@@ -112,7 +112,8 @@ fn wait_for_change(
                 assert_eq!(event.repo_id, repo_id);
                 if event.generation > before {
                     let refs = backend.get_refs(repo_id).unwrap();
-                    assert_eq!(refs.generation, event.generation);
+                    // Another refresh may already have landed after this event.
+                    assert!(refs.generation >= event.generation);
                     return refs;
                 }
             }
@@ -123,7 +124,7 @@ fn wait_for_change(
     }
 }
 
-fn assert_matches_git(backend: &Backend, repo_id: &str, path: &Path) {
+fn git_mismatch(backend: &Backend, repo_id: &str, path: &Path) -> Option<String> {
     let expected_commits: Vec<_> = git(path, &["log", "--all", "--topo-order", "--format=%H"])
         .lines()
         .map(str::to_owned)
@@ -134,14 +135,20 @@ fn assert_matches_git(backend: &Backend, repo_id: &str, path: &Path) {
     let mut sorted_expected = expected_commits;
     sorted_actual.sort();
     sorted_expected.sort();
-    assert_eq!(sorted_actual, sorted_expected);
+    if sorted_actual != sorted_expected {
+        return Some(format!(
+            "commits differ: gitreal {sorted_actual:?}, git {sorted_expected:?}"
+        ));
+    }
     let positions: HashMap<_, _> = actual_commits
         .iter()
         .enumerate()
         .map(|(index, id)| (id, index))
         .collect();
     for (index, row) in page.rows.iter().enumerate() {
-        assert!(row.parents.iter().all(|parent| positions[parent] > index));
+        if !row.parents.iter().all(|parent| positions[parent] > index) {
+            return Some(format!("row {index} is not in topological order"));
+        }
     }
 
     let expected_refs: Vec<_> = git(path, &["for-each-ref", "--format=%(refname) %(objectname)"])
@@ -164,11 +171,42 @@ fn assert_matches_git(backend: &Backend, repo_id: &str, path: &Path) {
             )
         })
         .collect();
-    assert_eq!(actual_refs, expected_refs);
-    assert_eq!(
-        page.generation,
-        backend.get_refs(repo_id).unwrap().generation
-    );
+    if actual_refs != expected_refs {
+        return Some(format!(
+            "refs differ: gitreal {actual_refs:?}, git {expected_refs:?}"
+        ));
+    }
+    let refs_generation = backend.get_refs(repo_id).unwrap().generation;
+    if page.generation != refs_generation {
+        return Some(format!(
+            "page generation {} differs from refs generation {refs_generation}",
+            page.generation
+        ));
+    }
+    None
+}
+
+/// Multi-step git commands (rebase, a burst of commits) can produce several
+/// debounced refreshes; wait until the backend settles on git's final state.
+fn wait_for_git_state(
+    backend: &Backend,
+    repo_id: &str,
+    events: &mpsc::Receiver<RecordedEvent>,
+    path: &Path,
+    before: u64,
+) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut generation = wait_for_change(backend, repo_id, events, before).generation;
+    loop {
+        let Some(mismatch) = git_mismatch(backend, repo_id, path) else {
+            return generation;
+        };
+        assert!(
+            Instant::now() < deadline,
+            "backend never matched git: {mismatch}"
+        );
+        generation = wait_for_change(backend, repo_id, events, generation).generation;
+    }
 }
 
 fn observed_backend() -> (Backend, mpsc::Receiver<RecordedEvent>) {
@@ -274,20 +312,16 @@ fn metadata_watcher_tracks_refs_commits_rebase_and_pack_refs() {
     let mut generation = backend.get_refs(&id).unwrap().generation;
 
     fixture.commit("External commit", "external");
-    generation = wait_for_change(&backend, &id, &events, generation).generation;
-    assert_matches_git(&backend, &id, &fixture.path);
+    generation = wait_for_git_state(&backend, &id, &events, &fixture.path, generation);
 
     git(&fixture.path, &["branch", "feature"]);
-    generation = wait_for_change(&backend, &id, &events, generation).generation;
-    assert_matches_git(&backend, &id, &fixture.path);
+    generation = wait_for_git_state(&backend, &id, &events, &fixture.path, generation);
 
     git(&fixture.path, &["branch", "-D", "feature"]);
-    generation = wait_for_change(&backend, &id, &events, generation).generation;
-    assert_matches_git(&backend, &id, &fixture.path);
+    generation = wait_for_git_state(&backend, &id, &events, &fixture.path, generation);
 
     git(&fixture.path, &["commit", "--amend", "-m", "Amended"]);
-    generation = wait_for_change(&backend, &id, &events, generation).generation;
-    assert_matches_git(&backend, &id, &fixture.path);
+    generation = wait_for_git_state(&backend, &id, &events, &fixture.path, generation);
 
     git(&fixture.path, &["branch", "topic"]);
     fixture.commit("Main ahead", "main");
@@ -296,17 +330,14 @@ fn metadata_watcher_tracks_refs_commits_rebase_and_pack_refs() {
     commit_file(&fixture, "topic-2.txt", "2", "Topic 2");
     commit_file(&fixture, "topic-3.txt", "3", "Topic 3");
     git(&fixture.path, &["checkout", "main"]);
-    wait_for_change(&backend, &id, &events, generation);
-    assert_matches_git(&backend, &id, &fixture.path);
+    wait_for_git_state(&backend, &id, &events, &fixture.path, generation);
 
     generation = backend.get_refs(&id).unwrap().generation;
     git(&fixture.path, &["rebase", "main", "topic"]);
-    generation = wait_for_change(&backend, &id, &events, generation).generation;
-    assert_matches_git(&backend, &id, &fixture.path);
+    generation = wait_for_git_state(&backend, &id, &events, &fixture.path, generation);
 
     git(&fixture.path, &["pack-refs", "--all"]);
-    wait_for_change(&backend, &id, &events, generation);
-    assert_matches_git(&backend, &id, &fixture.path);
+    wait_for_git_state(&backend, &id, &events, &fixture.path, generation);
 }
 
 #[test]
@@ -325,9 +356,8 @@ fn metadata_watcher_debounces_bursts_and_ignores_worktree_files() {
             &format!("Burst {index}"),
         );
     }
-    let refs = wait_for_change(&backend, &id, &events, initial);
-    assert_matches_git(&backend, &id, &fixture.path);
-    let mut rebuilds = 1;
+    let settled = wait_for_git_state(&backend, &id, &events, &fixture.path, initial);
+    let mut rebuilds = settled - initial;
     while let Ok(event) = events.recv_timeout(Duration::from_millis(250)) {
         match event {
             RecordedEvent::Changed(event) => {
@@ -338,20 +368,21 @@ fn metadata_watcher_debounces_bursts_and_ignores_worktree_files() {
         }
     }
     assert!(rebuilds < 10, "20 commits caused {rebuilds} rebuilds");
+    let settled = backend.get_refs(&id).unwrap().generation;
 
     fs::write(fixture.path.join("tracked.txt"), "working tree only").unwrap();
     assert!(matches!(
         events.recv_timeout(Duration::from_millis(350)),
         Err(mpsc::RecvTimeoutError::Timeout)
     ));
-    assert_eq!(backend.get_refs(&id).unwrap().generation, refs.generation);
+    assert_eq!(backend.get_refs(&id).unwrap().generation, settled);
 
     git(&fixture.path, &["add", "tracked.txt"]);
     assert!(matches!(
         events.recv_timeout(Duration::from_millis(350)),
         Err(mpsc::RecvTimeoutError::Timeout)
     ));
-    assert_eq!(backend.get_refs(&id).unwrap().generation, refs.generation);
+    assert_eq!(backend.get_refs(&id).unwrap().generation, settled);
 }
 
 #[test]
@@ -403,8 +434,7 @@ fn linked_worktree_watches_common_refs() {
     let generation = backend.get_refs(&linked_id).unwrap().generation;
 
     git(&fixture.path, &["branch", "external"]);
-    wait_for_change(&backend, &linked_id, &events, generation);
-    assert_matches_git(&backend, &linked_id, &linked);
+    wait_for_git_state(&backend, &linked_id, &events, &linked, generation);
 }
 
 #[test]

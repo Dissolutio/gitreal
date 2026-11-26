@@ -1,11 +1,17 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { open } from "@tauri-apps/plugin-dialog";
+  import Tabs from "./Tabs.svelte";
   import GraphCanvas from "./GraphCanvas.svelte";
   import VirtualList from "./VirtualList.svelte";
-  import { api, desktop, nativeError, type CommitDetail, type GraphRow, type NativeError, type RefInfo, type Repository } from "./lib/api";
+  import { api, desktop, nativeError, type CommitDetail, type GraphRow, type KnownRepo, type NativeError, type RefInfo, type Repository } from "./lib/api";
+  import { closeTab, createTab, cycleTabs, MAX_TABS, openTab, restoreTabs, type RepoTab } from "./lib/tabs";
   import { PageCache, PAGE_SIZE, ROW_HEIGHT, pageOffsets, visibleRange } from "./lib/virtual";
 
+  let tabs = $state<RepoTab[]>([]);
+  let activePath = $state<string | null>(null);
+  let knownRepos = $state<KnownRepo[]>([]);
+  let activeTab = $derived(tabs.find(tab => tab.path === activePath) ?? null);
   let repository = $state<Repository | null>(null);
   let refs = $state<RefInfo[]>([]);
   let filter = $state("");
@@ -26,10 +32,15 @@
   let revision = $state(0);
   let epoch = 0;
   let selectionEpoch = 0;
-  const cache = new PageCache<GraphRow>();
+  let cache = new PageCache<GraphRow>();
+  const caches = new Map<string, PageCache<GraphRow>>();
   const pending = new Set<number>();
   const failed = new Set<number>();
+  const openingTabs = new Set<number>();
   const groups = [{ kind: "local", label: "Local", icon: "⑂" }, { kind: "remote", label: "Remote", icon: "◎" }, { kind: "tag", label: "Tags", icon: "◇" }];
+  let initialized = false;
+  let disposed = false;
+  let persistTimer: ReturnType<typeof setTimeout> | undefined;
   const range = $derived(visibleRange(scrollTop, viewportHeight, total));
   const visibleRows = $derived.by(() => {
     void revision;
@@ -43,38 +54,215 @@
   const head = $derived(refs.find(ref => ref.kind === "local" && ref.is_head)?.name ?? refs.find(ref => ref.is_head)?.name ?? "Detached HEAD");
   const date = (timestamp: number) => new Date(timestamp * 1000).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
 
+  function saveActiveTab() {
+    const tab = tabs.find(item => item.path === activePath);
+    if (!tab) return;
+    tab.selected = selected;
+    tab.detail = detail;
+    tab.total = total;
+    tab.initialLoaded = initialLoaded;
+    tab.scrollTop = scrollTop;
+    tab.scrollLeft = scrollLeft;
+    if (cache.size) caches.set(tab.path, cache);
+  }
+
+  function activateView(tab: RepoTab | undefined) {
+    repository = tab?.repository ?? null;
+    refs = tab?.refs ?? [];
+    error = null;
+    detailError = null;
+    selected = tab?.selected ?? null;
+    detail = tab?.detail ?? null;
+    detailLoading = false;
+    total = tab?.total ?? 0;
+    initialLoaded = tab?.initialLoaded ?? false;
+    scrollTop = tab?.scrollTop ?? 0;
+    scrollLeft = tab?.scrollLeft ?? 0;
+    cache = tab ? caches.get(tab.path) ?? new PageCache<GraphRow>() : new PageCache<GraphRow>();
+    if (tab) caches.set(tab.path, cache);
+    pending.clear();
+    failed.clear();
+    revision++;
+    if (viewport) {
+      viewport.scrollTop = scrollTop;
+      viewport.scrollLeft = scrollLeft;
+    }
+  }
+
+  function schedulePersist() {
+    if (!initialized || !desktop) return;
+    clearTimeout(persistTimer);
+    persistTimer = setTimeout(() => {
+      void api.setOpenTabs(tabs.map(tab => tab.path), activePath)
+        .catch(failure => { error = nativeError(failure); });
+    }, 500);
+  }
+
+  function focusTab(path: string) {
+    const tab = tabs.find(item => item.path === path);
+    if (!tab) return;
+    saveActiveTab();
+    ++epoch;
+    ++selectionEpoch;
+    activePath = tab.path;
+    activateView(tab);
+    opening = openingTabs.has(tab.tabId);
+    schedulePersist();
+    if (!tab.repository && !tab.error) void openRepositoryTab(tab, false);
+  }
+
+  async function openRepositoryTab(tab: RepoTab, remember: boolean) {
+    const openingPath = tab.path;
+    if (openingTabs.has(tab.tabId)) return;
+    openingTabs.add(tab.tabId);
+    if (activePath === openingPath) opening = true;
+    let opened: Repository | null = null;
+    try {
+      const next = await api.open(openingPath);
+      opened = next;
+      if (disposed || !tabs.some(item => item.tabId === tab.tabId)) {
+        void api.close(next.repo_id).catch(() => {});
+        return;
+      }
+      const duplicate = tabs.find(item => item.tabId !== tab.tabId && item.path === next.path);
+      if (duplicate) {
+        void api.close(next.repo_id).catch(() => {});
+        const closed = closeTab({ tabs, activePath }, openingPath);
+        tabs = closed.tabs;
+        if (activePath === openingPath) {
+          activePath = duplicate.path;
+          activateView(duplicate);
+        }
+        schedulePersist();
+        return;
+      }
+      const oldPath = tab.path;
+      tab.path = next.path;
+      tab.name = next.name;
+      tab.repository = next;
+      tab.error = null;
+      if (activePath === oldPath) activePath = next.path;
+      const loadedRefs = await api.refs(next.repo_id);
+      if (disposed || !tabs.some(item => item.tabId === tab.tabId)) {
+        void api.close(next.repo_id).catch(() => {});
+        opened = null;
+        return;
+      }
+      opened = null;
+      tab.refs = loadedRefs;
+      if (activePath === next.path) activateView(tab);
+      if (remember) {
+        try {
+          await api.addKnownRepo(next.path);
+          knownRepos = (await api.config()).repos;
+        } catch (failure) { error = nativeError(failure); }
+      }
+      schedulePersist();
+    } catch (failure) {
+      if (opened) void api.close(opened.repo_id).catch(() => {});
+      if (!disposed && tabs.some(item => item.tabId === tab.tabId)) {
+        tab.error = nativeError(failure);
+        tab.repository = null;
+        if (activePath === openingPath || activePath === tab.path) {
+          repository = null;
+          refs = [];
+          opening = false;
+        }
+      }
+    } finally {
+      openingTabs.delete(tab.tabId);
+      if (activeTab?.tabId === tab.tabId) opening = false;
+    }
+  }
+
+  async function openTabPath(path: string, remember = false) {
+    const existing = tabs.find(tab => tab.path === path);
+    if (existing) {
+      focusTab(existing.path);
+      if (remember) {
+        try {
+          await api.addKnownRepo(existing.path);
+          knownRepos = (await api.config()).repos;
+        } catch (failure) { error = nativeError(failure); }
+      }
+      return;
+    }
+    if (tabs.length >= MAX_TABS) {
+      error = { code: "tab_limit", message: `Gitreal can keep up to ${MAX_TABS} repository tabs open.` };
+      return;
+    }
+    const result = openTab({ tabs, activePath }, createTab(path));
+    tabs = result.state.tabs;
+    activePath = result.state.activePath;
+    schedulePersist();
+    const tab = tabs.find(item => item.path === path);
+    if (!tab) return;
+    activateView(tab);
+    opening = true;
+    void openRepositoryTab(tab, remember);
+  }
+
+  function closeRepositoryTab(path: string) {
+    if (!tabs.some(item => item.path === path)) return;
+    const wasActive = activePath === path;
+    saveActiveTab();
+    const tab = tabs.find(item => item.path === path);
+    const next = closeTab({ tabs, activePath }, path);
+    tabs = next.tabs;
+    activePath = next.activePath;
+    if (tab?.repository) void api.close(tab.repository.repo_id).catch(() => {});
+    caches.delete(path);
+    if (!wasActive) {
+      schedulePersist();
+      return;
+    }
+    ++epoch;
+    ++selectionEpoch;
+    activateView(tabs.find(item => item.path === activePath));
+    opening = !!activeTab && openingTabs.has(activeTab.tabId);
+    schedulePersist();
+  }
+
+  function cycleTabsInOrder(direction: 1 | -1) {
+    const next = cycleTabs({ tabs, activePath }, direction);
+    if (next.activePath && next.activePath !== activePath) focusTab(next.activePath);
+  }
+
   async function chooseRepository() {
-    if (!desktop || choosing || opening) return;
+    if (!desktop || choosing) return;
     choosing = true;
     try {
       const path = await open({ directory: true, multiple: false, title: "Open Git repository" });
-      if (typeof path === "string") await loadRepository(path);
+      if (typeof path === "string") await openTabPath(path, true);
     } catch (failure) { error = nativeError(failure); }
     finally { choosing = false; }
   }
 
-  async function loadRepository(path: string) {
-    const token = ++epoch;
-    ++selectionEpoch;
-    const previous = repository;
-    repository = null;
-    refs = []; filter = ""; selected = null; detail = null; detailError = null;
-    detailLoading = false; error = null; total = 0; initialLoaded = false;
-    cache.clear(); pending.clear(); failed.clear(); revision++;
-    scrollTop = 0; scrollLeft = 0;
-    if (viewport) { viewport.scrollTop = 0; viewport.scrollLeft = 0; }
-    opening = true;
-    if (previous) void api.close(previous.repo_id).catch(() => {});
+  async function restoreConfig() {
     try {
-      const next = await api.open(path);
-      if (token !== epoch) { void api.close(next.repo_id).catch(() => {}); return; }
-      repository = next;
-      const result = await api.refs(next.repo_id);
-      if (token !== epoch) return;
-      refs = result;
+      const config = await api.config();
+      knownRepos = config.repos;
+      const restored = restoreTabs(config.tabs, config.active_tab);
+      const currentTabs = tabs;
+      const currentActivePath = activePath;
+      const mergedTabs = restored.tabs.map(
+        tab => currentTabs.find(existing => existing.path === tab.path) ?? tab,
+      );
+      for (const tab of currentTabs) {
+        if (!mergedTabs.some(existing => existing.path === tab.path)) mergedTabs.push(tab);
+      }
+      tabs = mergedTabs;
+      activePath = currentActivePath && currentTabs.some(tab => tab.path === currentActivePath)
+        ? currentActivePath
+        : restored.activePath;
+      initialized = true;
+      activateView(tabs.find(tab => tab.path === activePath));
+      schedulePersist();
+      await Promise.all(tabs.map(tab => openRepositoryTab(tab, false)));
     } catch (failure) {
-      if (token === epoch) error = nativeError(failure);
-    } finally { if (token === epoch) opening = false; }
+      initialized = true;
+      error = nativeError(failure);
+    }
   }
 
   async function loadPage(repoId: string, offset: number, token: number) {
@@ -85,6 +273,7 @@
       cache.set(offset, page.rows);
       total = page.total;
       initialLoaded = true;
+      saveActiveTab();
     } catch (failure) {
       if (token !== epoch) return;
       failed.add(offset);
@@ -112,9 +301,10 @@
     const token = ++selectionEpoch;
     const repoToken = epoch;
     selected = commitId; detail = null; detailError = null; detailLoading = true;
+    saveActiveTab();
     try {
       const result = await api.detail(repoId, commitId);
-      if (token === selectionEpoch && repoToken === epoch) detail = result;
+      if (token === selectionEpoch && repoToken === epoch) { detail = result; saveActiveTab(); }
     } catch (failure) {
       if (token === selectionEpoch && repoToken === epoch) detailError = nativeError(failure);
     } finally {
@@ -123,16 +313,26 @@
   }
 
   function retry() { error = null; failed.clear(); revision++; }
-  function onScroll() { scrollTop = viewport.scrollTop; scrollLeft = viewport.scrollLeft; }
+  function reopenActiveTab() {
+    if (!activeTab) return;
+    activeTab.error = null;
+    void openRepositoryTab(activeTab, false);
+  }
+  function onScroll() { scrollTop = viewport.scrollTop; scrollLeft = viewport.scrollLeft; saveActiveTab(); }
 
   onMount(() => {
     const observer = new ResizeObserver(() => { viewportHeight = viewport.clientHeight; });
     observer.observe(viewport);
     viewportHeight = viewport.clientHeight;
+    if (desktop) void restoreConfig();
     return () => {
+      disposed = true;
+      clearTimeout(persistTimer);
       observer.disconnect();
       ++epoch; ++selectionEpoch;
-      if (repository) void api.close(repository.repo_id).catch(() => {});
+      for (const tab of tabs) {
+        if (tab.repository) void api.close(tab.repository.repo_id).catch(() => {});
+      }
     };
   });
 </script>
@@ -143,13 +343,23 @@
   <header class="topbar">
     <div class="brand"><span class="brand-mark">⑂</span> gitreal<span class="brand-caption">REPOSITORY EXPLORER</span></div>
     <div class="read-only"><span></span> READ ONLY</div>
-    <button class="open-button" onclick={chooseRepository} disabled={!desktop || opening || choosing}><span aria-hidden="true">▱</span> {opening ? "Opening…" : "Open repository"}</button>
   </header>
+
+  <Tabs
+    {tabs}
+    {activePath}
+    {knownRepos}
+    onFocus={focusTab}
+    onClose={closeRepositoryTab}
+    onOpenKnown={(path) => openTabPath(path, true)}
+    onOpenFolder={chooseRepository}
+    onCycle={cycleTabsInOrder}
+  />
 
   <aside class="sidebar">
     <div class="repository-block">
       <span class="eyebrow">WORKSPACE</span>
-      <h1 title={repository?.path}><span class="repo-icon">▣</span> {repository?.name ?? "No repository"}</h1>
+      <h1 title={repository?.path ?? activeTab?.path}><span class="repo-icon">▣</span> {repository?.name ?? activeTab?.name ?? "No repository"}</h1>
       <p title={repository?.path}>{repository?.path ?? "Your history, in perspective."}</p>
     </div>
     <div class="sidebar-heading">REFERENCES <span>{refs.length}</span></div>
@@ -184,7 +394,7 @@
       <span class="commit-count">{initialLoaded ? total.toLocaleString() : "—"} <span>commits</span></span>
     </div>
     {#if error}
-      <div class="error-banner" role="alert"><div><strong>{error.code}</strong> {error.message}</div><button onclick={retry}>Retry pages</button>{#if repository}<button onclick={() => { if (repository) void loadRepository(repository.path); }}>Reopen</button>{/if}<button aria-label="Dismiss error" onclick={() => { error = null; }}>×</button></div>
+      <div class="error-banner" role="alert"><div><strong>{error.code}</strong> {error.message}</div><button onclick={retry}>Retry pages</button>{#if repository}<button onclick={reopenActiveTab}>Reopen</button>{/if}<button aria-label="Dismiss error" onclick={() => { error = null; }}>×</button></div>
     {/if}
     <div class="column-clip"><div class="column-head" style:--graph-width="{graphWidth}px" style:transform="translateX(-{scrollLeft}px)"><span>REFERENCES</span><span>GRAPH</span><span>COMMIT MESSAGE</span><span>AUTHOR</span><span>DATE</span></div></div>
     <div class="history-scroll" bind:this={viewport} onscroll={onScroll} aria-label="Commit history" aria-busy={opening || (!!repository && !initialLoaded)}>
@@ -192,8 +402,9 @@
         <div class="empty-state">
           <div class="empty-graph" aria-hidden="true"><i></i><i></i><i></i><span>⑂</span></div>
           <span class="eyebrow">A CLEARER VIEW OF YOUR CODE</span>
-          <h2>{opening ? "Opening repository…" : "Every commit tells a story."}</h2>
-          <p>{desktop ? "Open a local Git repository to explore its branches, commits, and connections." : "Gitreal is a desktop Git explorer. Open the desktop app to browse a local repository."}</p>
+          <h2>{opening ? "Opening repository…" : activeTab?.error ? "Repository unavailable." : "Every commit tells a story."}</h2>
+          <p>{activeTab?.error ? activeTab.error.message : desktop ? "Open a local Git repository to explore its branches, commits, and connections." : "Gitreal is a desktop Git explorer. Open the desktop app to browse a local repository."}</p>
+          {#if activeTab?.error}<button class="primary-button" onclick={reopenActiveTab}>Try again</button>{/if}
           {#if desktop}<button class="primary-button" onclick={chooseRepository} disabled={opening || choosing}>▱ &nbsp; Open repository</button>{:else}<span class="desktop-note">DESKTOP APP REQUIRED</span>{/if}
           <div class="empty-features"><span>○ Virtualized history</span><span>⑂ Branch topology</span><span>◇ Commit details</span></div>
         </div>

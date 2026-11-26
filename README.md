@@ -15,9 +15,10 @@ never watches the working tree. It watches Git metadata in the resolved worktree
 and common directories, debounces events for 150 ms, and ignores lock and
 transient files.
 
-History is cached as a topologically ordered snapshot and atomically refreshed
-when references change; subsequent pages share the same generation. The frontend
-keeps only a bounded page cache and reloads visible pages after refresh.
+History is cached as a compact, topologically ordered snapshot (lane assignments
+plus lane-occupancy checkpoints; edges are reconstructed per page) and atomically
+rebuilt when references change; subsequent pages share the same generation. The
+frontend keeps only a bounded page cache and reloads visible pages after refresh.
 Changed paths are compared with the first parent (merges included); initial and
 shallow-boundary commits are compared with an empty tree. Renames appear as
 added/deleted paths rather than requiring expensive similarity detection.
@@ -73,11 +74,12 @@ linear, branched/merged, octopus, multiple-root and criss-cross histories.
 - `get_refs(repo_id)` returns local/remote/tag/HEAD entries. Annotated tags are
   peeled; unborn HEAD and non-commit tags have a null target. The response also
   includes the repository generation.
-- `get_graph_page(repo_id, offset, limit)` returns `{ rows, total, generation }`,
-  with page sizes 1–500. Each row has commit metadata, labels, a lane and parent
-  edges.
-  Edges connect this row's center to the next row's center; pass-through edges
-  preserve connections across intervening rows and page boundaries.
+- `get_graph_page(repo_id, offset, limit)` returns
+  `{ rows, total, max_lane, generation }`, with page sizes 1–500. `max_lane` is
+  the widest lane index in the snapshot. Each row has commit metadata, labels, a
+  lane and parent edges. Edges connect this row's center to the next row's
+  center; pass-through edges preserve connections across intervening rows and
+  page boundaries.
 - `get_commit_detail(repo_id, commit_id)` accepts a full hexadecimal object ID
   in the snapshot, not revision expressions. It returns the message, author,
   Unix date, original parents and changed-path objects.

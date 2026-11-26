@@ -54,6 +54,13 @@ impl Fixture {
         git(&self.path, &["rev-parse", "HEAD"])
     }
 
+    fn commit_file(&self, path: &str, message: &str, content: &str) -> String {
+        fs::write(self.path.join(path), content).unwrap();
+        git(&self.path, &["add", path]);
+        git(&self.path, &["commit", "-m", message]);
+        git(&self.path, &["rev-parse", "HEAD"])
+    }
+
     fn open(&self, backend: &Backend) -> String {
         backend
             .open_repo(self.path.to_string_lossy().into())
@@ -623,6 +630,45 @@ fn topological_order_handles_skewed_dates_and_multiple_tips() {
     };
     assert!(position(&main) < position(&root));
     assert!(position(&other) < position(&root));
+}
+
+#[test]
+fn merged_and_unmerged_branches_keep_stable_lanes() {
+    let fixture = Fixture::new();
+    fixture.commit("Root", "root");
+    git(&fixture.path, &["branch", "feature"]);
+    git(&fixture.path, &["checkout", "feature"]);
+    let feature_one = fixture.commit_file("feature.txt", "Feature one", "one");
+    let feature_two = fixture.commit_file("feature.txt", "Feature two", "two");
+    git(&fixture.path, &["checkout", "main"]);
+    let main_one = fixture.commit_file("main.txt", "Main one", "main");
+    git(
+        &fixture.path,
+        &["merge", "--no-ff", "feature", "-m", "Merge feature"],
+    );
+    let merge = git(&fixture.path, &["rev-parse", "HEAD"]);
+    git(&fixture.path, &["branch", "unmerged"]);
+    git(&fixture.path, &["checkout", "unmerged"]);
+    let unmerged_one = fixture.commit_file("unmerged.txt", "Unmerged one", "one");
+    let unmerged_two = fixture.commit_file("unmerged.txt", "Unmerged two", "two");
+    git(&fixture.path, &["checkout", "main"]);
+
+    let backend = Backend::default();
+    let id = fixture.open(&backend);
+    let graph = backend.get_graph_page(&id, 0, 500).unwrap();
+    assert_eq!(
+        graph.max_lane,
+        graph.rows.iter().map(|row| row.lane).max().unwrap()
+    );
+    let lanes: HashMap<_, _> = graph
+        .rows
+        .iter()
+        .map(|row| (row.commit_id.as_str(), row.lane))
+        .collect();
+    assert_eq!(lanes[feature_one.as_str()], lanes[feature_two.as_str()]);
+    assert_eq!(lanes[unmerged_one.as_str()], lanes[unmerged_two.as_str()]);
+    assert_eq!(lanes[merge.as_str()], 0);
+    assert_eq!(lanes[main_one.as_str()], lanes[merge.as_str()]);
 }
 
 #[test]

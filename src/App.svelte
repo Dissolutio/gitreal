@@ -18,6 +18,7 @@
   let detail = $state<CommitDetail | null>(null);
   let detailLoading = $state(false);
   let total = $state(0);
+  let maxLane = $state(0);
   let initialLoaded = $state(false);
   let scrollTop = $state(0);
   let scrollLeft = $state(0);
@@ -37,9 +38,7 @@
     void revision;
     return Array.from({ length: range.end - range.start }, (_, i) => cache.row(range.start + i));
   });
-  const maxLaneWidth = $derived(Math.max(168, ...visibleRows.flatMap(row => row ? [
-    32 + row.lane * 15, ...row.parent_edges.map(edge => 32 + Math.max(edge.from_lane, edge.to_lane) * 15),
-  ] : [])));
+  const maxLaneWidth = $derived(Math.max(168, 32 + maxLane * 15));
   const graphWidth = $derived(Math.min(360, maxLaneWidth));
   const filtered = $derived(refs.filter(ref => ref.name.toLowerCase().includes(filter.toLowerCase())));
   const head = $derived(refs.find(ref => ref.kind === "local" && ref.is_head)?.name ?? refs.find(ref => ref.is_head)?.name ?? "Detached HEAD");
@@ -62,7 +61,7 @@
     repository = null;
     refs = []; filter = ""; selected = null; detail = null; detailError = null;
     generation = 0; eventGeneration = 0;
-    detailLoading = false; error = null; total = 0; initialLoaded = false;
+    detailLoading = false; error = null; total = 0; maxLane = 0; initialLoaded = false;
     cache.clear(); pending.clear(); failed.clear(); revision++;
     scrollTop = 0; scrollLeft = 0;
     if (viewport) { viewport.scrollTop = 0; viewport.scrollLeft = 0; }
@@ -91,6 +90,7 @@
       generation = page.generation;
       cache.set(offset, page.rows);
       total = page.total;
+      maxLane = page.max_lane;
       initialLoaded = true;
     } catch (failure) {
       if (token !== epoch) return;

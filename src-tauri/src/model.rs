@@ -1,0 +1,83 @@
+use serde::Serialize;
+
+#[derive(Debug, Clone, Serialize, thiserror::Error)]
+#[error("{message}")]
+pub struct BackendError {
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl BackendError {
+    pub fn new(code: &'static str, message: impl ToString) -> Self {
+        Self {
+            code,
+            message: message.to_string(),
+        }
+    }
+
+    pub fn git(error: impl std::fmt::Display) -> Self {
+        Self::new("git_error", error)
+    }
+}
+
+pub type Result<T> = std::result::Result<T, BackendError>;
+
+#[derive(Clone, Debug, Serialize)]
+pub struct OpenRepo {
+    pub repo_id: String,
+    pub path: String,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RefInfo {
+    pub name: String,
+    pub full_name: String,
+    pub kind: &'static str,
+    pub target: Option<String>,
+    pub is_head: bool,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct GraphEdge {
+    pub from_lane: usize,
+    pub to_lane: usize,
+    pub parent_id: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct GraphRow {
+    pub commit_id: String,
+    pub lane: usize,
+    pub parent_edges: Vec<GraphEdge>,
+    pub ref_labels: Vec<String>,
+    pub summary: String,
+    pub author: String,
+    pub date: i64,
+    pub parents: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GraphPage {
+    pub rows: Vec<GraphRow>,
+    pub total: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChangedPath {
+    pub path: String,
+    pub status: &'static str,
+    pub old_path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CommitDetail {
+    pub commit_id: String,
+    pub message: String,
+    pub summary: String,
+    pub author: String,
+    pub author_email: String,
+    pub date: i64,
+    pub parents: Vec<String>,
+    pub changed_paths: Vec<ChangedPath>,
+}

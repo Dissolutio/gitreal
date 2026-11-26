@@ -1,15 +1,18 @@
 use crate::{
     model::{
-        BackendError, ChangedPath, CommitDetail, GraphPage, GraphRow, OpenRepo, RefInfo, Result,
+        BackendError, ChangedPath, CommitDetail, GraphPage, GraphRow, OpenRepo, RefInfo,
+        RefsResponse, RepoChanged, RepoError, Result,
     },
     repo::graph::assign_lanes,
+    repo::watcher::{MetadataWatcher, WatchSignal},
 };
 use gix::bstr::ByteSlice;
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
+    sync::atomic::AtomicBool,
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Mutex, RwLock,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -19,8 +22,16 @@ const MAX_OPEN_REPOS: usize = 16;
 
 struct Repository {
     path: PathBuf,
+    state: RwLock<RepositoryState>,
+    refresh_lock: Mutex<()>,
+    watcher: Mutex<Option<MetadataWatcher>>,
+    closed: AtomicBool,
+}
+
+struct RepositoryState {
     refs: Vec<RefInfo>,
-    snapshot: OnceLock<Result<Arc<Snapshot>>>,
+    snapshot: Option<Arc<Snapshot>>,
+    generation: u64,
 }
 
 struct Snapshot {
@@ -28,13 +39,39 @@ struct Snapshot {
     ids: HashSet<String>,
 }
 
-#[derive(Default)]
 pub struct Backend {
     repositories: Mutex<HashMap<String, Arc<Repository>>>,
     next_id: AtomicU64,
+    event_sink: Arc<dyn EventSink>,
+}
+
+pub trait EventSink: Send + Sync + 'static {
+    fn repo_changed(&self, event: RepoChanged);
+    fn repo_error(&self, event: RepoError);
+}
+
+struct NullEventSink;
+
+impl EventSink for NullEventSink {
+    fn repo_changed(&self, _: RepoChanged) {}
+    fn repo_error(&self, _: RepoError) {}
+}
+
+impl Default for Backend {
+    fn default() -> Self {
+        Self::with_event_sink(Arc::new(NullEventSink))
+    }
 }
 
 impl Backend {
+    pub fn with_event_sink(event_sink: Arc<dyn EventSink>) -> Self {
+        Self {
+            repositories: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(0),
+            event_sink,
+        }
+    }
+
     pub fn open_repo(&self, path: String) -> Result<OpenRepo> {
         let path = Path::new(&path)
             .canonicalize()
@@ -44,9 +81,48 @@ impl Backend {
         let refs = read_refs(&repo)?;
         let repository = Arc::new(Repository {
             path: path.clone(),
-            refs,
-            snapshot: OnceLock::new(),
+            state: RwLock::new(RepositoryState {
+                refs,
+                snapshot: None,
+                generation: 0,
+            }),
+            refresh_lock: Mutex::new(()),
+            watcher: Mutex::new(None),
+            closed: AtomicBool::new(false),
         });
+        let repo_id = format!("repo-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
+        let event_repo_id = repo_id.clone();
+        let weak_repository = Arc::downgrade(&repository);
+        let event_sink = Arc::clone(&self.event_sink);
+        let watcher = MetadataWatcher::start(&repo, move |signal| {
+            if let Some(repository) = weak_repository.upgrade() {
+                let (refs_changed, watcher_error) = match signal {
+                    WatchSignal::Changed(refs_changed) => (refs_changed, None),
+                    WatchSignal::Error(message) => (false, Some(message)),
+                };
+                let mut watcher_error = watcher_error;
+                match repository.refresh(refs_changed) {
+                    Ok(Some(generation)) => event_sink.repo_changed(RepoChanged {
+                        repo_id: event_repo_id.clone(),
+                        generation,
+                    }),
+                    Ok(None) => {}
+                    Err(error) => watcher_error = Some(error.message),
+                }
+                if let Some(message) = watcher_error {
+                    event_sink.repo_error(RepoError {
+                        repo_id: event_repo_id.clone(),
+                        message,
+                    });
+                }
+            }
+        })
+        .map_err(|error| BackendError::new("watcher_error", error))?;
+        *repository
+            .watcher
+            .lock()
+            .map_err(|_| BackendError::new("internal_error", "Repository watcher unavailable"))? =
+            Some(watcher);
         let mut repositories = self
             .repositories
             .lock()
@@ -57,7 +133,6 @@ impl Backend {
                 "Close a repository before opening another",
             ));
         }
-        let repo_id = format!("repo-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
         repositories.insert(repo_id.clone(), repository);
         Ok(OpenRepo {
             repo_id,
@@ -71,10 +146,19 @@ impl Backend {
     }
 
     pub fn close_repo(&self, repo_id: &str) -> Result<()> {
-        self.repositories
+        let repository = self
+            .repositories
             .lock()
             .map_err(|_| BackendError::new("internal_error", "Repository state unavailable"))?
             .remove(repo_id);
+        if let Some(repository) = repository {
+            repository.closed.store(true, Ordering::Release);
+            repository
+                .watcher
+                .lock()
+                .map_err(|_| BackendError::new("internal_error", "Repository watcher unavailable"))?
+                .take();
+        }
         Ok(())
     }
 
@@ -92,8 +176,16 @@ impl Backend {
             })
     }
 
-    pub fn get_refs(&self, repo_id: &str) -> Result<Vec<RefInfo>> {
-        Ok(self.repository(repo_id)?.refs.clone())
+    pub fn get_refs(&self, repo_id: &str) -> Result<RefsResponse> {
+        let repository = self.repository(repo_id)?;
+        let state = repository
+            .state
+            .read()
+            .map_err(|_| BackendError::new("internal_error", "Repository state unavailable"))?;
+        Ok(RefsResponse {
+            refs: state.refs.clone(),
+            generation: state.generation,
+        })
     }
 
     pub fn get_graph_page(&self, repo_id: &str, offset: usize, limit: usize) -> Result<GraphPage> {
@@ -104,12 +196,13 @@ impl Backend {
             ));
         }
         let repository = self.repository(repo_id)?;
-        let snapshot = repository.snapshot()?;
+        let (snapshot, generation) = repository.snapshot()?;
         let start = offset.min(snapshot.rows.len());
         let end = start.saturating_add(limit).min(snapshot.rows.len());
         Ok(GraphPage {
             rows: snapshot.rows[start..end].to_vec(),
             total: snapshot.rows.len(),
+            generation,
         })
     }
 
@@ -123,7 +216,7 @@ impl Backend {
         }
         let repository = self.repository(repo_id)?;
         let id = commit_id.to_ascii_lowercase();
-        if !repository.snapshot()?.ids.contains(&id) {
+        if !repository.snapshot()?.0.ids.contains(&id) {
             return Err(BackendError::new(
                 "unknown_commit",
                 "Commit is not in this repository snapshot",
@@ -211,71 +304,125 @@ impl Backend {
 }
 
 impl Repository {
-    fn snapshot(&self) -> Result<Arc<Snapshot>> {
-        self.snapshot
-            .get_or_init(|| self.build_snapshot().map(Arc::new))
-            .clone()
+    fn snapshot(&self) -> Result<(Arc<Snapshot>, u64)> {
+        loop {
+            let (refs, generation, snapshot) = {
+                let state = self.state.read().map_err(|_| {
+                    BackendError::new("internal_error", "Repository state unavailable")
+                })?;
+                (state.refs.clone(), state.generation, state.snapshot.clone())
+            };
+            if let Some(snapshot) = snapshot {
+                return Ok((snapshot, generation));
+            }
+            let repo = gix::open(&self.path).map_err(BackendError::git)?;
+            let snapshot = Arc::new(build_snapshot(&repo, &refs)?);
+            let mut state = self
+                .state
+                .write()
+                .map_err(|_| BackendError::new("internal_error", "Repository state unavailable"))?;
+            if state.generation == generation && state.refs == refs {
+                let snapshot = state.snapshot.get_or_insert(snapshot).clone();
+                return Ok((snapshot, state.generation));
+            }
+        }
     }
 
-    fn build_snapshot(&self) -> Result<Snapshot> {
+    fn refresh(&self, refs_changed: bool) -> Result<Option<u64>> {
+        if self.closed.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let _refresh = self
+            .refresh_lock
+            .lock()
+            .map_err(|_| BackendError::new("internal_error", "Repository refresh unavailable"))?;
+        if self.closed.load(Ordering::Acquire) {
+            return Ok(None);
+        }
         let repo = gix::open(&self.path).map_err(BackendError::git)?;
-        let roots: HashSet<_> = self
-            .refs
-            .iter()
-            .filter_map(|reference| reference.target.as_ref())
-            .collect();
-        let mut roots: Vec<_> = roots
-            .iter()
-            .map(|id| gix::ObjectId::from_hex(id.as_bytes()).map_err(BackendError::git))
-            .collect::<Result<_>>()?;
-        roots.sort();
-        let mut labels: HashMap<&str, Vec<String>> = HashMap::new();
-        for reference in &self.refs {
-            if let Some(target) = &reference.target {
-                labels
-                    .entry(target)
-                    .or_default()
-                    .push(reference.name.clone());
-            }
+        let refs = read_refs(&repo)?;
+        let unchanged = {
+            let state = self
+                .state
+                .read()
+                .map_err(|_| BackendError::new("internal_error", "Repository state unavailable"))?;
+            state.refs == refs
+        };
+        if unchanged && !refs_changed {
+            // Index-only changes are ignored until status information is implemented.
+            return Ok(None);
         }
-        let mut rows = Vec::new();
-        if !roots.is_empty() {
-            for entry in repo
-                .rev_walk(roots)
-                .sorting(gix::revision::walk::Sorting::TopoOrder)
-                .all()
-                .map_err(BackendError::git)?
-            {
-                let entry = entry.map_err(BackendError::git)?;
-                let commit = repo.find_commit(entry.id).map_err(BackendError::git)?;
-                let author = commit.author().map_err(BackendError::git)?;
-                let commit_id = entry.id.to_string();
-                rows.push(GraphRow {
-                    ref_labels: labels.remove(commit_id.as_str()).unwrap_or_default(),
-                    summary: commit
-                        .message_raw()
-                        .map_err(BackendError::git)?
-                        .lines()
-                        .next()
-                        .map(|line| String::from_utf8_lossy(line).into_owned())
-                        .unwrap_or_default(),
-                    author: author.name.to_string(),
-                    date: author.time().map_err(BackendError::git)?.seconds,
-                    parents: entry.parent_ids().map(|id| id.to_string()).collect(),
-                    commit_id,
-                    lane: 0,
-                    parent_edges: Vec::new(),
-                });
-            }
+        let snapshot = Arc::new(build_snapshot(&repo, &refs)?);
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| BackendError::new("internal_error", "Repository state unavailable"))?;
+        if self.closed.load(Ordering::Acquire) {
+            return Ok(None);
         }
-        // Shallow boundaries have no visible parent; don't leave dangling graph edges.
-        let ids: HashSet<_> = rows.iter().map(|row| row.commit_id.clone()).collect();
-        for row in &mut rows {
-            row.parents.retain(|id| ids.contains(id));
-        }
-        assign_lanes(&mut rows);
-        Ok(Snapshot { rows, ids })
+        state.refs = refs;
+        state.snapshot = Some(snapshot);
+        state.generation = state.generation.saturating_add(1);
+        Ok(Some(state.generation))
     }
+}
+
+fn build_snapshot(repo: &gix::Repository, refs: &[RefInfo]) -> Result<Snapshot> {
+    let roots: HashSet<_> = refs
+        .iter()
+        .filter_map(|reference| reference.target.as_ref())
+        .collect();
+    let mut roots: Vec<_> = roots
+        .iter()
+        .map(|id| gix::ObjectId::from_hex(id.as_bytes()).map_err(BackendError::git))
+        .collect::<Result<_>>()?;
+    roots.sort();
+    let mut labels: HashMap<&str, Vec<String>> = HashMap::new();
+    for reference in refs {
+        if let Some(target) = &reference.target {
+            labels
+                .entry(target)
+                .or_default()
+                .push(reference.name.clone());
+        }
+    }
+    let mut rows = Vec::new();
+    if !roots.is_empty() {
+        for entry in repo
+            .rev_walk(roots)
+            .sorting(gix::revision::walk::Sorting::TopoOrder)
+            .all()
+            .map_err(BackendError::git)?
+        {
+            let entry = entry.map_err(BackendError::git)?;
+            let commit = repo.find_commit(entry.id).map_err(BackendError::git)?;
+            let author = commit.author().map_err(BackendError::git)?;
+            let commit_id = entry.id.to_string();
+            rows.push(GraphRow {
+                ref_labels: labels.remove(commit_id.as_str()).unwrap_or_default(),
+                summary: commit
+                    .message_raw()
+                    .map_err(BackendError::git)?
+                    .lines()
+                    .next()
+                    .map(|line| String::from_utf8_lossy(line).into_owned())
+                    .unwrap_or_default(),
+                author: author.name.to_string(),
+                date: author.time().map_err(BackendError::git)?.seconds,
+                parents: entry.parent_ids().map(|id| id.to_string()).collect(),
+                commit_id,
+                lane: 0,
+                parent_edges: Vec::new(),
+            });
+        }
+    }
+    // Shallow boundaries have no visible parent; don't leave dangling graph edges.
+    let ids: HashSet<_> = rows.iter().map(|row| row.commit_id.clone()).collect();
+    for row in &mut rows {
+        row.parents.retain(|id| ids.contains(id));
+    }
+    assign_lanes(&mut rows);
+    Ok(Snapshot { rows, ids })
 }
 
 fn read_refs(repo: &gix::Repository) -> Result<Vec<RefInfo>> {

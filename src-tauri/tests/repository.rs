@@ -1,12 +1,35 @@
-use gitreal_lib::repo::reader::Backend;
+use gitreal_lib::{
+    model::{RefsResponse, RepoChanged, RepoError},
+    repo::reader::{Backend, EventSink},
+};
 use std::{
     collections::HashMap,
     fs,
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::{Arc, mpsc},
+    thread,
+    time::{Duration, Instant},
 };
 use tempfile::TempDir;
+
+enum RecordedEvent {
+    Changed(RepoChanged),
+    Error(RepoError),
+}
+
+struct EventRecorder(mpsc::Sender<RecordedEvent>);
+
+impl EventSink for EventRecorder {
+    fn repo_changed(&self, event: RepoChanged) {
+        let _ = self.0.send(RecordedEvent::Changed(event));
+    }
+
+    fn repo_error(&self, event: RepoError) {
+        let _ = self.0.send(RecordedEvent::Error(event));
+    }
+}
 
 struct Fixture {
     directory: TempDir,
@@ -57,8 +80,114 @@ fn git(path: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).trim().into()
 }
 
+fn wait_for_generation(backend: &Backend, repo_id: &str, before: u64) -> RefsResponse {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let refs = backend.get_refs(repo_id).unwrap();
+        if refs.generation > before {
+            return refs;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "repository generation did not advance"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_change(
+    backend: &Backend,
+    repo_id: &str,
+    events: &mpsc::Receiver<RecordedEvent>,
+    before: u64,
+) -> RefsResponse {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match events
+            .recv_timeout(remaining)
+            .expect("timed out waiting for repo-changed")
+        {
+            RecordedEvent::Changed(event) => {
+                assert_eq!(event.repo_id, repo_id);
+                if event.generation > before {
+                    let refs = backend.get_refs(repo_id).unwrap();
+                    assert_eq!(refs.generation, event.generation);
+                    return refs;
+                }
+            }
+            RecordedEvent::Error(error) => {
+                panic!("unexpected repository error: {}", error.message);
+            }
+        }
+    }
+}
+
+fn assert_matches_git(backend: &Backend, repo_id: &str, path: &Path) {
+    let expected_commits: Vec<_> = git(path, &["log", "--all", "--topo-order", "--format=%H"])
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    let page = backend.get_graph_page(repo_id, 0, 500).unwrap();
+    let actual_commits: Vec<_> = page.rows.iter().map(|row| row.commit_id.clone()).collect();
+    let mut sorted_actual = actual_commits.clone();
+    let mut sorted_expected = expected_commits;
+    sorted_actual.sort();
+    sorted_expected.sort();
+    assert_eq!(sorted_actual, sorted_expected);
+    let positions: HashMap<_, _> = actual_commits
+        .iter()
+        .enumerate()
+        .map(|(index, id)| (id, index))
+        .collect();
+    for (index, row) in page.rows.iter().enumerate() {
+        assert!(row.parents.iter().all(|parent| positions[parent] > index));
+    }
+
+    let expected_refs: Vec<_> = git(path, &["for-each-ref", "--format=%(refname) %(objectname)"])
+        .lines()
+        .map(|line| {
+            let (name, target) = line.split_once(' ').unwrap();
+            (name.to_owned(), target.to_owned())
+        })
+        .collect();
+    let actual_refs: Vec<_> = backend
+        .get_refs(repo_id)
+        .unwrap()
+        .refs
+        .into_iter()
+        .filter(|reference| reference.kind != "head")
+        .map(|reference| {
+            (
+                reference.full_name,
+                reference.target.expect("test refs point to commits"),
+            )
+        })
+        .collect();
+    assert_eq!(actual_refs, expected_refs);
+    assert_eq!(
+        page.generation,
+        backend.get_refs(repo_id).unwrap().generation
+    );
+}
+
+fn observed_backend() -> (Backend, mpsc::Receiver<RecordedEvent>) {
+    let (sender, receiver) = mpsc::channel();
+    (
+        Backend::with_event_sink(Arc::new(EventRecorder(sender))),
+        receiver,
+    )
+}
+
+fn commit_file(fixture: &Fixture, name: &str, content: &str, message: &str) -> String {
+    fs::write(fixture.path.join(name), content).unwrap();
+    git(&fixture.path, &["add", name]);
+    git(&fixture.path, &["commit", "-m", message]);
+    git(&fixture.path, &["rev-parse", "HEAD"])
+}
+
 #[test]
-fn refs_paging_details_and_read_only_snapshot() {
+fn refs_paging_details_and_live_refresh() {
     let fixture = Fixture::new();
     let first = fixture.commit("First commit\n\nFull body", "first");
     git(&fixture.path, &["branch", "feature"]);
@@ -80,7 +209,7 @@ fn refs_paging_details_and_read_only_snapshot() {
     let refs_before = git(&fixture.path, &["show-ref"]);
     let backend = Backend::default();
     let id = fixture.open(&backend);
-    let refs = backend.get_refs(&id).unwrap();
+    let refs = backend.get_refs(&id).unwrap().refs;
     assert!(
         refs.iter()
             .any(|r| r.name == "main" && r.is_head && r.kind == "local")
@@ -123,8 +252,10 @@ fn refs_paging_details_and_read_only_snapshot() {
     assert_eq!(detail.changed_paths[0].status, "modified");
     assert_eq!(git(&fixture.path, &["status", "--porcelain=v1"]), before);
     assert_eq!(git(&fixture.path, &["show-ref"]), refs_before);
+    let generation = all.generation;
     fixture.commit("After snapshot", "later");
-    assert_eq!(backend.get_graph_page(&id, 0, 500).unwrap().total, 3);
+    wait_for_generation(&backend, &id, generation);
+    assert_eq!(backend.get_graph_page(&id, 0, 500).unwrap().total, 4);
     let fresh = fixture.open(&backend);
     assert_eq!(backend.get_graph_page(&fresh, 0, 500).unwrap().total, 4);
     backend.close_repo(&id).unwrap();
@@ -132,6 +263,148 @@ fn refs_paging_details_and_read_only_snapshot() {
         backend.get_refs(&id).unwrap_err().code,
         "unknown_repository"
     );
+}
+
+#[test]
+fn metadata_watcher_tracks_refs_commits_rebase_and_pack_refs() {
+    let fixture = Fixture::new();
+    fixture.commit("Root", "root");
+    let (backend, events) = observed_backend();
+    let id = fixture.open(&backend);
+    let mut generation = backend.get_refs(&id).unwrap().generation;
+
+    fixture.commit("External commit", "external");
+    generation = wait_for_change(&backend, &id, &events, generation).generation;
+    assert_matches_git(&backend, &id, &fixture.path);
+
+    git(&fixture.path, &["branch", "feature"]);
+    generation = wait_for_change(&backend, &id, &events, generation).generation;
+    assert_matches_git(&backend, &id, &fixture.path);
+
+    git(&fixture.path, &["branch", "-D", "feature"]);
+    generation = wait_for_change(&backend, &id, &events, generation).generation;
+    assert_matches_git(&backend, &id, &fixture.path);
+
+    git(&fixture.path, &["commit", "--amend", "-m", "Amended"]);
+    generation = wait_for_change(&backend, &id, &events, generation).generation;
+    assert_matches_git(&backend, &id, &fixture.path);
+
+    git(&fixture.path, &["branch", "topic"]);
+    fixture.commit("Main ahead", "main");
+    git(&fixture.path, &["checkout", "topic"]);
+    commit_file(&fixture, "topic-1.txt", "1", "Topic 1");
+    commit_file(&fixture, "topic-2.txt", "2", "Topic 2");
+    commit_file(&fixture, "topic-3.txt", "3", "Topic 3");
+    git(&fixture.path, &["checkout", "main"]);
+    wait_for_change(&backend, &id, &events, generation);
+    assert_matches_git(&backend, &id, &fixture.path);
+
+    generation = backend.get_refs(&id).unwrap().generation;
+    git(&fixture.path, &["rebase", "main", "topic"]);
+    generation = wait_for_change(&backend, &id, &events, generation).generation;
+    assert_matches_git(&backend, &id, &fixture.path);
+
+    git(&fixture.path, &["pack-refs", "--all"]);
+    wait_for_change(&backend, &id, &events, generation);
+    assert_matches_git(&backend, &id, &fixture.path);
+}
+
+#[test]
+fn metadata_watcher_debounces_bursts_and_ignores_worktree_files() {
+    let fixture = Fixture::new();
+    fixture.commit("Root", "root");
+    let (backend, events) = observed_backend();
+    let id = fixture.open(&backend);
+    let initial = backend.get_refs(&id).unwrap().generation;
+
+    for index in 0..20 {
+        commit_file(
+            &fixture,
+            &format!("burst-{index}.txt"),
+            &index.to_string(),
+            &format!("Burst {index}"),
+        );
+    }
+    let refs = wait_for_change(&backend, &id, &events, initial);
+    assert_matches_git(&backend, &id, &fixture.path);
+    let mut rebuilds = 1;
+    while let Ok(event) = events.recv_timeout(Duration::from_millis(250)) {
+        match event {
+            RecordedEvent::Changed(event) => {
+                assert_eq!(event.repo_id, id);
+                rebuilds += 1;
+            }
+            RecordedEvent::Error(error) => panic!("unexpected repository error: {}", error.message),
+        }
+    }
+    assert!(rebuilds < 10, "20 commits caused {rebuilds} rebuilds");
+
+    fs::write(fixture.path.join("tracked.txt"), "working tree only").unwrap();
+    assert!(matches!(
+        events.recv_timeout(Duration::from_millis(350)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+    assert_eq!(backend.get_refs(&id).unwrap().generation, refs.generation);
+
+    git(&fixture.path, &["add", "tracked.txt"]);
+    assert!(matches!(
+        events.recv_timeout(Duration::from_millis(350)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+    assert_eq!(backend.get_refs(&id).unwrap().generation, refs.generation);
+}
+
+#[test]
+fn close_stops_watcher_and_deleted_repo_keeps_last_snapshot() {
+    let fixture = Fixture::new();
+    fixture.commit("Root", "root");
+    let (backend, events) = observed_backend();
+    let id = fixture.open(&backend);
+    backend.close_repo(&id).unwrap();
+    fixture.commit("After close", "after");
+    assert!(matches!(
+        events.recv_timeout(Duration::from_millis(350)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+
+    let failed_fixture = Fixture::new();
+    failed_fixture.commit("Keep me", "contents");
+    let failed_id = failed_fixture.open(&backend);
+    let last_good = backend.get_graph_page(&failed_id, 0, 10).unwrap();
+    fs::remove_dir_all(&failed_fixture.path).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match events.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(RecordedEvent::Error(error)) if error.repo_id == failed_id => break,
+            Ok(RecordedEvent::Changed(_)) => {}
+            Ok(RecordedEvent::Error(error)) => panic!("unexpected error for {}", error.repo_id),
+            Err(error) => panic!("timed out waiting for repo-error: {error}"),
+        }
+    }
+    let still_cached = backend.get_graph_page(&failed_id, 0, 10).unwrap();
+    assert_eq!(still_cached.generation, last_good.generation);
+    assert_eq!(still_cached.rows[0].commit_id, last_good.rows[0].commit_id);
+}
+
+#[test]
+fn linked_worktree_watches_common_refs() {
+    let fixture = Fixture::new();
+    fixture.commit("Root", "root");
+    let linked = fixture.directory.path().join("linked-worktree");
+    git(
+        &fixture.path,
+        &["worktree", "add", "-b", "linked", linked.to_str().unwrap()],
+    );
+    let (backend, events) = observed_backend();
+    let linked_id = backend
+        .open_repo(linked.to_string_lossy().into())
+        .unwrap()
+        .repo_id;
+    let generation = backend.get_refs(&linked_id).unwrap().generation;
+
+    git(&fixture.path, &["branch", "external"]);
+    wait_for_change(&backend, &linked_id, &events, generation);
+    assert_matches_git(&backend, &linked_id, &linked);
 }
 
 #[test]
@@ -144,6 +417,7 @@ fn unborn_detached_bare_and_validation() {
         backend
             .get_refs(&unborn)
             .unwrap()
+            .refs
             .iter()
             .any(|r| r.kind == "head" && r.target.is_none())
     );
@@ -159,6 +433,7 @@ fn unborn_detached_bare_and_validation() {
         backend
             .get_refs(&id)
             .unwrap()
+            .refs
             .iter()
             .all(|r| r.kind == "head")
     );

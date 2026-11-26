@@ -1,4 +1,5 @@
 use serde::Serialize;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize, thiserror::Error)]
 #[error("{message}")]
@@ -42,7 +43,7 @@ pub struct RefInfo {
 pub struct GraphEdge {
     pub from_lane: usize,
     pub to_lane: usize,
-    pub parent_id: String,
+    pub parent_id: Arc<str>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -61,6 +62,7 @@ pub struct GraphRow {
 pub struct GraphPage {
     pub rows: Vec<GraphRow>,
     pub total: usize,
+    pub max_lane: usize,
 }
 
 #[derive(Debug, Serialize)]

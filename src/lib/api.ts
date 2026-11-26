@@ -19,7 +19,7 @@ export interface GraphRow {
   date: number;
   parents: string[];
 }
-export interface GraphPage { rows: GraphRow[]; total: number }
+export interface GraphPage { rows: GraphRow[]; total: number; max_lane: number }
 export interface ChangedPath {
   path: string;
   status: "added" | "modified" | "deleted" | "renamed";

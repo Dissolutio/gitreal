@@ -12,8 +12,9 @@ message, author, date, parents and changed paths. Git reads use gix, not libgit2
 There are no git mutations, network requests, polling loops, or background
 watchers. Reopen a repository to refresh its state after external changes.
 
-History is cached as a topologically ordered snapshot on first access; subsequent
-pages reuse its lane assignments. The frontend keeps only a bounded page cache.
+History is cached as a compact, topologically ordered snapshot on first access;
+subsequent pages reuse its lane assignments and reconstruct edges on demand from
+lane-occupancy checkpoints. The frontend keeps only a bounded page cache.
 Changed paths are compared with the first parent (merges included); initial and
 shallow-boundary commits are compared with an empty tree. Renames appear as
 added/deleted paths rather than requiring expensive similarity detection.
@@ -68,10 +69,11 @@ linear, branched/merged, octopus, multiple-root and criss-cross histories.
   the opaque handle. `close_repo(repo_id)` releases it when switching repos.
 - `get_refs(repo_id)` returns local/remote/tag/HEAD entries. Annotated tags are
   peeled; unborn HEAD and non-commit tags have a null target.
-- `get_graph_page(repo_id, offset, limit)` returns `{ rows, total }`, with page
-  sizes 1–500. Each row has commit metadata, labels, a lane and parent edges.
-  Edges connect this row's center to the next row's center; pass-through edges
-  preserve connections across intervening rows and page boundaries.
+- `get_graph_page(repo_id, offset, limit)` returns `{ rows, total, max_lane }`,
+  with page sizes 1–500. `max_lane` is the widest lane index in the snapshot.
+  Each row has commit metadata, labels, a lane and parent edges. Edges connect
+  this row's center to the next row's center; pass-through edges preserve
+  connections across intervening rows and page boundaries.
 - `get_commit_detail(repo_id, commit_id)` accepts a full hexadecimal object ID
   in the snapshot, not revision expressions. It returns the message, author,
   Unix date, original parents and changed-path objects.

@@ -1,5 +1,5 @@
 use crate::{
-    model::{BackendError, JobAction, Result},
+    model::{BackendError, Result},
     repo::jobs::{JobPrecondition, JobSpec},
 };
 use std::path::{Path, PathBuf};

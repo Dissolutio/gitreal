@@ -31,8 +31,16 @@ export interface OperationInfo {
   step: number | null;
   total_steps: number | null;
 }
+export interface StashInfo {
+  index: number;
+  oid: string;
+  message: string;
+  base_oid: string;
+  timestamp: number;
+}
 export interface RefsResponse {
   refs: RefInfo[];
+  stashes: StashInfo[];
   operation: OperationInfo | null;
   conflicted_files: number;
   generation: number;
@@ -135,6 +143,29 @@ export const api = {
   stashPush: (repoId: string, includeUntracked: boolean, message?: string) =>
     call<string>("stash_push", { repoId, includeUntracked, message }),
   stashPop: (repoId: string) => call<string>("stash_pop", { repoId }),
+  stashApply: (repoId: string, index: number) =>
+    call<string>("stash_apply", { repoId, index }),
+  stashPopAt: (repoId: string, index: number) =>
+    call<string>("stash_pop_at", { repoId, index }),
+  stashDrop: (repoId: string, index: number, expectedOid: string) =>
+    call<string>("stash_drop", { repoId, index, expectedOid }),
+  mergeIntoCurrent: (repoId: string, source: string) =>
+    call<string>("merge_into_current", { repoId, source }),
+  rebaseCurrentOnto: (repoId: string, target: string) =>
+    call<string>("rebase_current_onto", { repoId, target }),
+  cherryPick: (repoId: string, oid: string) =>
+    call<string>("cherry_pick", { repoId, oid }),
+  revert: (repoId: string, oid: string) =>
+    call<string>("revert", { repoId, oid }),
+  resetCurrent: (repoId: string, oid: string, mode: "soft" | "mixed" | "hard", expectedHead: string) =>
+    call<string>("reset_current", { repoId, oid, mode, expectedHead }),
+  continueOperation: (repoId: string, kind: OperationInfo["kind"]) =>
+    call<string>("continue_operation", { repoId, kind }),
+  abortOperation: (repoId: string, kind: OperationInfo["kind"]) =>
+    call<string>("abort_operation", { repoId, kind }),
+  skipOperation: (repoId: string, kind: OperationInfo["kind"]) =>
+    call<string>("skip_operation", { repoId, kind }),
+  openInVSCode: (repoId: string) => call<void>("open_in_vscode", { repoId }),
   stashAndCheckout: (repoId: string, targetKind: string, target: string) =>
     call<string>("stash_and_checkout", { repoId, targetKind, target }),
   pushRemote: (repoId: string, branch: string) =>

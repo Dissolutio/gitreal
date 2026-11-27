@@ -27,6 +27,7 @@ pub struct JobSpec {
     pub step_labels: Vec<String>,
     pub preconditions: Vec<JobPrecondition>,
     pub action_on_failure: Option<JobAction>,
+    pub envs: Vec<(OsString, OsString)>,
     pub success_message: String,
     pub timeout: Duration,
     program: OsString,
@@ -36,6 +37,10 @@ pub enum JobPrecondition {
     BranchOid { branch: String, expected: String },
     CurrentBranch { branch: String },
     WorkingTreeClean,
+    HeadOid { expected: String },
+    NoOperation,
+    OperationIs { kind: String },
+    StashOid { index: usize, expected: String },
 }
 
 impl JobSpec {
@@ -56,6 +61,7 @@ impl JobSpec {
             step_labels: Vec::new(),
             preconditions: Vec::new(),
             action_on_failure: None,
+            envs: Vec::new(),
             success_message: success_message.into(),
             timeout: JOB_TIMEOUT,
             program: OsString::from("git"),
@@ -120,27 +126,62 @@ impl JobQueue {
                         }
                         Ok(output) => {
                             let _captured_output = (&output.stdout, output.exit_code);
-                            let step = spec
-                                .step_labels
-                                .get(output.failed_step)
-                                .cloned()
-                                .unwrap_or_else(|| spec.label.clone());
-                            let message = friendly_failure(&spec, &output.stderr, output.timed_out);
-                            let message = if spec.step_labels.len() > 1 {
-                                format!("{step} failed: {message}")
+                            let conflicts = if is_history_operation(&spec.kind) {
+                                conflicted_file_count(&spec)
                             } else {
-                                message
+                                0
                             };
-                            let action = spec.action_on_failure.clone().filter(|action| {
-                                (action.kind == "stash_and_retry"
-                                    && is_local_changes_failure(&output.stderr))
-                                    || (action.kind == "force_delete"
-                                        && output
-                                            .stderr
-                                            .to_ascii_lowercase()
-                                            .contains("not fully merged"))
-                            });
-                            (false, message, output.stderr_tail, action)
+                            if conflicts > 0 {
+                                let operation = match crate::repo::history_ops::detect_operation(&spec.cwd)
+                                    .ok()
+                                    .flatten()
+                                {
+                                    Some("rebase") => "Rebase",
+                                    Some("merge") => "Merge",
+                                    Some("cherry-pick") => "Cherry-pick",
+                                    Some("revert") => "Revert",
+                                    _ => "Git operation",
+                                };
+                                let noun = if conflicts == 1 {
+                                    "conflicted file"
+                                } else {
+                                    "conflicted files"
+                                };
+                                let action = JobAction {
+                                    kind: "open_in_vscode".into(),
+                                    label: "Open in VSCode".into(),
+                                    payload: serde_json::json!({}),
+                                };
+                                (
+                                    false,
+                                    format!("{operation} stopped: {conflicts} {noun}"),
+                                    output.stderr_tail,
+                                    Some(action),
+                                )
+                            } else {
+                                let step = spec
+                                    .step_labels
+                                    .get(output.failed_step)
+                                    .cloned()
+                                    .unwrap_or_else(|| spec.label.clone());
+                                let message =
+                                    friendly_failure(&spec, &output.stderr, output.timed_out);
+                                let message = if spec.step_labels.len() > 1 {
+                                    format!("{step} failed: {message}")
+                                } else {
+                                    message
+                                };
+                                let action = spec.action_on_failure.clone().filter(|action| {
+                                    (action.kind == "stash_and_retry"
+                                        && is_local_changes_failure(&output.stderr))
+                                        || (action.kind == "force_delete"
+                                            && output
+                                                .stderr
+                                                .to_ascii_lowercase()
+                                                .contains("not fully merged"))
+                                });
+                                (false, message, output.stderr_tail, action)
+                            }
                         }
                         Err(error) => (false, error, String::new(), None),
                     };
@@ -193,6 +234,21 @@ struct GitOutput {
 
 fn run_git(spec: &JobSpec) -> Result<GitOutput, String> {
     for precondition in &spec.preconditions {
+        let metadata_failure = match precondition {
+            JobPrecondition::NoOperation => crate::repo::history_ops::detect_operation(&spec.cwd)
+                .map_err(|error| error.message)?
+                .map(|kind| format!("{kind} is already in progress")),
+            JobPrecondition::OperationIs { kind } => {
+                let actual = crate::repo::history_ops::detect_operation(&spec.cwd)
+                    .map_err(|error| error.message)?;
+                (actual != Some(kind.as_str()))
+                    .then(|| "The Git operation is no longer in progress".to_owned())
+            }
+            _ => None,
+        };
+        if let Some(message) = metadata_failure {
+            return Ok(precondition_failure(message, None));
+        }
         let (args, expected) = match precondition {
             JobPrecondition::BranchOid { branch, expected } => (
                 vec!["rev-parse".into(), format!("refs/heads/{branch}")],
@@ -206,18 +262,24 @@ fn run_git(spec: &JobSpec) -> Result<GitOutput, String> {
                 vec!["status".into(), "--porcelain".into()],
                 Some(String::new()),
             ),
+            JobPrecondition::HeadOid { expected } => (
+                vec!["rev-parse".into(), "HEAD".into()],
+                Some(expected.clone()),
+            ),
+            JobPrecondition::StashOid { index, expected } => (
+                vec!["rev-parse".into(), format!("stash@{{{index}}}")],
+                Some(expected.clone()),
+            ),
+            JobPrecondition::NoOperation | JobPrecondition::OperationIs { .. } => continue,
         };
-        let result = run_git_args(&spec.program, &spec.cwd, &args, spec.timeout)?;
+        let result = run_git_args(&spec.program, &spec.cwd, &args, spec.timeout, &spec.envs)?;
         let actual = if matches!(precondition, JobPrecondition::WorkingTreeClean) {
             result.stdout.trim_end()
         } else {
             result.stdout.trim()
         };
         if !result.success || expected.as_deref() != Some(actual) {
-            return Ok(GitOutput {
-                success: false,
-                exit_code: result.exit_code,
-                stderr: match precondition {
+            let message = match precondition {
                     JobPrecondition::BranchOid { .. } => {
                         "Local branch changed since the operation was requested".into()
                     }
@@ -225,12 +287,17 @@ fn run_git(spec: &JobSpec) -> Result<GitOutput, String> {
                         "The checked-out branch changed since the operation was requested".into()
                     }
                     JobPrecondition::WorkingTreeClean => "The working tree is not clean".into(),
-                },
-                stderr_tail: String::new(),
-                stdout: String::new(),
-                timed_out: false,
-                failed_step: 0,
-            });
+                    JobPrecondition::HeadOid { .. } => {
+                        "HEAD changed since the operation was requested".into()
+                    }
+                    JobPrecondition::StashOid { .. } => {
+                        "Stash changed since it was selected".into()
+                    }
+                    JobPrecondition::NoOperation | JobPrecondition::OperationIs { .. } => {
+                        unreachable!()
+                    }
+                };
+            return Ok(precondition_failure(message, result.exit_code));
         }
     }
 
@@ -239,12 +306,18 @@ fn run_git(spec: &JobSpec) -> Result<GitOutput, String> {
     steps.extend(spec.additional_steps.iter().cloned());
     let mut last_output = None;
     for (index, args) in steps.iter().enumerate() {
-        let output = run_git_args(&spec.program, &spec.cwd, args, spec.timeout)?;
+        let output = run_git_args(&spec.program, &spec.cwd, args, spec.timeout, &spec.envs)?;
         if !output.success {
             let mut output = output;
             if index > 0 {
                 for rollback_args in &spec.rollback_steps {
-                    match run_git_args(&spec.program, &spec.cwd, rollback_args, spec.timeout) {
+                    match run_git_args(
+                        &spec.program,
+                        &spec.cwd,
+                        rollback_args,
+                        spec.timeout,
+                        &spec.envs,
+                    ) {
                         Ok(rollback) if rollback.success => {}
                         Ok(rollback) => {
                             let detail = rollback
@@ -305,11 +378,53 @@ fn run_git(spec: &JobSpec) -> Result<GitOutput, String> {
     }))
 }
 
+fn precondition_failure(message: String, exit_code: Option<i32>) -> GitOutput {
+    GitOutput {
+        success: false,
+        exit_code,
+        stderr: message,
+        stderr_tail: String::new(),
+        stdout: String::new(),
+        timed_out: false,
+        failed_step: 0,
+    }
+}
+
+fn is_history_operation(kind: &str) -> bool {
+    matches!(
+        kind,
+        "merge"
+            | "rebase"
+            | "cherry-pick"
+            | "revert"
+            | "continue-operation"
+            | "skip-operation"
+    )
+}
+
+fn conflicted_file_count(spec: &JobSpec) -> usize {
+    let args = ["diff", "--name-only", "--diff-filter=U", "-z"]
+        .map(str::to_owned);
+    run_git_args(&spec.program, &spec.cwd, &args, spec.timeout, &spec.envs)
+        .ok()
+        .filter(|output| output.success)
+        .map(|output| {
+            output
+                .stdout
+                .as_bytes()
+                .split(|byte| *byte == 0)
+                .filter(|path| !path.is_empty())
+                .count()
+        })
+        .unwrap_or(0)
+}
+
 fn run_git_args(
     program: &OsString,
     cwd: &PathBuf,
     args: &[String],
     timeout: Duration,
+    envs: &[(OsString, OsString)],
 ) -> Result<GitOutput, String> {
     let mut command = Command::new(program);
     command
@@ -320,6 +435,7 @@ fn run_git_args(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    command.envs(envs.iter().cloned());
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -497,7 +613,11 @@ fn friendly_failure(spec: &JobSpec, stderr: &str, timed_out: bool) -> String {
         .any(|condition| matches!(condition, JobPrecondition::WorkingTreeClean))
         && text.contains("working tree is not clean")
     {
-        "Reset refused: the working tree is not clean".into()
+        if spec.kind == "rebase" {
+            "Rebase refused: the working tree is not clean; stash changes first".into()
+        } else {
+            "Reset refused: the working tree is not clean".into()
+        }
     } else {
         stderr
             .lines()

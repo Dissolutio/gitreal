@@ -119,6 +119,7 @@ struct WatchScopes {
     common_dir: PathBuf,
     files: HashSet<PathBuf>,
     ref_dirs: Vec<PathBuf>,
+    log_dirs: Vec<PathBuf>,
     rebase_dirs: Vec<PathBuf>,
 }
 
@@ -149,6 +150,9 @@ impl WatchScopes {
         let mut ref_dirs = vec![git_dir.join("refs"), common_dir.join("refs")];
         ref_dirs.sort();
         ref_dirs.dedup();
+        let mut log_dirs = vec![git_dir.join("logs"), common_dir.join("logs")];
+        log_dirs.sort();
+        log_dirs.dedup();
         let rebase_dirs = ["rebase-merge", "rebase-apply"]
             .map(|name| git_dir.join(name))
             .into_iter()
@@ -158,6 +162,7 @@ impl WatchScopes {
             common_dir,
             files,
             ref_dirs,
+            log_dirs,
             rebase_dirs,
         }
     }
@@ -167,6 +172,11 @@ impl WatchScopes {
         directories.insert(self.git_dir.clone(), RecursiveMode::NonRecursive);
         directories.insert(self.common_dir.clone(), RecursiveMode::NonRecursive);
         for directory in &self.ref_dirs {
+            if directory.is_dir() {
+                directories.insert(directory.clone(), RecursiveMode::Recursive);
+            }
+        }
+        for directory in &self.log_dirs {
             if directory.is_dir() {
                 directories.insert(directory.clone(), RecursiveMode::Recursive);
             }
@@ -195,7 +205,12 @@ impl WatchScopes {
         for directory in [&self.git_dir, &self.common_dir] {
             let _ = watcher.watch(directory, RecursiveMode::NonRecursive);
         }
-        for directory in self.ref_dirs.iter().chain(&self.rebase_dirs) {
+        for directory in self
+            .ref_dirs
+            .iter()
+            .chain(&self.log_dirs)
+            .chain(&self.rebase_dirs)
+        {
             if directory.is_dir() {
                 let _ = watcher.watch(directory, RecursiveMode::Recursive);
             }
@@ -230,6 +245,13 @@ impl WatchScopes {
             .any(|directory| path.starts_with(directory))
         {
             return Some(false);
+        }
+        if self
+            .log_dirs
+            .iter()
+            .any(|directory| path == directory.join("refs/stash"))
+        {
+            return Some(true);
         }
         if self
             .rebase_dirs

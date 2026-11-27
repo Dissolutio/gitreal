@@ -1,11 +1,29 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import type { GraphRow } from "./lib/api";
+  import type { StashPlacement } from "./lib/stashes";
   import { ROW_HEIGHT } from "./lib/virtual";
 
-  let { rows, start, scrollTop, height, selected, width = 168, laneWidth = 168, visible = true }: {
+  let {
+    rows,
+    start,
+    scrollTop,
+    height,
+    selected,
+    width = 168,
+    laneWidth = 168,
+    laneViewportWidth = width,
+    visible = true,
+    stashPlacements = [],
+    onSelectStash,
+    onContextStash,
+  }: {
     rows: (GraphRow | undefined)[]; start: number; scrollTop: number;
-    height: number; selected: string | null; width?: number; laneWidth?: number; visible?: boolean;
+    height: number; selected: string | null; width?: number; laneWidth?: number;
+    laneViewportWidth?: number; visible?: boolean;
+    stashPlacements?: StashPlacement[];
+    onSelectStash?: (oid: string) => void;
+    onContextStash?: (event: MouseEvent, oid: string) => void;
   } = $props();
   let canvas: HTMLCanvasElement;
   let dpr = $state(1);
@@ -31,7 +49,7 @@
     if (!context) return;
     context.scale(dpr, dpr);
     context.lineWidth = 2;
-    const x = (lane: number) => 16 + lane * 15 * Math.min(1, (width - 32) / (laneWidth - 32));
+    const x = (lane: number) => 16 + lane * 15 * Math.min(1, (laneViewportWidth - 32) / (laneWidth - 32));
     for (let i = 0; i < rows.length; i++) {
       const row = rows[i];
       if (!row) continue;
@@ -45,6 +63,18 @@
         context.stroke();
       }
     }
+    context.setLineDash([3, 3]);
+    for (const placement of stashPlacements) {
+      const row = rows[placement.rowIndex - start];
+      if (!row) continue;
+      const y = placement.y;
+      context.strokeStyle = "#b69df0";
+      context.beginPath();
+      context.moveTo(x(row.lane), y);
+      context.lineTo(placement.x, y);
+      context.stroke();
+    }
+    context.setLineDash([]);
     for (let i = 0; i < rows.length; i++) {
       const row = rows[i];
       if (!row) continue;
@@ -57,7 +87,27 @@
       context.strokeStyle = "#1a1e28";
       context.stroke();
     }
+    for (const placement of stashPlacements) {
+      context.fillStyle = "#302a42";
+      context.fillRect(placement.x - 5, placement.y - 5, 10, 10);
+      context.strokeStyle = "#b69df0";
+      context.strokeRect(placement.x - 5, placement.y - 5, 10, 10);
+    }
   });
 </script>
 
 <canvas bind:this={canvas} class="graph-canvas" style:width="{width}px" style:height="{height}px" aria-hidden="true"></canvas>
+{#if visible}
+  {#each stashPlacements as placement (placement.stash.oid)}
+    <button
+      class="stash-marker"
+      class:selected={selected === placement.stash.oid}
+      style:left="{placement.x - 7}px"
+      style:top="{placement.y - 7}px"
+      aria-label={`Select stash ${placement.stash.message}`}
+      title={placement.stash.message}
+      onclick={(event) => { event.stopPropagation(); onSelectStash?.(placement.stash.oid); }}
+      oncontextmenu={(event) => { event.preventDefault(); event.stopPropagation(); onContextStash?.(event, placement.stash.oid); }}
+    ></button>
+  {/each}
+{/if}

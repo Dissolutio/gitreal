@@ -440,14 +440,14 @@ fn run_git_args(
         .spawn()
         .map_err(|error| format!("Could not start Git: {error}"))?;
 
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "Could not capture Git output".to_owned())?;
-    let mut stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "Could not capture Git errors".to_owned())?;
+    let Some(mut stdout) = child.stdout.take() else {
+        terminate_child(&mut child);
+        return Err("Could not capture Git output".to_owned());
+    };
+    let Some(mut stderr) = child.stderr.take() else {
+        terminate_child(&mut child);
+        return Err("Could not capture Git errors".to_owned());
+    };
     let (output_sender, output_receiver) = mpsc::channel();
     let stdout_sender = output_sender.clone();
     let stdout_reader = thread::spawn(move || {
@@ -547,13 +547,7 @@ fn is_local_changes_failure(stderr: &str) -> bool {
 fn terminate_child(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
-        let process_group = format!("-{}", child.id());
-        let _ = Command::new("kill")
-            .args(["-KILL", "--", &process_group])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        let _ = unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
     }
     let _ = child.kill();
     let _ = child.wait();
@@ -858,14 +852,42 @@ mod tests {
     fn timeout_also_terminates_transport_children_holding_output_pipes() {
         let (sink, receiver) = sink();
         let queue = JobQueue::new("timeout-tree".into(), sink);
+        let directory = tempfile::tempdir().unwrap();
+        let grandchild_pid_path = directory.path().join("grandchild.pid");
         let mut spec = slow_spec("10");
-        spec.args = vec!["-c".into(), "sleep 10 & wait".into()];
+        spec.cwd = directory.path().to_path_buf();
+        spec.args = vec![
+            "-c".into(),
+            "sleep 10 & echo $! > \"$1\"; wait".into(),
+            "sh".into(),
+            grandchild_pid_path.to_string_lossy().into_owned(),
+        ];
         spec.timeout = Duration::from_millis(100);
         let started = Instant::now();
         queue.enqueue(spec, || {}).unwrap();
         let finished = receive_finished(&receiver);
         assert!(!finished.ok);
         assert!(started.elapsed() < Duration::from_secs(2));
+
+        let pid_deadline = Instant::now() + Duration::from_secs(2);
+        while !grandchild_pid_path.exists() && Instant::now() < pid_deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let grandchild_pid: u32 = std::fs::read_to_string(&grandchild_pid_path)
+            .expect("grandchild did not write its PID")
+            .trim()
+            .parse()
+            .unwrap();
+        let exit_deadline = Instant::now() + Duration::from_secs(2);
+        while std::path::Path::new(&format!("/proc/{grandchild_pid}")).exists()
+            && Instant::now() < exit_deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !std::path::Path::new(&format!("/proc/{grandchild_pid}")).exists(),
+            "grandchild process {grandchild_pid} is still present"
+        );
     }
 
     #[test]

@@ -6,13 +6,22 @@ export interface MenuItem {
   label: string;
   disabled?: boolean;
   danger?: boolean;
+  title?: string;
 }
 
 export interface BranchMenuState {
   ref: RefInfo;
   running: boolean;
+  currentBranch?: string | null;
+  operationInProgress?: boolean;
   hasLocalCounterpart?: boolean;
   hasRemoteCounterpart?: boolean;
+}
+
+export interface CommitMenuState {
+  running: boolean;
+  currentBranch?: string | null;
+  operationInProgress?: boolean;
 }
 
 export interface CommitRefLabel {
@@ -22,40 +31,77 @@ export interface CommitRefLabel {
   refs: RefInfo[];
 }
 
-const item = (id: string, label: string, running: boolean, danger = false): MenuItem => ({
-  id, label, disabled: running, danger,
+const item = (
+  id: string,
+  label: string,
+  disabled: boolean,
+  danger = false,
+  title?: string,
+): MenuItem => ({
+  id, label, disabled, danger, title,
 });
 
 export function branchMenuItems(state: BranchMenuState): MenuItem[] {
   const { ref, running } = state;
-  const items = [item("checkout", "Checkout", running || ref.is_head)];
-  if (ref.target) items.push(item("create-branch", "Create branch here…", running));
+  const currentBranch = state.currentBranch ?? null;
+  const operationInProgress = state.operationInProgress ?? false;
+  const mutationsDisabled = running || operationInProgress;
+  const historyDisabled = mutationsDisabled || !currentBranch;
+  const checkOutFirst = !currentBranch ? "Check out a branch first" : undefined;
+  const items: MenuItem[] = [];
+  if ((ref.kind === "local" || ref.kind === "remote") && !ref.is_head) {
+    items.push(
+      item("merge-into-current", `Merge ${safeRefLabel(ref.name)} into ${currentBranch ? safeRefLabel(currentBranch) : "current branch"}`, historyDisabled, false, checkOutFirst),
+      item("rebase-current-onto", `Rebase ${currentBranch ? safeRefLabel(currentBranch) : "current branch"} onto ${safeRefLabel(ref.name)}`, historyDisabled, false, checkOutFirst),
+    );
+  }
+  items.push(item("checkout", "Checkout", mutationsDisabled || ref.is_head));
+  if (ref.target) items.push(item("create-branch", "Create branch here…", mutationsDisabled));
   if (ref.kind === "local") {
-    items.push(item("rename", "Rename…", running));
-    items.push(item(ref.is_head ? "pull" : "push", ref.is_head ? "Pull" : "Push", running));
-    items.push(item("delete-local", "Delete local branch…", running || ref.is_head, true));
+    items.push(item("rename", "Rename…", mutationsDisabled));
+    items.push(item(ref.is_head ? "pull" : "push", ref.is_head ? "Pull" : "Push", mutationsDisabled));
+    items.push(item("delete-local", "Delete local branch…", mutationsDisabled || ref.is_head, true));
     if (state.hasRemoteCounterpart) {
-      items.push(item("delete-both", "Delete local and remote…", running || ref.is_head, true));
+      items.push(item("delete-both", "Delete local and remote…", mutationsDisabled || ref.is_head, true));
     }
     if (state.hasRemoteCounterpart) {
-      items.push(item("reset-remote", "Reset local to remote…", running, true));
+      items.push(item("reset-remote", "Reset local to remote…", mutationsDisabled, true));
     }
   } else if (ref.kind === "remote") {
-    items.push(item("delete-remote", "Delete remote branch…", running, true));
+    items.push(item("delete-remote", "Delete remote branch…", mutationsDisabled, true));
     if (state.hasLocalCounterpart) {
-      items.push(item("delete-both", "Delete local and remote…", running, true));
-      items.push(item("reset-remote", "Reset local to remote…", running, true));
+      items.push(item("delete-both", "Delete local and remote…", mutationsDisabled, true));
+      items.push(item("reset-remote", "Reset local to remote…", mutationsDisabled, true));
     }
   }
   items.push(item("copy", "Copy branch name", false));
   return items;
 }
 
-export function commitMenuItems(running: boolean): MenuItem[] {
+export function commitMenuItems(state: CommitMenuState | boolean): MenuItem[] {
+  const { running, operationInProgress = false, currentBranch = null } = typeof state === "boolean"
+    ? { running: state, operationInProgress: false, currentBranch: null }
+    : state;
+  const disabled = running || operationInProgress;
+  const branch = currentBranch ? safeRefLabel(currentBranch) : "HEAD";
   return [
-    item("checkout-commit", "Checkout this commit…", running),
-    item("create-branch", "Create branch here…", running),
+    item("checkout-commit", "Checkout this commit…", disabled),
+    item("create-branch", "Create branch here…", disabled),
+    item("cherry-pick", "Cherry-pick commit", disabled),
+    item("revert-commit", "Revert commit", disabled),
+    item("reset-soft", `Reset ${branch} to this commit · Soft`, disabled),
+    item("reset-mixed", `Reset ${branch} to this commit · Mixed`, disabled),
+    item("reset-hard", `Reset ${branch} to this commit · Hard…`, disabled, true),
     item("copy-commit", "Copy commit SHA", false),
+  ];
+}
+
+export function stashMenuItems(running: boolean, operationInProgress: boolean): MenuItem[] {
+  const disabled = running || operationInProgress;
+  return [
+    item("stash-apply", "Apply stash", disabled),
+    item("stash-pop-at", "Pop stash", disabled),
+    item("stash-drop", "Drop stash…", disabled, true),
   ];
 }
 

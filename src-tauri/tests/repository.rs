@@ -40,6 +40,12 @@ struct Fixture {
     path: PathBuf,
 }
 
+struct TrackingFixture {
+    _directory: TempDir,
+    clone: PathBuf,
+    writer: PathBuf,
+}
+
 impl Fixture {
     fn new() -> Self {
         let directory = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
@@ -73,6 +79,81 @@ impl Fixture {
     }
 }
 
+impl TrackingFixture {
+    fn new() -> Self {
+        let directory = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let seed = directory.path().join("seed");
+        let remote = directory.path().join("remote.git");
+        let clone = directory.path().join("clone");
+        let writer = directory.path().join("writer");
+        fs::create_dir(&seed).unwrap();
+        git(&seed, &["init", "-b", "main"]);
+        configure_user(&seed);
+        commit_at(&seed, "root.txt", "root", "Root");
+        git(
+            directory.path(),
+            &[
+                "init",
+                "--bare",
+                "--initial-branch=main",
+                remote.to_str().unwrap(),
+            ],
+        );
+        git(
+            &seed,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&seed, &["push", "-u", "origin", "main"]);
+        git(
+            directory.path(),
+            &["clone", remote.to_str().unwrap(), clone.to_str().unwrap()],
+        );
+        git(
+            directory.path(),
+            &["clone", remote.to_str().unwrap(), writer.to_str().unwrap()],
+        );
+        configure_user(&clone);
+        configure_user(&writer);
+        git(
+            &clone,
+            &[
+                "config",
+                "--replace-all",
+                "remote.origin.fetch",
+                "+refs/heads/*:refs/remotes/upstream/*",
+            ],
+        );
+        let initial = git(&clone, &["rev-parse", "HEAD"]);
+        for name in ["main", "alternate"] {
+            git(
+                &clone,
+                &[
+                    "update-ref",
+                    &format!("refs/remotes/upstream/{name}"),
+                    &initial,
+                ],
+            );
+        }
+        Self {
+            _directory: directory,
+            clone,
+            writer,
+        }
+    }
+}
+
+fn configure_user(path: &Path) {
+    git(path, &["config", "user.name", "Test Author"]);
+    git(path, &["config", "user.email", "author@example.test"]);
+}
+
+fn commit_at(path: &Path, file: &str, content: &str, message: &str) -> String {
+    fs::write(path.join(file), content).unwrap();
+    git(path, &["add", file]);
+    git(path, &["commit", "-m", message]);
+    git(path, &["rev-parse", "HEAD"])
+}
+
 fn git(path: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
@@ -89,6 +170,23 @@ fn git(path: &Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).trim().into()
+}
+
+fn git_fails(path: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
+        .args(args)
+        .current_dir(path)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "git {args:?} unexpectedly succeeded"
+    );
+    String::from_utf8_lossy(&output.stderr).into()
 }
 
 fn wait_for_generation(backend: &Backend, repo_id: &str, before: u64) -> RefsResponse {
@@ -195,6 +293,14 @@ fn git_mismatch(backend: &Backend, repo_id: &str, path: &Path) -> Option<String>
         ));
     }
     None
+}
+
+fn branch_ref<'a>(response: &'a RefsResponse, name: &str) -> &'a gitreal_lib::model::RefInfo {
+    response
+        .refs
+        .iter()
+        .find(|reference| reference.name == name)
+        .unwrap()
 }
 
 /// Multi-step git commands (rebase, a burst of commits) can produce several
@@ -312,6 +418,341 @@ fn refs_paging_details_and_live_refresh() {
         backend.get_refs(&id).unwrap_err().code,
         "unknown_repository"
     );
+}
+
+#[test]
+fn upstream_counts_cover_ahead_behind_diverged_missing_and_deleted() {
+    let fixture = TrackingFixture::new();
+    let (backend, events) = observed_backend();
+    let id = backend
+        .open_repo(fixture.clone.to_string_lossy().into())
+        .unwrap()
+        .repo_id;
+    let initial = backend.get_refs(&id).unwrap();
+    assert_eq!(
+        branch_ref(&initial, "main").upstream.as_deref(),
+        Some("origin/main")
+    );
+    assert_eq!(branch_ref(&initial, "main").ahead, Some(0));
+    assert_eq!(branch_ref(&initial, "main").behind, Some(0));
+
+    let generation = initial.generation;
+    commit_at(&fixture.clone, "local.txt", "local", "Local ahead");
+    let ahead = wait_for_generation(&backend, &id, generation);
+    assert_eq!(branch_ref(&ahead, "main").ahead, Some(1));
+    assert_eq!(branch_ref(&ahead, "main").behind, Some(0));
+
+    commit_at(&fixture.writer, "remote.txt", "remote", "Remote ahead");
+    git(&fixture.writer, &["push", "origin", "main"]);
+    git(&fixture.clone, &["fetch", "origin"]);
+    let behind = wait_for_generation(&backend, &id, ahead.generation);
+    assert_eq!(branch_ref(&behind, "main").ahead, Some(1));
+    assert_eq!(branch_ref(&behind, "main").behind, Some(1));
+
+    commit_at(
+        &fixture.writer,
+        "remote-2.txt",
+        "remote 2",
+        "Remote ahead again",
+    );
+    git(&fixture.writer, &["push", "origin", "main"]);
+    git(&fixture.clone, &["fetch", "origin"]);
+    let diverged = wait_for_generation(&backend, &id, behind.generation);
+    assert_eq!(branch_ref(&diverged, "main").ahead, Some(1));
+    assert_eq!(branch_ref(&diverged, "main").behind, Some(2));
+
+    git(
+        &fixture.clone,
+        &["config", "branch.main.merge", "refs/heads/alternate"],
+    );
+    let retargeted = wait_for_change(&backend, &id, &events, diverged.generation);
+    assert_eq!(
+        branch_ref(&retargeted, "main").upstream.as_deref(),
+        Some("origin/alternate")
+    );
+    assert_eq!(branch_ref(&retargeted, "main").ahead, Some(1));
+    assert_eq!(branch_ref(&retargeted, "main").behind, Some(0));
+    assert_eq!(
+        branch_ref(&retargeted, "main").target,
+        branch_ref(&diverged, "main").target
+    );
+
+    git(&fixture.clone, &["branch", "no-upstream"]);
+    let no_upstream = wait_for_change(&backend, &id, &events, retargeted.generation);
+    assert_eq!(branch_ref(&no_upstream, "no-upstream").upstream, None);
+    assert_eq!(branch_ref(&no_upstream, "no-upstream").ahead, None);
+    assert_eq!(branch_ref(&no_upstream, "no-upstream").behind, None);
+
+    git(
+        &fixture.clone,
+        &["update-ref", "-d", "refs/remotes/upstream/alternate"],
+    );
+    let deleted = wait_for_change(&backend, &id, &events, no_upstream.generation);
+    assert_eq!(
+        branch_ref(&deleted, "main").upstream.as_deref(),
+        Some("origin/alternate")
+    );
+    assert!(branch_ref(&deleted, "main").upstream_gone);
+    assert_eq!(branch_ref(&deleted, "main").ahead, None);
+    assert_eq!(branch_ref(&deleted, "main").behind, None);
+}
+
+#[test]
+fn default_fetch_refspec_resolves_origin_tracking_branch() {
+    let fixture = TrackingFixture::new();
+    git(
+        &fixture.clone,
+        &[
+            "config",
+            "--replace-all",
+            "remote.origin.fetch",
+            "+refs/heads/*:refs/remotes/origin/*",
+        ],
+    );
+    let backend = Backend::default();
+    let id = backend
+        .open_repo(fixture.clone.to_string_lossy().into())
+        .unwrap()
+        .repo_id;
+    let response = backend.get_refs(&id).unwrap();
+    assert_eq!(
+        branch_ref(&response, "main").upstream.as_deref(),
+        Some("origin/main")
+    );
+    assert_eq!(branch_ref(&response, "main").ahead, Some(0));
+    assert_eq!(branch_ref(&response, "main").behind, Some(0));
+}
+
+#[test]
+fn unmapped_upstream_does_not_use_a_conventional_stale_tracking_ref() {
+    let fixture = TrackingFixture::new();
+    let base = git(&fixture.clone, &["rev-parse", "HEAD"]);
+    let tree = git(&fixture.clone, &["rev-parse", "HEAD^{tree}"]);
+    let stale = git(
+        &fixture.clone,
+        &[
+            "commit-tree",
+            &tree,
+            "-p",
+            &base,
+            "-m",
+            "stale tracking target",
+        ],
+    );
+    git(
+        &fixture.clone,
+        &[
+            "config",
+            "--replace-all",
+            "remote.origin.fetch",
+            "+refs/heads/main:refs/remotes/upstream/main",
+        ],
+    );
+    git(
+        &fixture.clone,
+        &["update-ref", "refs/heads/unmapped", &base],
+    );
+    git(
+        &fixture.clone,
+        &["update-ref", "refs/remotes/origin/unmapped", &stale],
+    );
+    git(
+        &fixture.clone,
+        &["config", "branch.unmapped.remote", "origin"],
+    );
+    git(
+        &fixture.clone,
+        &["config", "branch.unmapped.merge", "refs/heads/unmapped"],
+    );
+
+    let backend = Backend::default();
+    let id = backend
+        .open_repo(fixture.clone.to_string_lossy().into())
+        .unwrap()
+        .repo_id;
+    let response = backend.get_refs(&id).unwrap();
+    let unmapped = branch_ref(&response, "unmapped");
+    assert_eq!(unmapped.upstream.as_deref(), Some("origin/unmapped"));
+    assert_eq!(unmapped.ahead, None);
+    assert_eq!(unmapped.behind, None);
+    assert!(!unmapped.upstream_gone);
+}
+
+#[test]
+fn upstream_read_performance_with_two_hundred_fifty_remote_branches() {
+    let fixture = TrackingFixture::new();
+    let base = git(&fixture.clone, &["rev-parse", "HEAD"]);
+    let tree = git(&fixture.clone, &["rev-parse", "HEAD^{tree}"]);
+    for index in 0..250 {
+        let name = format!("tracking-{index:03}");
+        let message = format!("Branch {index}");
+        let commit = git(
+            &fixture.clone,
+            &["commit-tree", &tree, "-p", &base, "-m", &message],
+        );
+        git(
+            &fixture.clone,
+            &["update-ref", &format!("refs/heads/{name}"), &commit],
+        );
+        git(
+            &fixture.clone,
+            &[
+                "update-ref",
+                &format!("refs/remotes/upstream/{name}"),
+                &base,
+            ],
+        );
+        git(
+            &fixture.clone,
+            &["config", &format!("branch.{name}.remote"), "origin"],
+        );
+        git(
+            &fixture.clone,
+            &[
+                "config",
+                &format!("branch.{name}.merge"),
+                &format!("refs/heads/{name}"),
+            ],
+        );
+    }
+
+    let started = Instant::now();
+    let backend = Backend::default();
+    let id = backend
+        .open_repo(fixture.clone.to_string_lossy().into())
+        .unwrap()
+        .repo_id;
+    let elapsed = started.elapsed();
+    let response = backend.get_refs(&id).unwrap();
+    assert_eq!(
+        response
+            .refs
+            .iter()
+            .filter(|reference| reference.name.starts_with("tracking-"))
+            .count(),
+        250
+    );
+    assert!(
+        response
+            .refs
+            .iter()
+            .filter(|reference| reference.name.starts_with("tracking-"))
+            .all(|reference| reference.ahead == Some(1) && reference.behind == Some(0))
+    );
+    eprintln!("Reading 250 upstream-tracking branches took {elapsed:?}");
+}
+
+#[test]
+fn operation_state_and_conflicts_refresh_for_merge_rebase_cherry_pick_and_revert() {
+    let fixture = Fixture::new();
+    fixture.commit("Root", "root");
+    git(&fixture.path, &["checkout", "-b", "feature"]);
+    let feature_commit = fixture.commit("Feature", "feature change");
+    git(&fixture.path, &["checkout", "main"]);
+    fixture.commit("Main", "main change");
+    let (backend, events) = observed_backend();
+    let id = fixture.open(&backend);
+
+    let before_merge = backend.get_refs(&id).unwrap().generation;
+    git_fails(&fixture.path, &["merge", "feature"]);
+    let merge = wait_for_change(&backend, &id, &events, before_merge);
+    assert_eq!(
+        merge.operation.as_ref().map(|operation| operation.kind),
+        Some("merge")
+    );
+    assert_eq!(merge.conflicted_files, 1);
+    let before_abort = merge.generation;
+    git(&fixture.path, &["merge", "--abort"]);
+    let after_abort = wait_for_change(&backend, &id, &events, before_abort);
+    assert_eq!(after_abort.operation, None);
+    assert_eq!(after_abort.conflicted_files, 0);
+
+    let before_rebase = after_abort.generation;
+    git_fails(&fixture.path, &["rebase", "main", "feature"]);
+    let rebase = wait_for_change(&backend, &id, &events, before_rebase);
+    let operation = rebase.operation.as_ref().unwrap();
+    assert_eq!(operation.kind, "rebase");
+    assert_eq!(operation.head_name.as_deref(), Some("feature"));
+    assert_eq!(operation.onto.as_deref(), Some("main"));
+    assert_eq!(operation.step, Some(1));
+    assert_eq!(operation.total_steps, Some(1));
+    assert_eq!(rebase.conflicted_files, 1);
+    let before_abort = rebase.generation;
+    git(&fixture.path, &["rebase", "--abort"]);
+    let after_abort = wait_for_change(&backend, &id, &events, before_abort);
+    assert_eq!(after_abort.operation, None);
+
+    git(&fixture.path, &["checkout", "main"]);
+    let before_cherry_pick = after_abort.generation;
+    git_fails(&fixture.path, &["cherry-pick", &feature_commit]);
+    let cherry_pick = wait_for_change(&backend, &id, &events, before_cherry_pick);
+    assert_eq!(
+        cherry_pick
+            .operation
+            .as_ref()
+            .map(|operation| operation.kind),
+        Some("cherry-pick")
+    );
+    assert_eq!(cherry_pick.conflicted_files, 1);
+    let before_abort = cherry_pick.generation;
+    git(&fixture.path, &["cherry-pick", "--abort"]);
+    let after_abort = wait_for_change(&backend, &id, &events, before_abort);
+    assert_eq!(after_abort.operation, None);
+
+    let before_revert = after_abort.generation;
+    git_fails(&fixture.path, &["revert", "--no-edit", &feature_commit]);
+    let revert = wait_for_change(&backend, &id, &events, before_revert);
+    assert_eq!(
+        revert.operation.as_ref().map(|operation| operation.kind),
+        Some("revert")
+    );
+    assert_eq!(revert.conflicted_files, 1);
+    let before_abort = revert.generation;
+    git(&fixture.path, &["revert", "--abort"]);
+    let after_abort = wait_for_change(&backend, &id, &events, before_abort);
+    assert_eq!(after_abort.operation, None);
+}
+
+#[test]
+fn watcher_emits_for_conflicting_merge_start_and_abort_without_ref_changes() {
+    let fixture = Fixture::new();
+    fixture.commit("Root", "root");
+    git(&fixture.path, &["checkout", "-b", "feature"]);
+    fixture.commit("Feature", "feature change");
+    git(&fixture.path, &["checkout", "main"]);
+    fixture.commit("Main", "main change");
+    let (backend, events) = observed_backend();
+    let id = fixture.open(&backend);
+    let original_refs: Vec<_> = backend
+        .get_refs(&id)
+        .unwrap()
+        .refs
+        .iter()
+        .filter(|reference| reference.kind != "head")
+        .map(|reference| (reference.full_name.clone(), reference.target.clone()))
+        .collect();
+
+    let before_merge = backend.get_refs(&id).unwrap().generation;
+    git_fails(&fixture.path, &["merge", "feature"]);
+    let merge = wait_for_change(&backend, &id, &events, before_merge);
+    assert_eq!(
+        merge.operation.as_ref().map(|operation| operation.kind),
+        Some("merge")
+    );
+    assert_eq!(
+        original_refs,
+        merge
+            .refs
+            .iter()
+            .filter(|reference| reference.kind != "head")
+            .map(|reference| (reference.full_name.clone(), reference.target.clone()))
+            .collect::<Vec<_>>()
+    );
+
+    let before_abort = merge.generation;
+    git(&fixture.path, &["merge", "--abort"]);
+    let aborted = wait_for_change(&backend, &id, &events, before_abort);
+    assert_eq!(aborted.operation, None);
 }
 
 #[test]

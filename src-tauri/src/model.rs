@@ -38,6 +38,11 @@ pub struct RefInfo {
     pub kind: &'static str,
     pub target: Option<String>,
     pub is_head: bool,
+    pub upstream: Option<String>,
+    pub ahead: Option<usize>,
+    pub behind: Option<usize>,
+    pub upstream_gone: bool,
+    pub truncated: bool,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -70,7 +75,18 @@ pub struct GraphPage {
 #[derive(Debug, Serialize)]
 pub struct RefsResponse {
     pub refs: Vec<RefInfo>,
+    pub operation: Option<OperationInfo>,
+    pub conflicted_files: usize,
     pub generation: u64,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct OperationInfo {
+    pub kind: &'static str,
+    pub head_name: Option<String>,
+    pub onto: Option<String>,
+    pub step: Option<usize>,
+    pub total_steps: Option<usize>,
 }
 
 #[derive(Clone, Debug, Serialize)]

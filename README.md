@@ -75,8 +75,14 @@ linear, branched/merged, octopus, multiple-root and criss-cross histories.
 - `open_repo(path)` returns `{ repo_id, path, name }`; subsequent commands use
   the opaque handle. `close_repo(repo_id)` releases it when switching repos.
 - `get_refs(repo_id)` returns local/remote/tag/HEAD entries. Annotated tags are
-  peeled; unborn HEAD and non-commit tags have a null target. The response also
-  includes the repository generation.
+  peeled; unborn HEAD and non-commit tags have a null target. Local branches
+  include `upstream` (for example, `origin/main`), `ahead`, and `behind`; absent
+  tracking data is null, a deleted upstream sets `upstream_gone`, and counts
+  stop at 10,000 commits per side with `truncated` set when the bound is hit.
+  The response also includes `operation` (null or merge/rebase/cherry-pick/
+  revert/bisect state), `conflicted_files`, and the repository generation.
+  Merge, cherry-pick, revert, and bisect markers are read from their Git metadata
+  files; rebase state is read from `rebase-merge/` or `rebase-apply/`.
 - `get_graph_page(repo_id, offset, limit)` returns
   `{ rows, total, max_lane, generation }`, with page sizes 1–500. `max_lane` is
   the widest lane index in the snapshot. Each row has commit metadata, labels, a

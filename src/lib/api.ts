@@ -17,8 +17,25 @@ export interface RefInfo {
   kind: "local" | "remote" | "tag" | "head";
   target: string | null;
   is_head: boolean;
+  upstream: string | null;
+  ahead: number | null;
+  behind: number | null;
+  upstream_gone: boolean;
+  truncated: boolean;
 }
-export interface RefsResponse { refs: RefInfo[]; generation: number }
+export interface OperationInfo {
+  kind: "merge" | "rebase" | "cherry-pick" | "revert" | "bisect";
+  head_name: string | null;
+  onto: string | null;
+  step: number | null;
+  total_steps: number | null;
+}
+export interface RefsResponse {
+  refs: RefInfo[];
+  operation: OperationInfo | null;
+  conflicted_files: number;
+  generation: number;
+}
 export interface RepoChangedEvent { repo_id: string; generation: number }
 export interface RepoErrorEvent { repo_id: string; message: string }
 export interface GraphEdge { from_lane: number; to_lane: number; parent_id: string }

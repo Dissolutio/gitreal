@@ -5,9 +5,10 @@
   import GraphCanvas from "./GraphCanvas.svelte";
   import VirtualList from "./VirtualList.svelte";
   import Snackbar from "./Snackbar.svelte";
-  import { api, desktop, nativeError, onJobFinished, onJobStarted, onRepoChanged, onRepoError, type CommitDetail, type GraphRow, type KnownRepo, type NativeError, type RefInfo, type Repository } from "./lib/api";
+  import { api, desktop, nativeError, onJobFinished, onJobStarted, onRepoChanged, onRepoError, type CommitDetail, type GraphRow, type KnownRepo, type NativeError, type OperationInfo, type RefInfo, type Repository } from "./lib/api";
   import { closeTab, createTab, cycleTabs, MAX_TABS, openTab, restoreTabs, type RepoTab } from "./lib/tabs";
   import { PageCache, PAGE_SIZE, ROW_HEIGHT, pageOffsets, visibleRange } from "./lib/virtual";
+  import { formatAheadBehind, formatOperationBanner } from "./lib/status";
   import { snackbarStore, type JobFinishedEvent, type JobStartedEvent } from "./lib/snackbar";
 
   let tabs = $state<RepoTab[]>([]);
@@ -16,6 +17,8 @@
   let activeTab = $derived(tabs.find(tab => tab.path === activePath) ?? null);
   let repository = $state<Repository | null>(null);
   let refs = $state<RefInfo[]>([]);
+  let operation = $state<OperationInfo | null>(null);
+  let conflictedFiles = $state(0);
   let filter = $state("");
   let collapsed = $state<Record<string, boolean>>({});
   let opening = $state(false);
@@ -43,6 +46,7 @@
   let selectionEpoch = 0;
   let cache = new PageCache<GraphRow>();
   const caches = new Map<string, PageCache<GraphRow>>();
+  const operationStates = new Map<string, { operation: OperationInfo | null; conflictedFiles: number }>();
   const pending = new Set<number>();
   const failed = new Set<number>();
   const openingTabs = new Set<number>();
@@ -84,6 +88,9 @@
   function activateView(tab: RepoTab | undefined) {
     repository = tab?.repository ?? null;
     refs = tab?.refs ?? [];
+    const status = tab ? operationStates.get(tab.path) : undefined;
+    operation = status?.operation ?? null;
+    conflictedFiles = status?.conflictedFiles ?? 0;
     error = null;
     detailError = null;
     selected = tab?.selected ?? null;
@@ -176,6 +183,10 @@
       tab.refs = loaded.refs;
       tab.generation = loaded.generation;
       tab.eventGeneration = loaded.generation;
+      operationStates.set(next.path, {
+        operation: loaded.operation,
+        conflictedFiles: loaded.conflicted_files,
+      });
       if (activePath === next.path) activateView(tab);
       if (remember) {
         try {
@@ -238,6 +249,7 @@
     activePath = next.activePath;
     if (tab?.repository) void api.close(tab.repository.repo_id).catch(() => {});
     caches.delete(path);
+    operationStates.delete(path);
     if (!wasActive) {
       schedulePersist();
       return;
@@ -364,6 +376,12 @@
       const result = await api.refs(repoId);
       if (token !== epoch || repository?.repo_id !== repoId) return;
       refs = result.refs;
+      operation = result.operation;
+      conflictedFiles = result.conflicted_files;
+      operationStates.set(repository.path, {
+        operation: result.operation,
+        conflictedFiles: result.conflicted_files,
+      });
       generation = Math.max(event.generation, result.generation);
       const tab = tabs.find(item => item.repository?.repo_id === repoId);
       if (tab) {
@@ -597,9 +615,17 @@
           {#if !collapsed[group.kind]}
             <VirtualList {items} maxHeight={216}>
               {#snippet children(ref)}
-                <button class="ref-item" class:current={ref.is_head} title={ref.full_name} disabled={!ref.target}
+                <button class="ref-item" class:current={ref.is_head}
+                  title={ref.upstream ? `${ref.full_name} · upstream ${ref.upstream}${ref.upstream_gone ? " (gone)" : ""}` : ref.full_name}
+                  disabled={!ref.target}
                   onclick={() => { if (ref.target) void selectCommit(ref.target); }}>
-                  <span class="ref-line" aria-hidden="true">⑂</span><span class="truncate">{ref.name}</span>{#if ref.is_head}<span class="head-dot" title="HEAD"></span>{/if}
+                  <span class="ref-line" aria-hidden="true">⑂</span><span class="truncate">{ref.name}</span>
+                  {#if ref.kind === "local" && ref.upstream_gone}<span class="upstream-gone">gone</span>{/if}
+                  {#if ref.kind === "local"}
+                    {@const badge = formatAheadBehind(ref.ahead, ref.behind, ref.truncated)}
+                    {#if badge}<span class="upstream-counts" title={ref.truncated ? "Upstream counts truncated at 10,000 commits" : `Upstream ${ref.upstream ?? ""}`}>{badge}</span>{/if}
+                  {/if}
+                  {#if ref.is_head}<span class="head-dot" title="HEAD"></span>{/if}
                 </button>
               {/snippet}
             </VirtualList>
@@ -637,6 +663,14 @@
         </div>
       </div>
     </div>
+    {#snippet operationControlsSlot()}{/snippet}
+    {#if operation}
+      <div class="operation-banner" role="status">
+        <span>{formatOperationBanner(operation, conflictedFiles)}</span>
+        {@render operationControlsSlot()}
+        <a class="vscode-soon" role="link" aria-disabled="true" tabindex="-1" title="coming soon">Open in VSCode</a>
+      </div>
+    {/if}
     {#if error}
       <div class="error-banner" role="alert"><div><strong>{error.code}</strong> {error.message}</div><button onclick={retry}>Retry pages</button>{#if repository}<button onclick={reopenActiveTab}>Reopen</button>{/if}<button aria-label="Dismiss error" onclick={() => { error = null; }}>×</button></div>
     {/if}

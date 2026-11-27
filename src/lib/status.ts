@@ -36,3 +36,15 @@ export function formatOperationBanner(
   }
   return [title, ...details].join(" — ");
 }
+
+export function operationBannerActions(
+  operation: OperationInfo,
+  conflictedFiles: number,
+  running: boolean,
+) {
+  return {
+    continueDisabled: running || conflictedFiles > 0,
+    skipVisible: operation.kind === "rebase" || operation.kind === "cherry-pick",
+    otherActionsDisabled: running,
+  };
+}

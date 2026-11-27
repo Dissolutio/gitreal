@@ -76,6 +76,7 @@
       role="menuitem"
       class:danger={item.danger}
       disabled={item.disabled}
+      title={item.title}
       onclick={() => { onSelect(item.id); }}
     >{item.label}</button>
   {/each}

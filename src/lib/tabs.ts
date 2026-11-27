@@ -1,4 +1,4 @@
-import type { CommitDetail, NativeError, RefInfo, Repository } from "./api";
+import type { CommitDetail, NativeError, RefInfo, Repository, StashInfo } from "./api";
 
 export const MAX_TABS = 16;
 let nextTabId = 0;
@@ -9,6 +9,7 @@ export interface RepoTab {
   name: string;
   repository: Repository | null;
   refs: RefInfo[];
+  stashes: StashInfo[];
   error: NativeError | null;
   scrollTop: number;
   scrollLeft: number;
@@ -37,6 +38,7 @@ export function createTab(path: string, name = repositoryName(path)): RepoTab {
     name,
     repository: null,
     refs: [],
+    stashes: [],
     error: null,
     scrollTop: 0,
     scrollLeft: 0,

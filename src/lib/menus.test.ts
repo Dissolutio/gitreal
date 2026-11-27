@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { branchMenuItems, commitMenuItems, mergeCommitRefLabels } from "./menus";
+import { branchMenuItems, commitMenuItems, mergeCommitRefLabels, stashMenuItems } from "./menus";
 import type { RefInfo } from "./api";
 
 const ref = (
@@ -29,6 +29,7 @@ describe("branchMenuItems", () => {
     const items = branchMenuItems({
       ref: ref("main", "local", "abc", true),
       running: false,
+      currentBranch: "main",
       hasRemoteCounterpart: true,
     });
     expect(items.map(item => item.id)).toEqual([
@@ -43,12 +44,54 @@ describe("branchMenuItems", () => {
     const items = branchMenuItems({
       ref: ref("origin/topic", "remote", "abc"),
       running: true,
+      currentBranch: "main",
       hasLocalCounterpart: true,
     });
     expect(items.map(item => item.id)).toEqual([
-      "checkout", "create-branch", "delete-remote", "delete-both", "reset-remote", "copy",
+      "merge-into-current", "rebase-current-onto", "checkout", "create-branch", "delete-remote", "delete-both", "reset-remote", "copy",
     ]);
     expect(items.filter(item => item.id !== "copy").every(item => item.disabled)).toBe(true);
+  });
+
+  it("offers merge and rebase for local and remote refs with explicit source and target names", () => {
+    for (const candidate of [
+      ref("topic", "local", "abc"),
+      ref("origin/topic", "remote", "abc"),
+    ]) {
+      const actions = branchMenuItems({
+        ref: candidate,
+        running: false,
+        currentBranch: "dev",
+      });
+      expect(actions[0].label).toBe(`Merge ${candidate.name} into dev`);
+      expect(actions[1].label).toBe(`Rebase dev onto ${candidate.name}`);
+      expect(actions[0].disabled).toBe(false);
+    }
+  });
+
+  it("hides merge and rebase for the current branch", () => {
+    const items = branchMenuItems({
+      ref: ref("main", "local", "abc", true),
+      running: false,
+      currentBranch: "main",
+    });
+    expect(items.some(item => item.id.startsWith("merge-") || item.id.startsWith("rebase-"))).toBe(false);
+  });
+
+  it("disables merge and rebase when detached or an operation is in progress", () => {
+    const detached = branchMenuItems({
+      ref: ref("origin/topic", "remote", "abc"),
+      running: false,
+      currentBranch: null,
+    });
+    expect(detached[0]).toMatchObject({ disabled: true, title: "Check out a branch first" });
+    const operating = branchMenuItems({
+      ref: ref("topic", "local", "abc"),
+      running: false,
+      currentBranch: "main",
+      operationInProgress: true,
+    });
+    expect(operating.filter(item => item.id !== "copy").every(item => item.disabled)).toBe(true);
   });
 
   it("does not offer rename or delete actions for tags", () => {
@@ -57,9 +100,30 @@ describe("branchMenuItems", () => {
   });
 
   it("exposes commit actions with mutations disabled while running", () => {
-    const items = commitMenuItems(true);
-    expect(items.map(item => item.id)).toEqual(["checkout-commit", "create-branch", "copy-commit"]);
+    const items = commitMenuItems({
+      running: true,
+      currentBranch: "main",
+    });
+    expect(items.map(item => item.id)).toEqual([
+      "checkout-commit", "create-branch", "cherry-pick", "revert-commit",
+      "reset-soft", "reset-mixed", "reset-hard", "copy-commit",
+    ]);
     expect(items.filter(item => item.id !== "copy-commit").every(item => item.disabled)).toBe(true);
+  });
+
+  it("disables commit mutations during an operation but leaves copy enabled", () => {
+    const items = commitMenuItems({ running: false, currentBranch: "dev", operationInProgress: true });
+    expect(items.filter(item => item.id !== "copy-commit").every(item => item.disabled)).toBe(true);
+    expect(items.find(item => item.id === "copy-commit")?.disabled).toBe(false);
+  });
+});
+
+describe("stashMenuItems", () => {
+  it("provides apply, pop, and confirmed drop actions and disables them during operations", () => {
+    const items = stashMenuItems(false, true);
+    expect(items.map(item => item.id)).toEqual(["stash-apply", "stash-pop-at", "stash-drop"]);
+    expect(items.every(item => item.disabled)).toBe(true);
+    expect(items[2].danger).toBe(true);
   });
 });
 

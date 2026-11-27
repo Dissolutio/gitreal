@@ -1,5 +1,6 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import type { JobFinishedEvent, JobStartedEvent } from "./snackbar";
 
 export interface Repository { repo_id: string; path: string; name: string }
 export interface KnownRepo { path: string; name: string; last_opened: number }
@@ -85,6 +86,12 @@ export function onRepoChanged(handler: (event: RepoChangedEvent) => void): Promi
 export function onRepoError(handler: (event: RepoErrorEvent) => void): Promise<UnlistenFn> {
   return desktop ? listen<RepoErrorEvent>("repo-error", event => handler(event.payload)) : Promise.resolve(() => {});
 }
+export function onJobStarted(handler: (event: JobStartedEvent) => void): Promise<UnlistenFn> {
+  return desktop ? listen<JobStartedEvent>("job-started", event => handler(event.payload)) : Promise.resolve(() => {});
+}
+export function onJobFinished(handler: (event: JobFinishedEvent) => void): Promise<UnlistenFn> {
+  return desktop ? listen<JobFinishedEvent>("job-finished", event => handler(event.payload)) : Promise.resolve(() => {});
+}
 export const api = {
   open: (path: string) => call<Repository>("open_repo", { path }),
   close: (repoId: string) => call<null>("close_repo", { repoId }),
@@ -93,6 +100,15 @@ export const api = {
     call<GraphPage>("get_graph_page", { repoId, offset, limit }),
   detail: (repoId: string, commitId: string) =>
     call<CommitDetail>("get_commit_detail", { repoId, commitId }),
+  fetch: (repoId: string, remote?: string) =>
+    call<string>("fetch", { repoId, remote }),
+  pull: (repoId: string) => call<string>("pull", { repoId }),
+  push: (repoId: string, branch: string) =>
+    call<string>("push", { repoId, branch }),
+  forcePush: (repoId: string, branch: string) =>
+    call<string>("force_push", { repoId, branch }),
+  pushRemote: (repoId: string, branch: string) =>
+    call<string>("get_push_remote", { repoId, branch }),
   config: () => call<AppConfig>("get_config", {}),
   setOpenTabs: (paths: string[], active: string | null) =>
     call<void>("set_open_tabs", { paths, active }),

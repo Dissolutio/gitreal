@@ -1,9 +1,11 @@
 use crate::{
     model::{
-        BackendError, ChangedPath, CommitDetail, GraphPage, GraphRow, OpenRepo, OperationInfo,
-        RefInfo, RefsResponse, RepoChanged, RepoError, Result,
+        BackendError, ChangedPath, CommitDetail, GraphPage, GraphRow, JobFinished, JobId,
+        JobStarted, OpenRepo, OperationInfo, RefInfo, RefsResponse, RepoChanged, RepoError, Result,
     },
     repo::graph::{LaneLayout, assign_lanes, page_edges},
+    repo::jobs::{JobQueue, JobSpec},
+    repo::remote_ops,
     repo::watcher::{MetadataWatcher, WatchSignal},
 };
 use gix::bstr::ByteSlice;
@@ -55,6 +57,7 @@ struct SnapshotRow {
 
 pub struct Backend {
     repositories: Mutex<HashMap<String, Arc<Repository>>>,
+    job_queues: Mutex<HashMap<String, Arc<JobQueue>>>,
     next_id: AtomicU64,
     event_sink: Arc<dyn EventSink>,
 }
@@ -62,6 +65,8 @@ pub struct Backend {
 pub trait EventSink: Send + Sync + 'static {
     fn repo_changed(&self, event: RepoChanged);
     fn repo_error(&self, event: RepoError);
+    fn job_started(&self, event: JobStarted);
+    fn job_finished(&self, event: JobFinished);
 }
 
 struct NullEventSink;
@@ -69,6 +74,8 @@ struct NullEventSink;
 impl EventSink for NullEventSink {
     fn repo_changed(&self, _: RepoChanged) {}
     fn repo_error(&self, _: RepoError) {}
+    fn job_started(&self, _: JobStarted) {}
+    fn job_finished(&self, _: JobFinished) {}
 }
 
 impl Default for Backend {
@@ -81,6 +88,7 @@ impl Backend {
     pub fn with_event_sink(event_sink: Arc<dyn EventSink>) -> Self {
         Self {
             repositories: Mutex::new(HashMap::new()),
+            job_queues: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(0),
             event_sink,
         }
@@ -163,11 +171,18 @@ impl Backend {
     }
 
     pub fn close_repo(&self, repo_id: &str) -> Result<()> {
-        let repository = self
+        let mut repositories = self
             .repositories
             .lock()
-            .map_err(|_| BackendError::new("internal_error", "Repository state unavailable"))?
-            .remove(repo_id);
+            .map_err(|_| BackendError::new("internal_error", "Repository state unavailable"))?;
+        let mut queues = self
+            .job_queues
+            .lock()
+            .map_err(|_| BackendError::new("internal_error", "Git job queue unavailable"))?;
+        if let Some(queue) = queues.remove(repo_id) {
+            queue.cancel_queued();
+        }
+        let repository = repositories.remove(repo_id);
         if let Some(repository) = repository {
             repository.closed.store(true, Ordering::Release);
             repository
@@ -177,6 +192,105 @@ impl Backend {
                 .take();
         }
         Ok(())
+    }
+
+    pub fn fetch(&self, repo_id: &str, remote: Option<&str>) -> Result<JobId> {
+        let repository = self.repository(repo_id)?;
+        let spec = remote_ops::fetch(repository.path.clone(), remote)?;
+        self.enqueue_job(repo_id, repository, spec)
+    }
+
+    pub fn pull(&self, repo_id: &str) -> Result<JobId> {
+        let repository = self.repository(repo_id)?;
+        let spec = remote_ops::pull(repository.path.clone())?;
+        self.enqueue_job(repo_id, repository, spec)
+    }
+
+    pub fn push(&self, repo_id: &str, branch: &str) -> Result<JobId> {
+        let repository = self.repository(repo_id)?;
+        let refs = repository
+            .state
+            .read()
+            .map_err(|_| BackendError::new("internal_error", "Repository state unavailable"))?
+            .refs
+            .clone();
+        let spec = remote_ops::push(repository.path.clone(), branch, &refs)?;
+        self.enqueue_job(repo_id, repository, spec)
+    }
+
+    pub fn force_push(&self, repo_id: &str, branch: &str) -> Result<JobId> {
+        let repository = self.repository(repo_id)?;
+        let refs = repository
+            .state
+            .read()
+            .map_err(|_| BackendError::new("internal_error", "Repository state unavailable"))?
+            .refs
+            .clone();
+        let spec = remote_ops::force_push(repository.path.clone(), branch, &refs)?;
+        self.enqueue_job(repo_id, repository, spec)
+    }
+
+    pub fn push_remote(&self, repo_id: &str, branch: &str) -> Result<String> {
+        let repository = self.repository(repo_id)?;
+        let refs = repository
+            .state
+            .read()
+            .map_err(|_| BackendError::new("internal_error", "Repository state unavailable"))?
+            .refs
+            .clone();
+        remote_ops::push_remote(repository.path.clone(), branch, &refs)
+    }
+
+    fn enqueue_job(
+        &self,
+        repo_id: &str,
+        repository: Arc<Repository>,
+        spec: JobSpec,
+    ) -> Result<JobId> {
+        let queue =
+            {
+                let repositories = self.repositories.lock().map_err(|_| {
+                    BackendError::new("internal_error", "Repository state unavailable")
+                })?;
+                if !repositories
+                    .get(repo_id)
+                    .is_some_and(|open| Arc::ptr_eq(open, &repository))
+                {
+                    return Err(BackendError::new(
+                        "unknown_repository",
+                        "Repository handle is closed or unknown",
+                    ));
+                }
+                let mut queues = self.job_queues.lock().map_err(|_| {
+                    BackendError::new("internal_error", "Git job queue unavailable")
+                })?;
+                Arc::clone(queues.entry(repo_id.to_owned()).or_insert_with(|| {
+                    Arc::new(JobQueue::new(
+                        repo_id.to_owned(),
+                        Arc::clone(&self.event_sink),
+                    ))
+                }))
+            };
+        let weak_repository = Arc::downgrade(&repository);
+        let event_sink = Arc::clone(&self.event_sink);
+        let event_repo_id = repo_id.to_owned();
+        queue
+            .enqueue(spec, move || {
+                if let Some(repository) = weak_repository.upgrade() {
+                    match repository.refresh(false) {
+                        Ok(Some(generation)) => event_sink.repo_changed(RepoChanged {
+                            repo_id: event_repo_id.clone(),
+                            generation,
+                        }),
+                        Ok(None) => {}
+                        Err(error) => event_sink.repo_error(RepoError {
+                            repo_id: event_repo_id.clone(),
+                            message: error.message,
+                        }),
+                    }
+                }
+            })
+            .map_err(|error| BackendError::new("internal_error", error))
     }
 
     fn repository(&self, id: &str) -> Result<Arc<Repository>> {

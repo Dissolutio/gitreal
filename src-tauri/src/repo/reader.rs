@@ -1,7 +1,7 @@
 use crate::{
     model::{
-        BackendError, ChangedPath, CommitDetail, GraphPage, GraphRow, OpenRepo, RefInfo,
-        RefsResponse, RepoChanged, RepoError, Result,
+        BackendError, ChangedPath, CommitDetail, GraphPage, GraphRow, OpenRepo, OperationInfo,
+        RefInfo, RefsResponse, RepoChanged, RepoError, Result,
     },
     repo::graph::{LaneLayout, assign_lanes, page_edges},
     repo::watcher::{MetadataWatcher, WatchSignal},
@@ -9,6 +9,7 @@ use crate::{
 use gix::bstr::ByteSlice;
 use std::{
     collections::{HashMap, HashSet},
+    fs,
     path::{Path, PathBuf},
     sync::atomic::AtomicBool,
     sync::{
@@ -19,6 +20,7 @@ use std::{
 
 const MAX_PAGE_SIZE: usize = 500;
 const MAX_OPEN_REPOS: usize = 16;
+const MAX_UPSTREAM_WALK: usize = 10_000;
 
 struct Repository {
     path: PathBuf,
@@ -30,6 +32,8 @@ struct Repository {
 
 struct RepositoryState {
     refs: Vec<RefInfo>,
+    operation: Option<OperationInfo>,
+    conflicted_files: usize,
     snapshot: Option<Arc<Snapshot>>,
     generation: u64,
 }
@@ -89,10 +93,13 @@ impl Backend {
         // Open exactly the selected repository, not a parent found by discovery.
         let repo = gix::open(&path).map_err(|error| BackendError::new("not_repository", error))?;
         let refs = read_refs(&repo)?;
+        let (operation, conflicted_files) = read_operation(&repo, &refs)?;
         let repository = Arc::new(Repository {
             path: path.clone(),
             state: RwLock::new(RepositoryState {
                 refs,
+                operation,
+                conflicted_files,
                 snapshot: None,
                 generation: 0,
             }),
@@ -194,6 +201,8 @@ impl Backend {
             .map_err(|_| BackendError::new("internal_error", "Repository state unavailable"))?;
         Ok(RefsResponse {
             refs: state.refs.clone(),
+            operation: state.operation.clone(),
+            conflicted_files: state.conflicted_files,
             generation: state.generation,
         })
     }
@@ -346,18 +355,30 @@ impl Repository {
         }
         let repo = gix::open(&self.path).map_err(BackendError::git)?;
         let refs = read_refs(&repo)?;
-        let unchanged = {
+        let (operation, conflicted_files) = read_operation(&repo, &refs)?;
+        let (refs_unchanged, graph_unchanged, status_unchanged) = {
             let state = self
                 .state
                 .read()
                 .map_err(|_| BackendError::new("internal_error", "Repository state unavailable"))?;
-            state.refs == refs
+            (
+                state.refs == refs,
+                state.refs.len() == refs.len()
+                    && state.refs.iter().zip(&refs).all(|(old, new)| {
+                        old.full_name == new.full_name
+                            && old.kind == new.kind
+                            && old.target == new.target
+                    }),
+                state.operation == operation && state.conflicted_files == conflicted_files,
+            )
         };
-        if unchanged && !refs_changed {
-            // Index-only changes are ignored until status information is implemented.
+        if refs_unchanged && status_unchanged && !refs_changed {
+            // Index-only changes without repository status changes are ignored.
             return Ok(None);
         }
-        let snapshot = Arc::new(build_snapshot(&repo, &refs)?);
+        let snapshot = (!graph_unchanged)
+            .then(|| build_snapshot(&repo, &refs))
+            .transpose()?;
         let mut state = self
             .state
             .write()
@@ -366,7 +387,11 @@ impl Repository {
             return Ok(None);
         }
         state.refs = refs;
-        state.snapshot = Some(snapshot);
+        state.operation = operation;
+        state.conflicted_files = conflicted_files;
+        if let Some(snapshot) = snapshot {
+            state.snapshot = Some(Arc::new(snapshot));
+        }
         state.generation = state.generation.saturating_add(1);
         Ok(Some(state.generation))
     }
@@ -515,6 +540,10 @@ impl Snapshot {
 }
 
 fn read_refs(repo: &gix::Repository) -> Result<Vec<RefInfo>> {
+    read_refs_with_limit(repo, MAX_UPSTREAM_WALK)
+}
+
+fn read_refs_with_limit(repo: &gix::Repository, walk_limit: usize) -> Result<Vec<RefInfo>> {
     let head = repo.head().map_err(BackendError::git)?;
     let head_name = head.referent_name().map(|name| name.as_bstr().to_string());
     let mut refs = Vec::new();
@@ -536,11 +565,12 @@ fn read_refs(repo: &gix::Repository) -> Result<Vec<RefInfo>> {
             continue;
         };
         // Tags may intentionally point to blobs/trees, which have no history.
-        let object = reference
-            .peel_to_id()
-            .map_err(BackendError::git)?
-            .object()
-            .map_err(BackendError::git)?;
+        let peeled = match reference.peel_to_id() {
+            Ok(id) => id,
+            Err(_) if reference.try_id().is_none() => continue,
+            Err(error) => return Err(BackendError::git(error)),
+        };
+        let object = peeled.object().map_err(BackendError::git)?;
         let target = (object.kind == gix::object::Kind::Commit).then(|| object.id.to_string());
         refs.push(RefInfo {
             name: full_name.trim_start_matches(prefix).into(),
@@ -548,6 +578,11 @@ fn read_refs(repo: &gix::Repository) -> Result<Vec<RefInfo>> {
             full_name,
             kind,
             target,
+            upstream: None,
+            ahead: None,
+            behind: None,
+            upstream_gone: false,
+            truncated: false,
         });
     }
     let target = if head.is_unborn() {
@@ -566,9 +601,171 @@ fn read_refs(repo: &gix::Repository) -> Result<Vec<RefInfo>> {
         kind: "head",
         target,
         is_head: true,
+        upstream: None,
+        ahead: None,
+        behind: None,
+        upstream_gone: false,
+        truncated: false,
     });
+    let config = repo.config_snapshot();
+    for index in 0..refs.len() {
+        if refs[index].kind != "local" {
+            continue;
+        }
+        let branch = refs[index].name.as_str();
+        let (Some(remote), Some(merge)) = (
+            config.string_by("branch", branch, "remote"),
+            config.string_by("branch", branch, "merge"),
+        ) else {
+            continue;
+        };
+        let remote = remote.to_string();
+        let merge = merge.to_string();
+        let (upstream_ref, upstream_name) = if let Some(name) = merge.strip_prefix("refs/heads/") {
+            if remote == "." {
+                (merge.clone(), name.to_owned())
+            } else {
+                (
+                    format!("refs/remotes/{remote}/{name}"),
+                    format!("{remote}/{name}"),
+                )
+            }
+        } else {
+            (merge.clone(), merge.clone())
+        };
+        refs[index].upstream = Some(upstream_name);
+        let upstream = refs
+            .iter()
+            .find(|reference| reference.full_name == upstream_ref);
+        let Some(upstream) = upstream else {
+            refs[index].upstream_gone = true;
+            continue;
+        };
+        let Some(local_target) = refs[index].target.as_deref() else {
+            continue;
+        };
+        let Some(upstream_target) = upstream.target.as_deref() else {
+            continue;
+        };
+        let local = gix::ObjectId::from_hex(local_target.as_bytes()).map_err(BackendError::git)?;
+        let upstream =
+            gix::ObjectId::from_hex(upstream_target.as_bytes()).map_err(BackendError::git)?;
+        let (ahead, behind, truncated) = ahead_behind(repo, local, upstream, walk_limit)?;
+        refs[index].ahead = Some(ahead);
+        refs[index].behind = Some(behind);
+        refs[index].truncated = truncated;
+    }
     refs.sort_by(|a, b| a.full_name.cmp(&b.full_name));
     Ok(refs)
+}
+
+fn ahead_behind(
+    repo: &gix::Repository,
+    local: gix::ObjectId,
+    upstream: gix::ObjectId,
+    limit: usize,
+) -> Result<(usize, usize, bool)> {
+    if local == upstream {
+        return Ok((0, 0, false));
+    }
+    let (ahead, ahead_truncated) = count_exclusive(repo, local, upstream, limit)?;
+    let (behind, behind_truncated) = count_exclusive(repo, upstream, local, limit)?;
+    let truncated = ahead_truncated || behind_truncated;
+    Ok((ahead, behind, truncated))
+}
+
+fn count_exclusive(
+    repo: &gix::Repository,
+    tip: gix::ObjectId,
+    hidden: gix::ObjectId,
+    limit: usize,
+) -> Result<(usize, bool)> {
+    let mut count = 0;
+    for entry in repo
+        .rev_walk([tip])
+        .with_hidden([hidden])
+        .sorting(gix::revision::walk::Sorting::BreadthFirst)
+        .all()
+        .map_err(BackendError::git)?
+        .take(limit.saturating_add(1))
+    {
+        entry.map_err(BackendError::git)?;
+        count += 1;
+    }
+    let truncated = count > limit;
+    Ok((count.min(limit), truncated))
+}
+
+fn read_operation(
+    repo: &gix::Repository,
+    refs: &[RefInfo],
+) -> Result<(Option<OperationInfo>, usize)> {
+    let git_dir = repo.git_dir();
+    let rebase_merge = git_dir.join("rebase-merge");
+    let rebase_apply = git_dir.join("rebase-apply");
+    let operation = if rebase_merge.is_dir() {
+        Some(rebase_operation(&rebase_merge, refs, false))
+    } else if rebase_apply.is_dir() {
+        Some(rebase_operation(&rebase_apply, refs, true))
+    } else if git_dir.join("CHERRY_PICK_HEAD").is_file() {
+        Some(simple_operation("cherry-pick"))
+    } else if git_dir.join("REVERT_HEAD").is_file() {
+        Some(simple_operation("revert"))
+    } else if git_dir.join("MERGE_HEAD").is_file() {
+        Some(simple_operation("merge"))
+    } else if git_dir.join("BISECT_LOG").is_file() {
+        Some(simple_operation("bisect"))
+    } else {
+        None
+    };
+    let conflicted_files = if operation.is_some() {
+        let index = repo.index_or_empty().map_err(BackendError::git)?;
+        index
+            .entries()
+            .iter()
+            .filter(|entry| entry.stage_raw() != 0)
+            .map(|entry| entry.path(&index).to_vec())
+            .collect::<HashSet<_>>()
+            .len()
+    } else {
+        0
+    };
+    Ok((operation, conflicted_files))
+}
+
+fn simple_operation(kind: &'static str) -> OperationInfo {
+    OperationInfo {
+        kind,
+        head_name: None,
+        onto: None,
+        step: None,
+        total_steps: None,
+    }
+}
+
+fn rebase_operation(path: &Path, refs: &[RefInfo], apply: bool) -> OperationInfo {
+    let read = |name: &str| {
+        fs::read_to_string(path.join(name))
+            .ok()
+            .map(|value| value.trim().to_owned())
+    };
+    let head_name =
+        read("head-name").map(|name| name.strip_prefix("refs/heads/").unwrap_or(&name).to_owned());
+    let onto = read("onto").map(|id| {
+        refs.iter()
+            .filter(|reference| reference.kind == "local")
+            .chain(refs.iter().filter(|reference| reference.kind == "remote"))
+            .find(|reference| reference.target.as_deref() == Some(id.as_str()))
+            .map(|reference| reference.name.clone())
+            .unwrap_or(id)
+    });
+    OperationInfo {
+        kind: "rebase",
+        head_name,
+        onto,
+        step: read(if apply { "next" } else { "msgnum" }).and_then(|value| value.parse().ok()),
+        total_steps: read(if apply { "last" } else { "end" }).and_then(|value| value.parse().ok()),
+    }
 }
 
 #[cfg(test)]
@@ -752,6 +949,8 @@ mod tests {
             path: PathBuf::new(),
             state: RwLock::new(RepositoryState {
                 refs: Vec::new(),
+                operation: None,
+                conflicted_files: 0,
                 snapshot: Some(Arc::new(snapshot)),
                 generation: 0,
             }),
@@ -780,5 +979,52 @@ mod tests {
         eprintln!(
             "Synthetic 20k/200 get_graph_page(0, 200) average: before {before:?}, after {after:?}"
         );
+    }
+
+    #[test]
+    fn upstream_counts_truncate_at_the_test_bound() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(path)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.name", "Test Author"]);
+        git(&["config", "user.email", "author@example.test"]);
+        fs::write(path.join("tracked.txt"), "0").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "root"]);
+        let upstream = git(&["rev-parse", "HEAD"]);
+        git(&["update-ref", "refs/remotes/origin/main", &upstream]);
+        git(&["config", "branch.main.remote", "origin"]);
+        git(&["config", "branch.main.merge", "refs/heads/main"]);
+        for index in 1..=4 {
+            fs::write(path.join("tracked.txt"), index.to_string()).unwrap();
+            git(&["add", "."]);
+            git(&["commit", "-m", &format!("commit {index}")]);
+        }
+
+        let repo = gix::open(path).unwrap();
+        let main = read_refs_with_limit(&repo, 2).unwrap();
+        let main = main
+            .iter()
+            .find(|reference| reference.name == "main")
+            .unwrap();
+        assert_eq!(main.ahead, Some(2));
+        assert_eq!(main.behind, Some(0));
+        assert!(main.truncated);
     }
 }

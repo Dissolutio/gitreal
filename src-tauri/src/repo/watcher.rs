@@ -130,11 +130,16 @@ impl WatchScopes {
         for dir in [&git_dir, &common_dir] {
             for name in [
                 "HEAD",
+                "config",
+                "config.worktree",
                 "packed-refs",
                 "index",
                 "FETCH_HEAD",
                 "ORIG_HEAD",
                 "MERGE_HEAD",
+                "CHERRY_PICK_HEAD",
+                "REVERT_HEAD",
+                "BISECT_LOG",
             ] {
                 files.insert(dir.join(name));
             }

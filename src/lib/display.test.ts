@@ -4,6 +4,7 @@ import { safeRefLabel } from "./display";
 describe("safeRefLabel", () => {
   it("reveals every bidi and zero-width code point in the protected ranges", () => {
     const ranges = [
+      [0x061c, 0x061c],
       [0x202a, 0x202e],
       [0x2066, 0x2069],
       [0x200b, 0x200f],

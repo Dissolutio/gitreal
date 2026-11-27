@@ -982,7 +982,7 @@
           <div class="empty-graph" aria-hidden="true"><i></i><i></i><i></i><span>⑂</span></div>
           <span class="eyebrow">A CLEARER VIEW OF YOUR CODE</span>
           <h2>{opening ? "Opening repository…" : activeTab?.error ? "Repository unavailable." : "Every commit tells a story."}</h2>
-          <p>{activeTab?.error ? activeTab.error.message : desktop ? "Open a local Git repository to explore its branches, commits, and connections." : "Gitreal is a desktop Git explorer. Open the desktop app to browse a local repository."}</p>
+          <p>{activeTab?.error ? safeRefLabel(activeTab.error.message) : desktop ? "Open a local Git repository to explore its branches, commits, and connections." : "Gitreal is a desktop Git explorer. Open the desktop app to browse a local repository."}</p>
           {#if activeTab?.error}<button class="primary-button" onclick={reopenActiveTab}>Try again</button>{/if}
           {#if desktop}<button class="primary-button" onclick={chooseRepository} disabled={opening || choosing}>▱ &nbsp; Open repository</button>{:else}<span class="desktop-note">DESKTOP APP REQUIRED</span>{/if}
           <div class="empty-features"><span>○ Virtualized history</span><span>⑂ Branch topology</span><span>◇ Commit details</span></div>
@@ -994,7 +994,7 @@
           {#each visibleRows as row, i (range.start + i)}
             <button class="commit-row" class:selected={row?.commit_id === selected} class:placeholder={!row}
               style:top="{(range.start + i) * ROW_HEIGHT}px" disabled={!row}
-              aria-label={row ? `${row.summary}, ${row.author}, ${row.commit_id.slice(0, 7)}` : "Loading commit"}
+              aria-label={row ? `${safeRefLabel(row.summary)}, ${safeRefLabel(row.author)}, ${row.commit_id.slice(0, 7)}` : "Loading commit"}
               aria-pressed={!!row && row.commit_id === selected}
               onclick={() => { if (row) void selectCommit(row.commit_id); }}
               oncontextmenu={(event) => { if (row) showContextMenu(event, { kind: "commit", oid: row.commit_id }); }}>
@@ -1014,8 +1014,8 @@
                   <span>{label.name}</span>
                 </span>
               {/each}{/if}</span>
-              <span></span><span class="commit-message">{row?.summary ?? "Loading commits…"}{#if row && row.parents.length > 1}<span class="merge-label">MERGE</span>{/if}</span>
-              <span class="commit-author">{row?.author ?? ""}</span><span class="commit-date">{row ? date(row.date) : ""}</span>
+              <span></span><span class="commit-message">{safeRefLabel(row?.summary ?? "Loading commits…")}{#if row && row.parents.length > 1}<span class="merge-label">MERGE</span>{/if}</span>
+              <span class="commit-author">{safeRefLabel(row?.author ?? "")}</span><span class="commit-date">{row ? date(row.date) : ""}</span>
             </button>
           {/each}
         </div>
@@ -1037,10 +1037,10 @@
     {:else if detail}
       <div class="detail-content">
         <span class="eyebrow">COMMIT</span><code class="full-hash">{detail.commit_id}</code>
-        <h2 class="detail-summary">{detail.summary}</h2>
-        <div class="author-card"><span class="avatar">{detail.author.slice(0, 1).toUpperCase()}</span><div><strong>{detail.author}</strong><small>{detail.author_email}</small></div></div>
+        <h2 class="detail-summary">{safeRefLabel(detail.summary)}</h2>
+        <div class="author-card"><span class="avatar">{safeRefLabel(detail.author.slice(0, 1).toUpperCase())}</span><div><strong>{safeRefLabel(detail.author)}</strong><small>{safeRefLabel(detail.author_email)}</small></div></div>
         <p class="detail-date">{new Date(detail.date * 1000).toLocaleString()}</p>
-        {#if detail.message !== detail.summary}<pre class="commit-body">{detail.message}</pre>{/if}
+        {#if detail.message !== detail.summary}<pre class="commit-body">{safeRefLabel(detail.message)}</pre>{/if}
         <div class="parent-section"><span class="eyebrow">PARENTS · {detail.parents.length}</span>
           <VirtualList items={detail.parents} maxHeight={108}>
             {#snippet children(parent)}<button class="parent-link" onclick={() => selectCommit(parent)} title={parent}>⑂ &nbsp; {parent.slice(0, 12)} <span>↗</span></button>{/snippet}
@@ -1049,7 +1049,7 @@
         </div>
         <div class="paths-heading"><span class="eyebrow">CHANGED FILES</span><span class="count">{detail.changed_paths.length}</span></div>
         <VirtualList items={detail.changed_paths} maxHeight={360}>
-          {#snippet children(change)}<div class="changed-path" title={change.old_path ? `${change.old_path} → ${change.path}` : change.path}><span class="file-status" class:added={change.status === "added"} class:deleted={change.status === "deleted"}>{change.status.slice(0, 1).toUpperCase()}</span><span class="truncate">{change.path}</span></div>{/snippet}
+          {#snippet children(change)}<div class="changed-path" title={safeRefLabel(change.old_path ? `${change.old_path} → ${change.path}` : change.path)}><span class="file-status" class:added={change.status === "added"} class:deleted={change.status === "deleted"}>{change.status.slice(0, 1).toUpperCase()}</span><span class="truncate">{safeRefLabel(change.path)}</span></div>{/snippet}
         </VirtualList>
         {#if !detail.changed_paths.length}<p class="root-label">No changed files</p>{/if}
       </div>

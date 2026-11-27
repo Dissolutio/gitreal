@@ -293,9 +293,17 @@ mod tests {
 
     #[test]
     fn validates_refs_and_oids_before_building_arguments() {
-        for invalid in ["--help", "topic;touch", "feature..bad", "refs/heads/x "] {
+        for invalid in [
+            "--help",
+            "feature..bad",
+            "refs/heads/x ",
+            "topic.lock",
+            "a@{1}",
+        ] {
             assert!(validate_ref(invalid).is_err(), "{invalid}");
         }
+        // Git allows `;` in ref names; argv is passed without a shell, so it's harmless.
+        assert!(validate_ref("topic;touch").is_ok());
         assert!(validate_ref("refs/heads/feature/topic").is_ok());
         assert!(validate_oid(&"a".repeat(40)).is_ok());
         assert!(validate_oid("HEAD").is_err());

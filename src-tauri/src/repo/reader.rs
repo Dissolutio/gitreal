@@ -7,7 +7,7 @@ use crate::{
     repo::graph::{LaneLayout, assign_lanes, page_edges},
     repo::jobs::{JobQueue, JobSpec},
     repo::remote_ops,
-    repo::watcher::{MetadataWatcher, WatchSignal},
+    repo::watcher::{MetadataWatcher, WatchChanges, WatchSignal},
 };
 use gix::bstr::ByteSlice;
 use std::{
@@ -24,6 +24,10 @@ use std::{
 const MAX_PAGE_SIZE: usize = 500;
 const MAX_OPEN_REPOS: usize = 16;
 const MAX_UPSTREAM_WALK: usize = 10_000;
+type UpstreamCache = HashMap<(gix::ObjectId, gix::ObjectId), (usize, usize, bool)>;
+type RefFingerprintEntry = (PathBuf, u64, Option<std::time::SystemTime>, bool, bool);
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RefFingerprint(Vec<RefFingerprintEntry>);
 
 struct Repository {
     path: PathBuf,
@@ -35,6 +39,8 @@ struct Repository {
 
 struct RepositoryState {
     refs: Vec<RefInfo>,
+    upstream_cache: UpstreamCache,
+    ref_fingerprint: RefFingerprint,
     operation: Option<OperationInfo>,
     conflicted_files: usize,
     snapshot: Option<Arc<Snapshot>>,
@@ -101,12 +107,16 @@ impl Backend {
             .map_err(|error| BackendError::new("invalid_path", error))?;
         // Open exactly the selected repository, not a parent found by discovery.
         let repo = gix::open(&path).map_err(|error| BackendError::new("not_repository", error))?;
-        let refs = read_refs(&repo)?;
+        let mut upstream_cache = UpstreamCache::new();
+        let refs = read_refs_with_cache(&repo, MAX_UPSTREAM_WALK, &mut upstream_cache)?;
+        let ref_fingerprint = read_ref_fingerprint(&repo)?;
         let (operation, conflicted_files) = read_operation(&repo, &refs)?;
         let repository = Arc::new(Repository {
             path: path.clone(),
             state: RwLock::new(RepositoryState {
                 refs,
+                upstream_cache,
+                ref_fingerprint,
                 operation,
                 conflicted_files,
                 snapshot: None,
@@ -122,12 +132,12 @@ impl Backend {
         let event_sink = Arc::clone(&self.event_sink);
         let watcher = MetadataWatcher::start(&repo, move |signal| {
             if let Some(repository) = weak_repository.upgrade() {
-                let (refs_changed, watcher_error) = match signal {
-                    WatchSignal::Changed(refs_changed) => (refs_changed, None),
-                    WatchSignal::Error(message) => (false, Some(message)),
+                let (changes, watcher_error) = match signal {
+                    WatchSignal::Changed(changes) => (changes, None),
+                    WatchSignal::Error(message) => (WatchChanges::ALL, Some(message)),
                 };
                 let mut watcher_error = watcher_error;
-                match repository.refresh(refs_changed) {
+                match repository.refresh(changes) {
                     Ok(Some(generation)) => event_sink.repo_changed(RepoChanged {
                         repo_id: event_repo_id.clone(),
                         generation,
@@ -399,7 +409,7 @@ impl Backend {
         queue
             .enqueue(spec, move || {
                 if let Some(repository) = weak_repository.upgrade() {
-                    match repository.refresh(false) {
+                    match repository.refresh(WatchChanges::ALL) {
                         Ok(Some(generation)) => event_sink.repo_changed(RepoChanged {
                             repo_id: event_repo_id.clone(),
                             generation,
@@ -578,7 +588,7 @@ impl Repository {
         }
     }
 
-    fn refresh(&self, refs_changed: bool) -> Result<Option<u64>> {
+    fn refresh(&self, changes: WatchChanges) -> Result<Option<u64>> {
         if self.closed.load(Ordering::Acquire) {
             return Ok(None);
         }
@@ -590,8 +600,32 @@ impl Repository {
             return Ok(None);
         }
         let repo = gix::open(&self.path).map_err(BackendError::git)?;
-        let refs = read_refs(&repo)?;
-        let (operation, conflicted_files) = read_operation(&repo, &refs)?;
+        let (mut refs, mut upstream_cache, mut ref_fingerprint) = {
+            let state = self
+                .state
+                .read()
+                .map_err(|_| BackendError::new("internal_error", "Repository state unavailable"))?;
+            (
+                state.refs.clone(),
+                state.upstream_cache.clone(),
+                state.ref_fingerprint.clone(),
+            )
+        };
+        let should_read_refs =
+            changes.refs && (changes.force || read_ref_fingerprint(&repo)? != ref_fingerprint);
+        if should_read_refs {
+            refs = read_refs_with_cache(&repo, MAX_UPSTREAM_WALK, &mut upstream_cache)?;
+            ref_fingerprint = read_ref_fingerprint(&repo)?;
+        }
+        let (operation, conflicted_files) = if changes.refs || changes.status {
+            read_operation(&repo, &refs)?
+        } else {
+            let state = self
+                .state
+                .read()
+                .map_err(|_| BackendError::new("internal_error", "Repository state unavailable"))?;
+            (state.operation.clone(), state.conflicted_files)
+        };
         let (refs_unchanged, graph_unchanged, status_unchanged) = {
             let state = self
                 .state
@@ -608,8 +642,15 @@ impl Repository {
                 state.operation == operation && state.conflicted_files == conflicted_files,
             )
         };
-        if refs_unchanged && status_unchanged && !refs_changed {
-            // Index-only changes without repository status changes are ignored.
+        if refs_unchanged && status_unchanged && !changes.force {
+            // Unchanged refs and status do not need a new generation or event.
+            if should_read_refs {
+                let mut state = self.state.write().map_err(|_| {
+                    BackendError::new("internal_error", "Repository state unavailable")
+                })?;
+                state.upstream_cache = upstream_cache;
+                state.ref_fingerprint = ref_fingerprint;
+            }
             return Ok(None);
         }
         let snapshot = (!graph_unchanged)
@@ -623,6 +664,8 @@ impl Repository {
             return Ok(None);
         }
         state.refs = refs;
+        state.upstream_cache = upstream_cache;
+        state.ref_fingerprint = ref_fingerprint;
         state.operation = operation;
         state.conflicted_files = conflicted_files;
         if let Some(snapshot) = snapshot {
@@ -775,11 +818,69 @@ impl Snapshot {
     }
 }
 
-fn read_refs(repo: &gix::Repository) -> Result<Vec<RefInfo>> {
-    read_refs_with_limit(repo, MAX_UPSTREAM_WALK)
+fn read_ref_fingerprint(repo: &gix::Repository) -> Result<RefFingerprint> {
+    let mut paths: Vec<RefFingerprintEntry> = Vec::new();
+    let mut ref_directories = vec![repo.git_dir().join("refs"), repo.common_dir().join("refs")];
+    ref_directories.sort();
+    ref_directories.dedup();
+    for directory in ref_directories {
+        collect_ref_metadata(&directory, &mut paths)?;
+    }
+    for path in [
+        repo.git_dir().join("HEAD"),
+        repo.git_dir().join("config"),
+        repo.git_dir().join("config.worktree"),
+        repo.git_dir().join("packed-refs"),
+        repo.common_dir().join("config"),
+        repo.common_dir().join("config.worktree"),
+        repo.common_dir().join("packed-refs"),
+    ] {
+        collect_ref_metadata(&path, &mut paths)?;
+    }
+    paths.sort_by(|a, b| a.0.cmp(&b.0));
+    paths.dedup_by(|a, b| a.0 == b.0);
+    Ok(RefFingerprint(paths))
 }
 
+fn collect_ref_metadata(path: &Path, entries: &mut Vec<RefFingerprintEntry>) -> Result<()> {
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(BackendError::new("git_error", error)),
+        };
+        let is_dir = metadata.is_dir();
+        let is_symlink = metadata.file_type().is_symlink();
+        entries.push((
+            path.clone(),
+            metadata.len(),
+            metadata.modified().ok(),
+            is_dir,
+            is_symlink,
+        ));
+        if is_dir {
+            for entry in fs::read_dir(path).map_err(BackendError::git)? {
+                let entry = entry.map_err(BackendError::git)?;
+                pending.push(entry.path());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn read_refs_with_limit(repo: &gix::Repository, walk_limit: usize) -> Result<Vec<RefInfo>> {
+    read_refs_with_cache(repo, walk_limit, &mut UpstreamCache::new())
+}
+
+fn read_refs_with_cache(
+    repo: &gix::Repository,
+    walk_limit: usize,
+    upstream_cache: &mut UpstreamCache,
+) -> Result<Vec<RefInfo>> {
+    #[cfg(test)]
+    let ref_iteration_started = std::time::Instant::now();
     let head = repo.head().map_err(BackendError::git)?;
     let head_name = head.referent_name().map(|name| name.as_bstr().to_string());
     let mut refs = Vec::new();
@@ -844,6 +945,14 @@ fn read_refs_with_limit(repo: &gix::Repository, walk_limit: usize) -> Result<Vec
         truncated: false,
     });
     let config = repo.config_snapshot();
+    refs.sort_by(|a, b| a.full_name.cmp(&b.full_name));
+    #[cfg(test)]
+    let ref_iteration_elapsed = ref_iteration_started.elapsed();
+    #[cfg(test)]
+    let config_started = std::time::Instant::now();
+    #[cfg(test)]
+    let mut walk_elapsed = std::time::Duration::ZERO;
+    let mut used_cache_keys = HashSet::new();
     for index in 0..refs.len() {
         if refs[index].kind != "local" {
             continue;
@@ -885,28 +994,53 @@ fn read_refs_with_limit(repo: &gix::Repository, walk_limit: usize) -> Result<Vec
         let Some(upstream_ref) = upstream_ref else {
             continue;
         };
-        let upstream = refs
-            .iter()
-            .find(|reference| reference.full_name == upstream_ref);
-        let Some(upstream) = upstream else {
-            refs[index].upstream_gone = true;
-            continue;
+        let upstream_index = match refs
+            .binary_search_by(|reference| reference.full_name.as_str().cmp(upstream_ref.as_str()))
+        {
+            Ok(index) => index,
+            Err(_) => {
+                refs[index].upstream_gone = true;
+                continue;
+            }
         };
         let Some(local_target) = refs[index].target.as_deref() else {
             continue;
         };
-        let Some(upstream_target) = upstream.target.as_deref() else {
+        let Some(upstream_target) = refs[upstream_index].target.as_deref() else {
             continue;
         };
         let local = gix::ObjectId::from_hex(local_target.as_bytes()).map_err(BackendError::git)?;
         let upstream =
             gix::ObjectId::from_hex(upstream_target.as_bytes()).map_err(BackendError::git)?;
-        let (ahead, behind, truncated) = ahead_behind(repo, local, upstream, walk_limit)?;
+        let key = (local, upstream);
+        used_cache_keys.insert(key);
+        let counts = match upstream_cache.get(&key) {
+            Some(counts) => *counts,
+            None => {
+                #[cfg(test)]
+                let walk_started = std::time::Instant::now();
+                let counts = ahead_behind(repo, local, upstream, walk_limit)?;
+                #[cfg(test)]
+                {
+                    walk_elapsed += walk_started.elapsed();
+                }
+                upstream_cache.insert(key, counts);
+                counts
+            }
+        };
+        let (ahead, behind, truncated) = counts;
         refs[index].ahead = Some(ahead);
         refs[index].behind = Some(behind);
         refs[index].truncated = truncated;
     }
+    upstream_cache.retain(|key, _| used_cache_keys.contains(key));
     refs.sort_by(|a, b| a.full_name.cmp(&b.full_name));
+    #[cfg(test)]
+    tests::record_read_profile(
+        ref_iteration_elapsed,
+        config_started.elapsed().saturating_sub(walk_elapsed),
+        walk_elapsed,
+    );
     Ok(refs)
 }
 
@@ -931,6 +1065,8 @@ fn count_exclusive(
     hidden: gix::ObjectId,
     limit: usize,
 ) -> Result<(usize, bool)> {
+    #[cfg(test)]
+    tests::record_upstream_walk();
     let mut count = 0;
     for entry in repo
         .rev_walk([tip])
@@ -1022,7 +1158,86 @@ fn rebase_operation(path: &Path, refs: &[RefInfo], apply: bool) -> OperationInfo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{hint::black_box, mem::size_of, time::Instant};
+    use std::{
+        cell::RefCell,
+        hint::black_box,
+        mem::size_of,
+        process::Command,
+        time::{Duration, Instant},
+    };
+
+    #[derive(Default)]
+    struct ReadProfile {
+        ref_iteration: Duration,
+        config_resolution: Duration,
+        walks: Duration,
+    }
+
+    thread_local! {
+        static UPSTREAM_WALK_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        static READ_PROFILE: RefCell<ReadProfile> = RefCell::default();
+    }
+
+    pub(super) fn record_upstream_walk() {
+        UPSTREAM_WALK_COUNT.with(|count| count.set(count.get() + 1));
+    }
+
+    fn reset_upstream_walk_count() {
+        UPSTREAM_WALK_COUNT.with(|count| count.set(0));
+    }
+
+    fn upstream_walk_count() -> usize {
+        UPSTREAM_WALK_COUNT.with(std::cell::Cell::get)
+    }
+
+    fn reset_read_profile() {
+        READ_PROFILE.with(|profile| *profile.borrow_mut() = ReadProfile::default());
+    }
+
+    fn read_profile() -> (Duration, Duration, Duration) {
+        READ_PROFILE.with(|profile| {
+            let profile = profile.borrow();
+            (
+                profile.ref_iteration,
+                profile.config_resolution,
+                profile.walks,
+            )
+        })
+    }
+
+    pub(super) fn record_read_profile(
+        ref_iteration: Duration,
+        config_resolution: Duration,
+        walks: Duration,
+    ) {
+        READ_PROFILE.with(|profile| {
+            let mut profile = profile.borrow_mut();
+            profile.ref_iteration += ref_iteration;
+            profile.config_resolution += config_resolution;
+            profile.walks += walks;
+        });
+    }
+
+    fn git(path: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .current_dir(path)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    fn commit_tree(path: &Path, tree: &str, parent: &str, message: &str) -> String {
+        git(path, &["commit-tree", tree, "-p", parent, "-m", message])
+    }
 
     #[derive(Clone)]
     struct LegacyEdge {
@@ -1200,6 +1415,8 @@ mod tests {
             path: PathBuf::new(),
             state: RwLock::new(RepositoryState {
                 refs: Vec::new(),
+                upstream_cache: UpstreamCache::new(),
+                ref_fingerprint: RefFingerprint(Vec::new()),
                 operation: None,
                 conflicted_files: 0,
                 snapshot: Some(Arc::new(snapshot)),
@@ -1287,5 +1504,353 @@ mod tests {
         assert_eq!(main.ahead, Some(2));
         assert_eq!(main.behind, Some(0));
         assert!(main.truncated);
+    }
+
+    #[test]
+    fn upstream_cache_tracks_moved_and_deleted_refs_and_skips_unchanged_walks() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path();
+        git(path, &["init", "-b", "main"]);
+        git(path, &["config", "user.name", "Test Author"]);
+        git(path, &["config", "user.email", "author@example.test"]);
+        fs::write(path.join("tracked.txt"), "root").unwrap();
+        git(path, &["add", "."]);
+        git(path, &["commit", "-m", "root"]);
+        let root = git(path, &["rev-parse", "HEAD"]);
+        let tree = git(path, &["rev-parse", "HEAD^{tree}"]);
+        git(
+            path,
+            &[
+                "config",
+                "remote.origin.url",
+                "https://example.invalid/repo",
+            ],
+        );
+        git(
+            path,
+            &[
+                "config",
+                "remote.origin.fetch",
+                "+refs/heads/*:refs/remotes/origin/*",
+            ],
+        );
+        git(path, &["config", "branch.main.remote", "origin"]);
+        git(path, &["config", "branch.main.merge", "refs/heads/main"]);
+        let local_one = commit_tree(path, &tree, &root, "local one");
+        let upstream_one = commit_tree(path, &tree, &root, "upstream one");
+        git(path, &["update-ref", "refs/heads/main", &local_one]);
+        git(
+            path,
+            &["update-ref", "refs/remotes/origin/main", &upstream_one],
+        );
+
+        let mut cache = UpstreamCache::new();
+        let repo = gix::open(path).unwrap();
+        let initial = read_refs_with_cache(&repo, MAX_UPSTREAM_WALK, &mut cache).unwrap();
+        let main = initial
+            .iter()
+            .find(|reference| reference.name == "main")
+            .unwrap();
+        assert_eq!((main.ahead, main.behind), (Some(1), Some(1)));
+        assert_eq!(upstream_walk_count(), 2);
+
+        reset_upstream_walk_count();
+        let repo = gix::open(path).unwrap();
+        read_refs_with_cache(&repo, MAX_UPSTREAM_WALK, &mut cache).unwrap();
+        assert_eq!(upstream_walk_count(), 0);
+
+        let local_two = commit_tree(path, &tree, &local_one, "local two");
+        git(path, &["update-ref", "refs/heads/main", &local_two]);
+        reset_upstream_walk_count();
+        let repo = gix::open(path).unwrap();
+        let moved_local = read_refs_with_cache(&repo, MAX_UPSTREAM_WALK, &mut cache).unwrap();
+        let main = moved_local
+            .iter()
+            .find(|reference| reference.name == "main")
+            .unwrap();
+        assert_eq!((main.ahead, main.behind), (Some(2), Some(1)));
+        assert_eq!(upstream_walk_count(), 2);
+
+        let upstream_two = commit_tree(path, &tree, &upstream_one, "upstream two");
+        git(
+            path,
+            &["update-ref", "refs/remotes/origin/main", &upstream_two],
+        );
+        reset_upstream_walk_count();
+        let repo = gix::open(path).unwrap();
+        let moved_upstream = read_refs_with_cache(&repo, MAX_UPSTREAM_WALK, &mut cache).unwrap();
+        let main = moved_upstream
+            .iter()
+            .find(|reference| reference.name == "main")
+            .unwrap();
+        assert_eq!((main.ahead, main.behind), (Some(2), Some(2)));
+        assert_eq!(upstream_walk_count(), 2);
+
+        git(path, &["branch", "-m", "renamed"]);
+        reset_upstream_walk_count();
+        let repo = gix::open(path).unwrap();
+        let renamed_refs = read_refs_with_cache(&repo, MAX_UPSTREAM_WALK, &mut cache).unwrap();
+        let renamed_ref = renamed_refs
+            .iter()
+            .find(|reference| reference.name == "renamed")
+            .unwrap();
+        assert_eq!((renamed_ref.ahead, renamed_ref.behind), (Some(2), Some(2)));
+        assert_eq!(upstream_walk_count(), 0);
+
+        let operation = read_operation(&repo, &renamed_refs).unwrap();
+        let ref_fingerprint = read_ref_fingerprint(&repo).unwrap();
+        let repository = Repository {
+            path: path.to_path_buf(),
+            state: RwLock::new(RepositoryState {
+                refs: renamed_refs,
+                upstream_cache: cache.clone(),
+                ref_fingerprint,
+                operation: operation.0,
+                conflicted_files: operation.1,
+                snapshot: None,
+                generation: 0,
+            }),
+            refresh_lock: Mutex::new(()),
+            watcher: Mutex::new(None),
+            closed: AtomicBool::new(false),
+        };
+        reset_upstream_walk_count();
+        assert_eq!(
+            repository
+                .refresh(WatchChanges {
+                    refs: true,
+                    status: true,
+                    force: false,
+                })
+                .unwrap(),
+            None
+        );
+        assert_eq!(upstream_walk_count(), 0);
+
+        git(path, &["update-ref", "-d", "refs/remotes/origin/main"]);
+        reset_upstream_walk_count();
+        let repo = gix::open(path).unwrap();
+        let deleted = read_refs_with_cache(&repo, MAX_UPSTREAM_WALK, &mut cache).unwrap();
+        let renamed_ref = deleted
+            .iter()
+            .find(|reference| reference.name == "renamed")
+            .unwrap();
+        assert!(renamed_ref.upstream_gone);
+        assert_eq!(renamed_ref.ahead, None);
+        assert_eq!(renamed_ref.behind, None);
+        assert!(cache.is_empty());
+        assert_eq!(upstream_walk_count(), 0);
+    }
+
+    #[test]
+    fn upstream_cache_synthetic_cold_warm_and_moved_branch_timings() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path();
+        git(path, &["init", "-b", "seed"]);
+        git(path, &["config", "user.name", "Test Author"]);
+        git(path, &["config", "user.email", "author@example.test"]);
+        fs::write(path.join("tracked.txt"), "root").unwrap();
+        git(path, &["add", "."]);
+        git(path, &["commit", "-m", "root"]);
+        let root = git(path, &["rev-parse", "HEAD"]);
+        let tree = git(path, &["rev-parse", "HEAD^{tree}"]);
+        git(
+            path,
+            &[
+                "config",
+                "remote.upstream.url",
+                "https://example.invalid/repo",
+            ],
+        );
+        git(
+            path,
+            &[
+                "config",
+                "remote.upstream.fetch",
+                "+refs/heads/*:refs/remotes/upstream/*",
+            ],
+        );
+        let mut local_chain = vec![root.clone()];
+        let mut upstream_chain = vec![root.clone()];
+        for index in 1..=300 {
+            local_chain.push(commit_tree(
+                path,
+                &tree,
+                local_chain.last().unwrap(),
+                &format!("local {index}"),
+            ));
+            upstream_chain.push(commit_tree(
+                path,
+                &tree,
+                upstream_chain.last().unwrap(),
+                &format!("upstream {index}"),
+            ));
+        }
+
+        for index in 0..215 {
+            let name = format!("remote-{index:03}");
+            git(
+                path,
+                &[
+                    "update-ref",
+                    &format!("refs/remotes/upstream/{name}"),
+                    &root,
+                ],
+            );
+        }
+        for index in 0..35 {
+            let branch = format!("bench-{index:03}");
+            let tracking = format!("tracked-{index:03}");
+            let (local_target, upstream_target) = match index {
+                0..12 => (&local_chain[265 + index], &root),
+                12..23 => (&root, &upstream_chain[265 + index - 12]),
+                _ => (&local_chain[265 + index], &upstream_chain[100 + index - 23]),
+            };
+            git(
+                path,
+                &["update-ref", &format!("refs/heads/{branch}"), local_target],
+            );
+            git(
+                path,
+                &[
+                    "update-ref",
+                    &format!("refs/remotes/upstream/{tracking}"),
+                    upstream_target,
+                ],
+            );
+            git(
+                path,
+                &["config", &format!("branch.{branch}.remote"), "upstream"],
+            );
+            git(
+                path,
+                &[
+                    "config",
+                    &format!("branch.{branch}.merge"),
+                    &format!("refs/heads/{tracking}"),
+                ],
+            );
+        }
+        git(path, &["symbolic-ref", "HEAD", "refs/heads/bench-000"]);
+        git(path, &["branch", "-D", "seed"]);
+
+        let repo = gix::open(path).unwrap();
+        let mut cache = UpstreamCache::new();
+        reset_upstream_walk_count();
+        reset_read_profile();
+        let started = Instant::now();
+        let cold_refs = read_refs_with_cache(&repo, MAX_UPSTREAM_WALK, &mut cache).unwrap();
+        let cold = started.elapsed();
+        let cold_walks = upstream_walk_count();
+        let cold_profile = read_profile();
+        assert_eq!(
+            cold_refs
+                .iter()
+                .filter(|reference| reference.kind == "local")
+                .count(),
+            35
+        );
+        assert_eq!(cache.len(), 35);
+
+        reset_upstream_walk_count();
+        let started = Instant::now();
+        let uncached_refs =
+            read_refs_with_cache(&repo, MAX_UPSTREAM_WALK, &mut UpstreamCache::new()).unwrap();
+        let uncached_no_change = started.elapsed();
+        let uncached_walks = upstream_walk_count();
+        assert_eq!(uncached_refs, cold_refs);
+        assert_eq!(uncached_walks, cold_walks);
+
+        let ref_fingerprint = read_ref_fingerprint(&repo).unwrap();
+        let operation = read_operation(&repo, &cold_refs).unwrap();
+        let repository = Repository {
+            path: path.to_path_buf(),
+            state: RwLock::new(RepositoryState {
+                refs: cold_refs.clone(),
+                upstream_cache: cache.clone(),
+                ref_fingerprint,
+                operation: operation.0,
+                conflicted_files: operation.1,
+                snapshot: None,
+                generation: 0,
+            }),
+            refresh_lock: Mutex::new(()),
+            watcher: Mutex::new(None),
+            closed: AtomicBool::new(false),
+        };
+
+        reset_upstream_walk_count();
+        let started = Instant::now();
+        assert_eq!(
+            repository.refresh(WatchChanges::ALL).unwrap(),
+            None,
+            "unchanged repository refresh must not emit"
+        );
+        let warm = started.elapsed();
+        assert_eq!(upstream_walk_count(), 0);
+
+        git(
+            path,
+            &["update-ref", "refs/heads/bench-000", &local_chain[264]],
+        );
+        reset_upstream_walk_count();
+        reset_read_profile();
+        let mut moved_cache = repository.state.read().unwrap().upstream_cache.clone();
+        let started = Instant::now();
+        let moved_refs = read_refs_with_cache(
+            &gix::open(path).unwrap(),
+            MAX_UPSTREAM_WALK,
+            &mut moved_cache,
+        )
+        .unwrap();
+        let moved_read_refs = started.elapsed();
+        let moved_read_walks = upstream_walk_count();
+        let moved_profile = read_profile();
+        assert_eq!(moved_read_walks, 2);
+        let moved_branch = moved_refs
+            .iter()
+            .find(|reference| reference.name == "bench-000")
+            .unwrap();
+        assert_eq!(
+            (moved_branch.ahead, moved_branch.behind),
+            (Some(264), Some(0))
+        );
+
+        reset_upstream_walk_count();
+        let started = Instant::now();
+        assert!(repository.refresh(WatchChanges::ALL).unwrap().is_some());
+        let moved_refresh = started.elapsed();
+        let moved_walks = upstream_walk_count();
+        let moved_refs = repository.state.read().unwrap().refs.clone();
+        assert_eq!(moved_walks, 2);
+        let moved_branch = moved_refs
+            .iter()
+            .find(|reference| reference.name == "bench-000")
+            .unwrap();
+        assert_eq!(
+            (moved_branch.ahead, moved_branch.behind),
+            (Some(264), Some(0))
+        );
+        assert_eq!(repository.state.read().unwrap().upstream_cache.len(), 35);
+        assert_ne!(moved_refs, cold_refs);
+
+        let cpu = fs::read_to_string("/proc/cpuinfo")
+            .ok()
+            .and_then(|contents| {
+                contents
+                    .lines()
+                    .find_map(|line| line.strip_prefix("model name\t: "))
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "unknown".into());
+        eprintln!(
+            "Synthetic 250 remote/35 local upstream refs ({cpu}): cold read_refs {cold:?}; uncached no-change read_refs {uncached_no_change:?} ({uncached_walks} walks); cached warm no-change refresh {warm:?} (0 walks); one branch moved read_refs {moved_read_refs:?} ({moved_read_walks} walks), full moved refresh {moved_refresh:?} ({moved_walks} walks); cold phases ref iteration/config resolution/walks {:?}/{:?}/{:?}, moved read_refs phases {:?}/{:?}/{:?}",
+            cold_profile.0,
+            cold_profile.1,
+            cold_profile.2,
+            moved_profile.0,
+            moved_profile.1,
+            moved_profile.2,
+        );
     }
 }

@@ -39,11 +39,6 @@
     "linux": {
       "deb": {
         "desktopTemplate": "gitreal.desktop"
-      },
-      "appimage": {
-        "files": {
-          "gitreal.desktop": "usr/share/applications/gitreal.desktop"
-        }
       }
     }
   },

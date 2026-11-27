@@ -59,7 +59,7 @@ jobs:
           packageJson.version = version;
           writeFileSync(packagePath, `${JSON.stringify(packageJson, null, 2)}\n`);
           NODE
-          cargo update --manifest-path src-tauri/Cargo.toml --package gitreal --precise "0.1.${GITHUB_RUN_NUMBER}"
+          # The build (not --locked) rewrites gitreal's own version in Cargo.lock.
       - name: Build, sign, and publish
         uses: tauri-apps/tauri-action@73fb865345c54760d875b94642314f8c0c894afa # v0.6.1
         env:

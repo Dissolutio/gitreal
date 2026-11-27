@@ -94,8 +94,8 @@ pnpm tauri signer generate -w ~/.tauri/gitreal.key
 
 Add the generated private key and password as repository secrets named
 `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`. Copy the
-generated public key into `src-tauri/tauri.conf.json`, replacing
-`REPLACE_WITH_OWNER_PUBKEY`. Never commit the private key or password. Every
+generated public key into `plugins.updater.pubkey` in `src-tauri/tauri.conf.json`
+(already set for the official repo: minisign key ID `9F2988ED5FF35989`). Never commit the private key or password. Every
 push to `main` then publishes a signed release with an AppImage, `.deb`, and
 updater metadata.
 

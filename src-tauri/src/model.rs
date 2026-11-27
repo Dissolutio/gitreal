@@ -1,6 +1,13 @@
 use serde::Serialize;
 use std::sync::Arc;
 
+#[derive(Clone, Debug, Serialize)]
+pub struct JobAction {
+    pub kind: String,
+    pub label: String,
+    pub payload: serde_json::Value,
+}
+
 #[derive(Debug, Clone, Serialize, thiserror::Error)]
 #[error("{message}")]
 pub struct BackendError {
@@ -118,6 +125,7 @@ pub struct JobFinished {
     pub ok: bool,
     pub message: String,
     pub stderr_tail: String,
+    pub action: Option<JobAction>,
 }
 
 #[derive(Debug, Serialize)]

@@ -3,6 +3,7 @@ use crate::{
         BackendError, ChangedPath, CommitDetail, GraphPage, GraphRow, JobFinished, JobId,
         JobStarted, OpenRepo, OperationInfo, RefInfo, RefsResponse, RepoChanged, RepoError, Result,
     },
+    repo::branch_ops,
     repo::graph::{LaneLayout, assign_lanes, page_edges},
     repo::jobs::{JobQueue, JobSpec},
     repo::remote_ops,
@@ -249,6 +250,127 @@ impl Backend {
             .refs
             .clone();
         remote_ops::push_remote(repository.path.clone(), branch, &refs)
+    }
+
+    pub fn checkout_local(&self, repo_id: &str, branch: &str) -> Result<JobId> {
+        let repository = self.repository(repo_id)?;
+        let spec = branch_ops::checkout_local(repository.path.clone(), branch)?;
+        self.enqueue_job(repo_id, repository, spec)
+    }
+
+    pub fn checkout_remote(&self, repo_id: &str, remote_branch: &str) -> Result<JobId> {
+        let repository = self.repository(repo_id)?;
+        let spec = branch_ops::checkout_remote(repository.path.clone(), remote_branch)?;
+        self.enqueue_job(repo_id, repository, spec)
+    }
+
+    pub fn reset_local_to_remote(
+        &self,
+        repo_id: &str,
+        branch: &str,
+        remote_branch: &str,
+        expected_local_oid: &str,
+    ) -> Result<JobId> {
+        let repository = self.repository(repo_id)?;
+        let spec = branch_ops::reset_local_to_remote(
+            repository.path.clone(),
+            branch,
+            remote_branch,
+            expected_local_oid,
+        )?;
+        self.enqueue_job(repo_id, repository, spec)
+    }
+
+    pub fn checkout_commit(&self, repo_id: &str, oid: &str) -> Result<JobId> {
+        let repository = self.repository(repo_id)?;
+        let spec = branch_ops::checkout_commit(repository.path.clone(), oid)?;
+        self.enqueue_job(repo_id, repository, spec)
+    }
+
+    pub fn create_branch(
+        &self,
+        repo_id: &str,
+        name: &str,
+        at_oid: &str,
+        checkout: bool,
+    ) -> Result<JobId> {
+        let repository = self.repository(repo_id)?;
+        let spec = branch_ops::create_branch(repository.path.clone(), name, at_oid, checkout)?;
+        self.enqueue_job(repo_id, repository, spec)
+    }
+
+    pub fn rename_branch(&self, repo_id: &str, old: &str, new: &str) -> Result<JobId> {
+        let repository = self.repository(repo_id)?;
+        let spec = branch_ops::rename_branch(repository.path.clone(), old, new)?;
+        self.enqueue_job(repo_id, repository, spec)
+    }
+
+    pub fn delete_local(&self, repo_id: &str, branch: &str, force: bool) -> Result<JobId> {
+        let repository = self.repository(repo_id)?;
+        let spec = branch_ops::delete_local(repository.path.clone(), branch, force)?;
+        self.enqueue_job(repo_id, repository, spec)
+    }
+
+    pub fn delete_remote(&self, repo_id: &str, remote: &str, branch: &str) -> Result<JobId> {
+        let repository = self.repository(repo_id)?;
+        let spec = branch_ops::delete_remote(repository.path.clone(), remote, branch)?;
+        self.enqueue_job(repo_id, repository, spec)
+    }
+
+    pub fn delete_local_and_remote(
+        &self,
+        repo_id: &str,
+        branch: &str,
+        remote: &str,
+        remote_branch: &str,
+    ) -> Result<JobId> {
+        let repository = self.repository(repo_id)?;
+        let spec = branch_ops::delete_local_and_remote(
+            repository.path.clone(),
+            branch,
+            remote,
+            remote_branch,
+        )?;
+        self.enqueue_job(repo_id, repository, spec)
+    }
+
+    pub fn stash_push(
+        &self,
+        repo_id: &str,
+        include_untracked: bool,
+        message: Option<&str>,
+    ) -> Result<JobId> {
+        let repository = self.repository(repo_id)?;
+        let spec = branch_ops::stash_push(repository.path.clone(), include_untracked, message)?;
+        self.enqueue_job(repo_id, repository, spec)
+    }
+
+    pub fn stash_pop(&self, repo_id: &str) -> Result<JobId> {
+        let repository = self.repository(repo_id)?;
+        let spec = branch_ops::stash_pop(repository.path.clone());
+        self.enqueue_job(repo_id, repository, spec)
+    }
+
+    pub fn stash_and_checkout(
+        &self,
+        repo_id: &str,
+        target_kind: &str,
+        target: &str,
+    ) -> Result<JobId> {
+        let repository = self.repository(repo_id)?;
+        let checkout = match target_kind {
+            "local" => branch_ops::checkout_local(repository.path.clone(), target)?,
+            "remote" => branch_ops::checkout_remote(repository.path.clone(), target)?,
+            "commit" => branch_ops::checkout_commit(repository.path.clone(), target)?,
+            _ => {
+                return Err(BackendError::new(
+                    "invalid_checkout_target",
+                    "Unknown checkout target",
+                ));
+            }
+        };
+        let spec = branch_ops::stash_and_checkout(repository.path.clone(), checkout);
+        self.enqueue_job(repo_id, repository, spec)
     }
 
     fn enqueue_job(

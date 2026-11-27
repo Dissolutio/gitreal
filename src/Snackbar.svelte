@@ -1,6 +1,7 @@
 <script lang="ts">
-  import { snackbarStore, type SnackbarEntry } from "./lib/snackbar";
+  import { snackbarStore, type JobAction, type SnackbarEntry } from "./lib/snackbar";
 
+  let { onAction }: { onAction?: (action: JobAction, entry: SnackbarEntry) => void } = $props();
   let copied = $state<Record<string, boolean>>({});
 
   async function copy(entry: SnackbarEntry) {
@@ -23,6 +24,7 @@
         <small>{toast.repo_name} · {toast.label}</small>
         {#if toast.ok === false}
           <div class="snackbar-actions">
+            {#if toast.action}<button onclick={() => onAction?.(toast.action!, toast)}>{toast.action.label}</button>{/if}
             <button onclick={() => snackbarStore.toggleDetails(toast.job_id)}>{toast.details_open ? "Hide details" : "Details"}</button>
             <button onclick={() => copy(toast)}>{copied[toast.job_id] ? "Copied" : "Copy"}</button>
           </div>

@@ -8,6 +8,7 @@ export interface PersistedTab { path: string }
 export interface AppConfig {
   version: number;
   active_tab: string | null;
+  start_at_login: boolean;
   repos: KnownRepo[];
   tabs: PersistedTab[];
 }
@@ -86,6 +87,12 @@ export function onRepoChanged(handler: (event: RepoChangedEvent) => void): Promi
 export function onRepoError(handler: (event: RepoErrorEvent) => void): Promise<UnlistenFn> {
   return desktop ? listen<RepoErrorEvent>("repo-error", event => handler(event.payload)) : Promise.resolve(() => {});
 }
+export function onOpenPath(handler: (path: string) => void): Promise<UnlistenFn> {
+  return desktop ? listen<{ path: string }>("open-path", event => handler(event.payload.path)) : Promise.resolve(() => {});
+}
+export function onWindowVisibility(handler: (visible: boolean) => void): Promise<UnlistenFn> {
+  return desktop ? listen<boolean>("window-visibility", event => handler(event.payload)) : Promise.resolve(() => {});
+}
 export function onJobStarted(handler: (event: JobStartedEvent) => void): Promise<UnlistenFn> {
   return desktop ? listen<JobStartedEvent>("job-started", event => handler(event.payload)) : Promise.resolve(() => {});
 }
@@ -107,9 +114,35 @@ export const api = {
     call<string>("push", { repoId, branch }),
   forcePush: (repoId: string, branch: string) =>
     call<string>("force_push", { repoId, branch }),
+  checkoutLocal: (repoId: string, branch: string) =>
+    call<string>("checkout_local", { repoId, branch }),
+  checkoutRemote: (repoId: string, remoteBranch: string) =>
+    call<string>("checkout_remote", { repoId, remoteBranch }),
+  resetLocalToRemote: (repoId: string, branch: string, remoteBranch: string, expectedLocalOid: string) =>
+    call<string>("reset_local_to_remote", { repoId, branch, remoteBranch, expectedLocalOid }),
+  checkoutCommit: (repoId: string, oid: string) =>
+    call<string>("checkout_commit", { repoId, oid }),
+  createBranch: (repoId: string, name: string, atOid: string, checkout: boolean) =>
+    call<string>("create_branch", { repoId, name, atOid, checkout }),
+  renameBranch: (repoId: string, old: string, newName: string) =>
+    call<string>("rename_branch", { repoId, old, new: newName }),
+  deleteLocal: (repoId: string, branch: string, force: boolean) =>
+    call<string>("delete_local", { repoId, branch, force }),
+  deleteRemote: (repoId: string, remote: string, branch: string) =>
+    call<string>("delete_remote", { repoId, remote, branch }),
+  deleteLocalAndRemote: (repoId: string, branch: string, remote: string, remoteBranch: string) =>
+    call<string>("delete_local_and_remote", { repoId, branch, remote, remoteBranch }),
+  stashPush: (repoId: string, includeUntracked: boolean, message?: string) =>
+    call<string>("stash_push", { repoId, includeUntracked, message }),
+  stashPop: (repoId: string) => call<string>("stash_pop", { repoId }),
+  stashAndCheckout: (repoId: string, targetKind: string, target: string) =>
+    call<string>("stash_and_checkout", { repoId, targetKind, target }),
   pushRemote: (repoId: string, branch: string) =>
     call<string>("get_push_remote", { repoId, branch }),
   config: () => call<AppConfig>("get_config", {}),
+  frontendReady: () => call<void>("frontend_ready", {}),
+  windowVisible: () => call<boolean>("get_window_visibility", {}),
+  quit: () => call<void>("quit_app", {}),
   setOpenTabs: (paths: string[], active: string | null) =>
     call<void>("set_open_tabs", { paths, active }),
   addKnownRepo: (path: string) => call<void>("add_known_repo", { path }),

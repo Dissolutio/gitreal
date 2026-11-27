@@ -5,11 +5,17 @@
   import GraphCanvas from "./GraphCanvas.svelte";
   import VirtualList from "./VirtualList.svelte";
   import Snackbar from "./Snackbar.svelte";
-  import { api, desktop, nativeError, onJobFinished, onJobStarted, onRepoChanged, onRepoError, type CommitDetail, type GraphRow, type KnownRepo, type NativeError, type OperationInfo, type RefInfo, type Repository } from "./lib/api";
+  import ContextMenu from "./ContextMenu.svelte";
+  import { api, desktop, nativeError, onJobFinished, onJobStarted, onOpenPath, onRepoChanged, onRepoError, onWindowVisibility, type CommitDetail, type GraphRow, type KnownRepo, type NativeError, type OperationInfo, type RefInfo, type Repository } from "./lib/api";
   import { closeTab, createTab, cycleTabs, MAX_TABS, openTab, restoreTabs, type RepoTab } from "./lib/tabs";
   import { PageCache, PAGE_SIZE, ROW_HEIGHT, pageOffsets, visibleRange } from "./lib/virtual";
   import { formatAheadBehind, formatOperationBanner } from "./lib/status";
-  import { snackbarStore, type JobFinishedEvent, type JobStartedEvent } from "./lib/snackbar";
+  import { snackbarStore, type JobAction, type JobFinishedEvent, type JobStartedEvent, type SnackbarEntry } from "./lib/snackbar";
+  import { branchMenuItems, commitMenuItems, mergeCommitRefLabels, refIcon, type MenuItem } from "./lib/menus";
+  import { validateBranchName } from "./lib/refnames";
+
+  type MenuTarget = { kind: "ref"; ref: RefInfo } | { kind: "commit"; oid: string };
+  type PromptState = { kind: "create" | "rename"; x: number; y: number; ref?: RefInfo; oid: string; name: string; checkout: boolean; message: string };
 
   let tabs = $state<RepoTab[]>([]);
   let activePath = $state<string | null>(null);
@@ -25,6 +31,11 @@
   let choosing = $state(false);
   let pushMenuOpen = $state(false);
   let forceConfirmation = $state<{ repoId: string; branch: string; remote: string } | null>(null);
+  let contextMenu = $state<{ x: number; y: number; target: MenuTarget } | null>(null);
+  let inlinePrompt = $state<PromptState | null>(null);
+  let remoteCheckoutPrompt = $state<{ local: RefInfo; remote: RefInfo; x: number; y: number } | null>(null);
+  let stashPopover = $state(false);
+  let stashIncludeUntracked = $state(false);
   let runningRepoIds = $state<string[]>([]);
   let requestingRepoIds = $state<string[]>([]);
   let error = $state<NativeError | null>(null);
@@ -38,6 +49,7 @@
   let scrollTop = $state(0);
   let scrollLeft = $state(0);
   let viewportHeight = $state(600);
+  let windowVisible = $state(true);
   let viewport: HTMLDivElement;
   let revision = $state(0);
   let generation = 0;
@@ -58,6 +70,22 @@
     runningRepoIds.includes(repository.repo_id) || requestingRepoIds.includes(repository.repo_id)
   ));
   const currentBranch = $derived(refs.find(ref => ref.kind === "local" && ref.is_head)?.name ?? null);
+  const contextItems = $derived.by(() => {
+    if (!contextMenu) return [];
+    if (contextMenu.target.kind === "commit") return commitMenuItems(activeRepoRunning);
+    const ref = contextMenu.target.ref;
+    const counterpart = ref.kind === "local"
+      ? refs.some(candidate => candidate.kind === "remote" && candidate.name.endsWith(`/${ref.name}`))
+      : ref.kind === "remote" && refs.some(candidate =>
+        candidate.kind === "local" && candidate.name === ref.name.slice(ref.name.indexOf("/") + 1),
+      );
+    return branchMenuItems({
+      ref,
+      running: activeRepoRunning,
+      hasLocalCounterpart: ref.kind === "remote" && counterpart,
+      hasRemoteCounterpart: ref.kind === "local" && counterpart,
+    });
+  });
   let persistTimer: ReturnType<typeof setTimeout> | undefined;
   const range = $derived(visibleRange(scrollTop, viewportHeight, total));
   const visibleRows = $derived.by(() => {
@@ -135,6 +163,9 @@
     ++selectionEpoch;
     pushMenuOpen = false;
     forceConfirmation = null;
+    contextMenu = null;
+    inlinePrompt = null;
+    remoteCheckoutPrompt = null;
     activePath = tab.path;
     activateView(tab);
     opening = openingTabs.has(tab.tabId);
@@ -326,7 +357,7 @@
 
   $effect(() => {
     void revision;
-    if (!repository) return;
+    if (!windowVisible || !repository) return;
     const offsets = initialLoaded ? pageOffsets(range.start, range.end) : [0];
     for (const offset of offsets) {
       if (pending.size >= 3) break;
@@ -355,6 +386,13 @@
 
   async function refreshRepository(event: { repo_id: string; generation: number }) {
     const owner = tabs.find(tab => tab.repository?.repo_id === event.repo_id);
+    if (!windowVisible) {
+      if (owner) {
+        owner.staleGeneration = Math.max(owner.staleGeneration, event.generation);
+        caches.delete(owner.path);
+      }
+      return;
+    }
     if (owner && owner.repository?.repo_id !== repository?.repo_id) {
       // No work for inactive tabs: drop their cached pages and refresh on focus.
       owner.staleGeneration = Math.max(owner.staleGeneration, event.generation);
@@ -435,6 +473,34 @@
     void openRepositoryTab(activeTab, false);
   }
   function onScroll() { scrollTop = viewport.scrollTop; scrollLeft = viewport.scrollLeft; saveActiveTab(); }
+
+  function updateWindowVisibility(visible: boolean) {
+    const wasVisible = windowVisible;
+    windowVisible = visible;
+    if (wasVisible && !visible) {
+      ++epoch;
+      ++selectionEpoch;
+      pending.clear();
+      detailLoading = false;
+    }
+    if (!wasVisible && visible) {
+      if (activeTab?.repository && activeTab.staleGeneration > eventGeneration) {
+        void refreshRepository({
+          repo_id: activeTab.repository.repo_id,
+          generation: activeTab.staleGeneration,
+        });
+      } else if (repository && selected && !detail && !detailError) {
+        void selectCommit(selected);
+      }
+    }
+  }
+
+  function handleShortcut(event: KeyboardEvent) {
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "q") {
+      event.preventDefault();
+      void api.quit().catch(failure => { error = nativeError(failure); });
+    }
+  }
 
   function repositoryNameFor(repoId: string) {
     return tabs.find(tab => tab.repository?.repo_id === repoId)?.name ?? repoId;
@@ -537,9 +603,210 @@
     }
   }
 
+  async function enqueueCustom(
+    kind: string,
+    label: string,
+    operation: (repoId: string) => Promise<string>,
+  ) {
+    if (!repository || activeRepoRunning) return;
+    const repo = repository;
+    requestingRepoIds = [...new Set([...requestingRepoIds, repo.repo_id])];
+    let enqueued = false;
+    try {
+      await operation(repo.repo_id);
+      enqueued = true;
+    } catch (failure) {
+      showOperationError(repo, kind, label, failure);
+    } finally {
+      if (!enqueued) requestingRepoIds = requestingRepoIds.filter(repoId => repoId !== repo.repo_id);
+    }
+  }
+
+  function showContextMenu(event: MouseEvent, target: MenuTarget) {
+    event.preventDefault();
+    event.stopPropagation();
+    contextMenu = { x: event.clientX, y: event.clientY, target };
+    inlinePrompt = null;
+    remoteCheckoutPrompt = null;
+  }
+
+  function counterpartFor(ref: RefInfo) {
+    if (ref.kind === "local") {
+      return refs.find(candidate => candidate.kind === "remote" && candidate.name.endsWith(`/${ref.name}`));
+    }
+    if (ref.kind === "remote") {
+      const branch = ref.name.slice(ref.name.indexOf("/") + 1);
+      return refs.find(candidate => candidate.kind === "local" && candidate.name === branch);
+    }
+    return undefined;
+  }
+
+  function startRemoteCheckout(ref: RefInfo, event?: Event) {
+    const local = counterpartFor(ref);
+    if (local && local.target !== ref.target) {
+      const bounds = event?.currentTarget instanceof HTMLElement
+        ? event.currentTarget.getBoundingClientRect()
+        : { left: 24, bottom: 120 };
+      remoteCheckoutPrompt = { local, remote: ref, x: bounds.left, y: bounds.bottom };
+      return;
+    }
+    void enqueueCustom("checkout-remote", `Checkout ${ref.name}`, repoId => api.checkoutRemote(repoId, ref.name));
+  }
+
+  function doubleClickRef(event: Event, ref: RefInfo) {
+    event.preventDefault();
+    if (ref.kind === "local" && !ref.is_head) {
+      void enqueueCustom("checkout", `Checkout ${ref.name}`, repoId => api.checkoutLocal(repoId, ref.name));
+    } else if (ref.kind === "remote") {
+      startRemoteCheckout(ref, event);
+    }
+  }
+
+  function startInlinePrompt(kind: "create" | "rename", target: MenuTarget) {
+    const source = target.kind === "ref" ? target.ref : undefined;
+    const bounds = contextMenu;
+    inlinePrompt = {
+      kind,
+      x: bounds?.x ?? 100,
+      y: bounds?.y ?? 100,
+      ref: source,
+      oid: target.kind === "commit" ? target.oid : source?.target ?? "",
+      name: kind === "rename" ? source?.name ?? "" : "new-branch",
+      checkout: false,
+      message: "",
+    };
+  }
+
+  async function submitInlinePrompt(event: SubmitEvent) {
+    event.preventDefault();
+    const prompt = inlinePrompt;
+    if (!prompt || !repository) return;
+    const validation = validateBranchName(prompt.name);
+    if (validation) {
+      inlinePrompt = { ...prompt, message: validation };
+      return;
+    }
+    inlinePrompt = null;
+    if (prompt.kind === "create") {
+      await enqueueCustom("create-branch", `Create branch ${prompt.name}`, repoId =>
+        api.createBranch(repoId, prompt.name, prompt.oid, prompt.checkout),
+      );
+    } else if (prompt.ref?.kind === "local") {
+      await enqueueCustom("rename-branch", `Rename ${prompt.ref.name}`, repoId =>
+        api.renameBranch(repoId, prompt.ref!.name, prompt.name),
+      );
+    }
+  }
+
+  function remoteBranchParts(ref: RefInfo) {
+    const separator = ref.name.indexOf("/");
+    return separator < 0
+      ? null
+      : { remote: ref.name.slice(0, separator), branch: ref.name.slice(separator + 1) };
+  }
+
+  async function selectContextMenuItem(id: string) {
+    const target = contextMenu?.target;
+    contextMenu = null;
+    if (!target || !repository) return;
+    if (target.kind === "commit") {
+      if (id === "checkout-commit" && window.confirm(`Checkout commit ${target.oid.slice(0, 7)} in detached HEAD?`)) {
+        await enqueueCustom("checkout-commit", `Checkout commit ${target.oid.slice(0, 7)}`, repoId =>
+          api.checkoutCommit(repoId, target.oid),
+        );
+      } else if (id === "create-branch") {
+        startInlinePrompt("create", target);
+      } else if (id === "copy-commit") {
+        await navigator.clipboard.writeText(target.oid).catch(() => {});
+      }
+      return;
+    }
+    const ref = target.ref;
+    const local = ref.kind === "local" ? ref : counterpartFor(ref);
+    const remote = ref.kind === "remote" ? ref : counterpartFor(ref);
+    if (id === "checkout") {
+      if (ref.kind === "local") {
+        await enqueueCustom("checkout", `Checkout ${ref.name}`, repoId => api.checkoutLocal(repoId, ref.name));
+      } else if (ref.kind === "remote") {
+        startRemoteCheckout(ref);
+      }
+    } else if (id === "create-branch" && ref.target) {
+      startInlinePrompt("create", target);
+    } else if (id === "rename" && ref.kind === "local") {
+      startInlinePrompt("rename", target);
+    } else if (id === "pull" && ref.kind === "local") {
+      await enqueueCustom("pull", `Pull ${ref.name}`, repoId => api.pull(repoId));
+    } else if (id === "push" && ref.kind === "local") {
+      await enqueueCustom("push", `Push ${ref.name}`, repoId => api.push(repoId, ref.name));
+    } else if (id === "delete-local" && ref.kind === "local") {
+      if (window.confirm(`Delete local branch '${ref.name}'?`)) {
+        await enqueueCustom("delete-local", `Delete local branch ${ref.name}`, repoId => api.deleteLocal(repoId, ref.name, false));
+      }
+    } else if (id === "delete-remote" && ref.kind === "remote") {
+      const parts = remoteBranchParts(ref);
+      if (parts && window.confirm(`Delete remote branch '${ref.name}'?`)) {
+        await enqueueCustom("delete-remote", `Delete remote branch ${ref.name}`, repoId =>
+          api.deleteRemote(repoId, parts.remote, parts.branch),
+        );
+      }
+    } else if (id === "delete-both" && local && remote) {
+      const parts = remoteBranchParts(remote);
+      if (parts && window.confirm(`Delete local branch '${local.name}' and remote branch '${remote.name}'?`)) {
+        await enqueueCustom("delete-local-and-remote", `Delete local and remote branch ${local.name}`, repoId =>
+          api.deleteLocalAndRemote(repoId, local.name, parts.remote, parts.branch),
+        );
+      }
+    } else if (id === "reset-remote" && local && remote?.target && local.target) {
+      if (window.confirm(`Reset local branch '${local.name}' to remote branch '${remote.name}'?`)) {
+        await enqueueCustom("reset-local-to-remote", `Reset ${local.name} to ${remote.name}`, repoId =>
+          api.resetLocalToRemote(repoId, local.name, remote.name, local.target!),
+        );
+      }
+    } else if (id === "copy") {
+      await navigator.clipboard.writeText(ref.name).catch(() => {});
+    }
+  }
+
+  async function followUpAction(action: JobAction, entry: SnackbarEntry) {
+    if (action.kind === "force_delete") {
+      const branch = String(action.payload?.branch ?? "");
+      if (branch && repository?.repo_id === entry.repo_id) {
+        const remote = action.payload?.remote ? String(action.payload.remote) : undefined;
+        const remoteBranch = action.payload?.remote_branch ? String(action.payload.remote_branch) : undefined;
+        await enqueueCustom("delete-local", `Force delete local branch ${branch}`, async repoId => {
+          const jobId = await api.deleteLocal(repoId, branch, true);
+          if (remote && remoteBranch) await api.deleteRemote(repoId, remote, remoteBranch);
+          return jobId;
+        });
+      }
+    } else if (action.kind === "stash_and_retry") {
+      const targetKind = String(action.payload?.target_kind ?? "");
+      const target = String(action.payload?.target ?? "");
+      if (targetKind && target && repository?.repo_id === entry.repo_id) {
+        await enqueueCustom("stash-and-checkout", action.label, repoId =>
+          api.stashAndCheckout(repoId, targetKind, target),
+        );
+      }
+    }
+  }
+
+  async function runStash(includeUntracked: boolean) {
+    stashPopover = false;
+    await enqueueCustom("stash", "Stash changes", repoId => api.stashPush(repoId, includeUntracked));
+  }
+
+  async function runStashPop() {
+    await enqueueCustom("stash-pop", "Pop stash", repoId => api.stashPop(repoId));
+  }
+
   onMount(() => {
     let unlistenChanged: (() => void) | undefined;
     let unlistenError: (() => void) | undefined;
+    let unlistenOpenPath: (() => void) | undefined;
+    let unlistenVisibility: (() => void) | undefined;
+    windowVisible = document.visibilityState === "visible";
+    const onDocumentVisibility = () => updateWindowVisibility(document.visibilityState === "visible");
+    document.addEventListener("visibilitychange", onDocumentVisibility);
     let unlistenJobStarted: (() => void) | undefined;
     let unlistenJobFinished: (() => void) | undefined;
     void onRepoChanged(event => { void refreshRepository(event); }).then(unlisten => {
@@ -558,6 +825,22 @@
       if (disposed) unlisten();
       else unlistenError = unlisten;
     }).catch(failure => { error = nativeError(failure); });
+    void Promise.all([
+      onOpenPath(path => { void openTabPath(path, true); }),
+      onWindowVisibility(updateWindowVisibility),
+    ]).then(async ([unlistenOpen, unlistenWindow]) => {
+      if (disposed) {
+        unlistenOpen();
+        unlistenWindow();
+        return;
+      }
+      unlistenOpenPath = unlistenOpen;
+      unlistenVisibility = unlistenWindow;
+      if (desktop) {
+        await api.frontendReady();
+        updateWindowVisibility(await api.windowVisible());
+      }
+    }).catch(failure => { error = nativeError(failure); });
     const observer = new ResizeObserver(() => { viewportHeight = viewport.clientHeight; });
     observer.observe(viewport);
     viewportHeight = viewport.clientHeight;
@@ -567,6 +850,9 @@
       clearTimeout(persistTimer);
       unlistenChanged?.();
       unlistenError?.();
+      unlistenOpenPath?.();
+      unlistenVisibility?.();
+      document.removeEventListener("visibilitychange", onDocumentVisibility);
       unlistenJobStarted?.();
       unlistenJobFinished?.();
       observer.disconnect();
@@ -578,6 +864,7 @@
   });
 </script>
 
+<svelte:window onkeydown={handleShortcut} />
 <svelte:head><title>{repository ? `${repository.name} · Gitreal` : "Gitreal — Repository explorer"}</title></svelte:head>
 
 <div class="workspace">
@@ -618,8 +905,10 @@
                 <button class="ref-item" class:current={ref.is_head}
                   title={ref.upstream ? `${ref.full_name} · upstream ${ref.upstream}${ref.upstream_gone ? " (gone)" : ""}` : ref.full_name}
                   disabled={!ref.target}
-                  onclick={() => { if (ref.target) void selectCommit(ref.target); }}>
-                  <span class="ref-line" aria-hidden="true">⑂</span><span class="truncate">{ref.name}</span>
+                  onclick={() => { if (ref.target) void selectCommit(ref.target); }}
+                  ondblclick={(event) => doubleClickRef(event, ref)}
+                  oncontextmenu={(event) => showContextMenu(event, { kind: "ref", ref })}>
+                  <span class="ref-line" aria-hidden="true">{refIcon(ref.kind)}</span><span class="truncate">{ref.kind === "remote" ? ref.name.slice(ref.name.indexOf("/") + 1) : ref.name}</span>
                   {#if ref.kind === "local" && ref.upstream_gone}<span class="upstream-gone">gone</span>{/if}
                   {#if ref.kind === "local"}
                     {@const badge = formatAheadBehind(ref.ahead, ref.behind, ref.truncated)}
@@ -643,6 +932,16 @@
       <div class="history-actions">
         <span class="commit-count">{initialLoaded ? total.toLocaleString() : "—"} <span>commits</span></span>
         <div class="operation-toolbar">
+          <div class="stash-menu">
+            <button disabled={!repository || activeRepoRunning} onclick={() => { stashPopover = !stashPopover; }}>Stash</button>
+            {#if stashPopover}
+              <div class="stash-popover">
+                <label><input type="checkbox" bind:checked={stashIncludeUntracked} /> Include untracked files</label>
+                <button disabled={!repository || activeRepoRunning} onclick={() => { void runStash(stashIncludeUntracked); }}>Stash changes</button>
+              </div>
+            {/if}
+          </div>
+          <button disabled={!repository || activeRepoRunning} onclick={() => { void runStashPop(); }}>Pop</button>
           <button disabled={!repository || activeRepoRunning} onclick={() => runOperation("fetch")}>Fetch</button>
           <button disabled={!repository || !currentBranch || activeRepoRunning} onclick={() => runOperation("pull")}>Pull</button>
           <button disabled={!repository || !currentBranch || activeRepoRunning} onclick={() => runOperation("push")}>Push</button>
@@ -694,15 +993,32 @@
             <button class="commit-row" class:selected={row?.commit_id === selected} class:placeholder={!row}
               style:top="{(range.start + i) * ROW_HEIGHT}px" disabled={!row}
               aria-label={row ? `${row.summary}, ${row.author}, ${row.commit_id.slice(0, 7)}` : "Loading commit"}
-              aria-pressed={!!row && row.commit_id === selected} onclick={() => { if (row) void selectCommit(row.commit_id); }}>
-              <span class="row-refs">{#if row}{#each row.ref_labels.slice(0, 2) as label}<span class="ref-badge" title={row.ref_labels.join(", ")}>{label.replace(/^refs\/(heads|remotes|tags)\//, "")}</span>{/each}{/if}</span>
+              aria-pressed={!!row && row.commit_id === selected}
+              onclick={() => { if (row) void selectCommit(row.commit_id); }}
+              oncontextmenu={(event) => { if (row) showContextMenu(event, { kind: "commit", oid: row.commit_id }); }}>
+              <span class="row-refs">{#if row}{@const labelItems = mergeCommitRefLabels(row.ref_labels, refs)}{#each labelItems.slice(0, 2) as label}
+                <span class="ref-badge" class:current={label.refs.some(ref => ref.is_head)} role="button" tabindex="0" aria-label={`Checkout ${label.name}`} title={label.fullNames.join(", ")}
+                  onkeydown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      const ref = label.refs[0];
+                      if (ref) doubleClickRef(event, ref);
+                    }
+                  }}
+                  ondblclick={(event) => { event.stopPropagation(); const ref = label.refs[0]; if (ref) doubleClickRef(event, ref); }}
+                  oncontextmenu={(event) => { const ref = label.refs[0]; if (ref) showContextMenu(event, { kind: "ref", ref }); }}>
+                  {#each label.kinds as kind}<span class="ref-icon" aria-hidden="true">{kind === "remote" ? "☁" : kind === "tag" ? "◆" : kind === "local" ? "⑂" : "●"}</span>{/each}
+                  <span>{label.name}</span>
+                </span>
+              {/each}{/if}</span>
               <span></span><span class="commit-message">{row?.summary ?? "Loading commits…"}{#if row && row.parents.length > 1}<span class="merge-label">MERGE</span>{/if}</span>
               <span class="commit-author">{row?.author ?? ""}</span><span class="commit-date">{row ? date(row.date) : ""}</span>
             </button>
           {/each}
         </div>
         <div class="canvas-position" style:left="156px" style:top="{scrollTop}px">
-          <GraphCanvas rows={visibleRows} start={range.start} {scrollTop} height={viewportHeight} {selected} width={graphWidth} laneWidth={maxLaneWidth} />
+          <GraphCanvas rows={visibleRows} start={range.start} {scrollTop} height={viewportHeight} {selected} width={graphWidth} laneWidth={maxLaneWidth} visible={windowVisible} />
         </div>
         {#if !initialLoaded}<div class="loading-history">Loading repository history…</div>{/if}
       {/if}
@@ -739,5 +1055,26 @@
       <div class="details-empty"><span class="details-icon">◇</span><h3>The details matter.</h3><p>Select a commit to explore its author, message, parents, and changed files.</p><span class="keyboard-hint">CLICK A COMMIT TO INSPECT</span></div>
     {/if}
   </aside>
-  <Snackbar />
+  <Snackbar onAction={followUpAction} />
+  {#if contextMenu}
+    <ContextMenu x={contextMenu.x} y={contextMenu.y} items={contextItems} onSelect={selectContextMenuItem} onClose={() => { contextMenu = null; }} />
+  {/if}
+  {#if inlinePrompt}
+    <form class="branch-prompt" style:left="{inlinePrompt.x}px" style:top="{inlinePrompt.y}px" onsubmit={submitInlinePrompt}>
+      <label>{inlinePrompt.kind === "rename" ? "Rename local branch" : "Create branch"}<input bind:value={inlinePrompt.name} /></label>
+      {#if inlinePrompt.kind === "create"}<label class="prompt-check"><input type="checkbox" bind:checked={inlinePrompt.checkout} /> Check out after creating</label>{/if}
+      {#if inlinePrompt.message}<p role="alert">{inlinePrompt.message}</p>{/if}
+      <div><button type="button" onclick={() => { inlinePrompt = null; }}>Cancel</button><button type="submit" disabled={activeRepoRunning}>Save</button></div>
+    </form>
+  {/if}
+  {#if remoteCheckoutPrompt}
+    <div class="branch-prompt remote-checkout-prompt" style:left="{remoteCheckoutPrompt.x}px" style:top="{remoteCheckoutPrompt.y}px" role="dialog" aria-label="Choose remote branch checkout">
+      <p>Local {remoteCheckoutPrompt.local.name} is at {remoteCheckoutPrompt.local.target?.slice(0, 7)}, {remoteCheckoutPrompt.remote.name} is at {remoteCheckoutPrompt.remote.target?.slice(0, 7)}.</p>
+      <div>
+        <button disabled={activeRepoRunning} onclick={() => { const local = remoteCheckoutPrompt!.local; remoteCheckoutPrompt = null; void enqueueCustom("checkout", `Checkout ${local.name}`, repoId => api.checkoutLocal(repoId, local.name)); }}>Checkout local</button>
+        <button disabled={activeRepoRunning} onclick={() => { const prompt = remoteCheckoutPrompt!; remoteCheckoutPrompt = null; void enqueueCustom("reset-local-to-remote", `Reset ${prompt.local.name} to ${prompt.remote.name}`, repoId => api.resetLocalToRemote(repoId, prompt.local.name, prompt.remote.name, prompt.local.target!)); }}>Reset local to {remoteCheckoutPrompt.remote.name}</button>
+        <button onclick={() => { remoteCheckoutPrompt = null; }}>Cancel</button>
+      </div>
+    </div>
+  {/if}
 </div>

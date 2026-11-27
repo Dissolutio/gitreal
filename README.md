@@ -9,12 +9,16 @@ Pop!_OS 24.04 with COSMIC/Wayland, with low idle RAM and CPU as a priority.
 Open a repository with the native folder picker, browse local branches, remote
 branches and tags, scroll a virtualized commit graph, and select a commit for its
 message, author, date, parents and changed paths. Git reads use gix, not libgit2.
-There are no git mutations, network requests, polling loops, or background
-watchers. Reopen a repository to refresh its state after external changes.
+There are no git mutations, network requests, or polling loops. A metadata-only
+watcher keeps references and history current after external Git activity; it
+never watches the working tree. It watches Git metadata in the resolved worktree
+and common directories, debounces events for 150 ms, and ignores lock and
+transient files.
 
-History is cached as a compact, topologically ordered snapshot on first access;
-subsequent pages reuse its lane assignments and reconstruct edges on demand from
-lane-occupancy checkpoints. The frontend keeps only a bounded page cache.
+History is cached as a compact, topologically ordered snapshot (lane assignments
+plus lane-occupancy checkpoints; edges are reconstructed per page) and atomically
+rebuilt when references change; subsequent pages share the same generation. The
+frontend keeps only a bounded page cache and reloads visible pages after refresh.
 Changed paths are compared with the first parent (merges included); initial and
 shallow-boundary commits are compared with an empty tree. Renames appear as
 added/deleted paths rather than requiring expensive similarity detection.
@@ -68,12 +72,14 @@ linear, branched/merged, octopus, multiple-root and criss-cross histories.
 - `open_repo(path)` returns `{ repo_id, path, name }`; subsequent commands use
   the opaque handle. `close_repo(repo_id)` releases it when switching repos.
 - `get_refs(repo_id)` returns local/remote/tag/HEAD entries. Annotated tags are
-  peeled; unborn HEAD and non-commit tags have a null target.
-- `get_graph_page(repo_id, offset, limit)` returns `{ rows, total, max_lane }`,
-  with page sizes 1–500. `max_lane` is the widest lane index in the snapshot.
-  Each row has commit metadata, labels, a lane and parent edges. Edges connect
-  this row's center to the next row's center; pass-through edges preserve
-  connections across intervening rows and page boundaries.
+  peeled; unborn HEAD and non-commit tags have a null target. The response also
+  includes the repository generation.
+- `get_graph_page(repo_id, offset, limit)` returns
+  `{ rows, total, max_lane, generation }`, with page sizes 1–500. `max_lane` is
+  the widest lane index in the snapshot. Each row has commit metadata, labels, a
+  lane and parent edges. Edges connect this row's center to the next row's
+  center; pass-through edges preserve connections across intervening rows and
+  page boundaries.
 - `get_commit_detail(repo_id, commit_id)` accepts a full hexadecimal object ID
   in the snapshot, not revision expressions. It returns the message, author,
   Unix date, original parents and changed-path objects.
@@ -89,7 +95,7 @@ events. No optimistic updates; force pushes must use `--force-with-lease`.
 
 ## Roadmap
 
-- Tabs, configuration persistence, and a `.git` file watcher.
+- Tabs and configuration persistence.
 - Branch operations, push/pull/fetch, and snackbar notifications.
 - Merge/rebase via drag and context menu, with a conflict banner.
 - Tray icon, single instance, `gitreal open <path>`, `gitreal --toggle`, autostart.

@@ -3,7 +3,7 @@
   import { open } from "@tauri-apps/plugin-dialog";
   import GraphCanvas from "./GraphCanvas.svelte";
   import VirtualList from "./VirtualList.svelte";
-  import { api, desktop, nativeError, type CommitDetail, type GraphRow, type NativeError, type RefInfo, type Repository } from "./lib/api";
+  import { api, desktop, nativeError, onRepoChanged, onRepoError, type CommitDetail, type GraphRow, type NativeError, type RefInfo, type Repository } from "./lib/api";
   import { PageCache, PAGE_SIZE, ROW_HEIGHT, pageOffsets, visibleRange } from "./lib/virtual";
 
   let repository = $state<Repository | null>(null);
@@ -25,6 +25,8 @@
   let viewportHeight = $state(600);
   let viewport: HTMLDivElement;
   let revision = $state(0);
+  let generation = 0;
+  let eventGeneration = 0;
   let epoch = 0;
   let selectionEpoch = 0;
   const cache = new PageCache<GraphRow>();
@@ -58,6 +60,7 @@
     const previous = repository;
     repository = null;
     refs = []; filter = ""; selected = null; detail = null; detailError = null;
+    generation = 0; eventGeneration = 0;
     detailLoading = false; error = null; total = 0; maxLane = 0; initialLoaded = false;
     cache.clear(); pending.clear(); failed.clear(); revision++;
     scrollTop = 0; scrollLeft = 0;
@@ -70,7 +73,9 @@
       repository = next;
       const result = await api.refs(next.repo_id);
       if (token !== epoch) return;
-      refs = result;
+      refs = result.refs;
+      generation = result.generation;
+      eventGeneration = result.generation;
     } catch (failure) {
       if (token === epoch) error = nativeError(failure);
     } finally { if (token === epoch) opening = false; }
@@ -81,6 +86,8 @@
     try {
       const page = await api.page(repoId, offset, PAGE_SIZE);
       if (token !== epoch) return;
+      if (page.generation < generation) return;
+      generation = page.generation;
       cache.set(offset, page.rows);
       total = page.total;
       maxLane = page.max_lane;
@@ -122,14 +129,84 @@
     }
   }
 
+  async function refreshRepository(event: { repo_id: string; generation: number }) {
+    if (!repository || event.repo_id !== repository.repo_id || event.generation <= eventGeneration) return;
+    const repoId = repository.repo_id;
+    eventGeneration = event.generation;
+    const token = ++epoch;
+    const selectedAtRefresh = selected;
+    const selectionToken = selectionEpoch;
+    cache.clear(); pending.clear(); failed.clear(); revision++;
+    error = null;
+    detail = null;
+    detailError = null;
+    detailLoading = !!selectedAtRefresh;
+    try {
+      const result = await api.refs(repoId);
+      if (token !== epoch || repository?.repo_id !== repoId) return;
+      refs = result.refs;
+      generation = Math.max(event.generation, result.generation);
+      opening = false;
+      if (selectedAtRefresh && selectionToken === selectionEpoch) {
+        try {
+          const nextDetail = await api.detail(repoId, selectedAtRefresh);
+          if (token !== epoch || selectionToken !== selectionEpoch) return;
+          detail = nextDetail;
+          detailError = null;
+          detailLoading = false;
+        } catch (failure) {
+          if (token !== epoch || selectionToken !== selectionEpoch) return;
+          const nextError = nativeError(failure);
+          if (nextError.code === "unknown_commit") {
+            selected = null;
+            detail = null;
+            detailError = null;
+          } else {
+            detail = null;
+            detailError = nextError;
+          }
+          detailLoading = false;
+        }
+      }
+    } catch (failure) {
+      if (token === epoch) {
+        error = nativeError(failure);
+        opening = false;
+        detailLoading = false;
+      }
+    } finally {
+      if (token === epoch) revision++;
+    }
+  }
+
+  function reportRepositoryError(event: { repo_id: string; message: string }) {
+    if (repository?.repo_id === event.repo_id) {
+      error = { code: "repo_error", message: event.message };
+    }
+  }
+
   function retry() { error = null; failed.clear(); revision++; }
   function onScroll() { scrollTop = viewport.scrollTop; scrollLeft = viewport.scrollLeft; }
 
   onMount(() => {
+    let disposed = false;
+    let unlistenChanged: (() => void) | undefined;
+    let unlistenError: (() => void) | undefined;
+    void onRepoChanged(event => { void refreshRepository(event); }).then(unlisten => {
+      if (disposed) unlisten();
+      else unlistenChanged = unlisten;
+    }).catch(failure => { error = nativeError(failure); });
+    void onRepoError(reportRepositoryError).then(unlisten => {
+      if (disposed) unlisten();
+      else unlistenError = unlisten;
+    }).catch(failure => { error = nativeError(failure); });
     const observer = new ResizeObserver(() => { viewportHeight = viewport.clientHeight; });
     observer.observe(viewport);
     viewportHeight = viewport.clientHeight;
     return () => {
+      disposed = true;
+      unlistenChanged?.();
+      unlistenError?.();
       observer.disconnect();
       ++epoch; ++selectionEpoch;
       if (repository) void api.close(repository.repo_id).catch(() => {});
@@ -175,12 +252,12 @@
         </section>
       {/each}
     </nav>
-    <div class="sidebar-bottom"><span class="status-dot"></span> Local. Private. Read-only.<small>No background refresh · Reopen to update</small></div>
+    <div class="sidebar-bottom"><span class="status-dot"></span> Local. Private. Read-only.<small>Watching Git metadata · No polling</small></div>
   </aside>
 
   <main class="history">
     <div class="history-toolbar">
-      <div><span class="eyebrow">REPOSITORY HISTORY</span><h2>{repository ? head : "Commit graph"}<span class="snapshot">SNAPSHOT</span></h2></div>
+      <div><span class="eyebrow">REPOSITORY HISTORY</span><h2>{repository ? head : "Commit graph"}<span class="snapshot">LIVE</span></h2></div>
       <span class="commit-count">{initialLoaded ? total.toLocaleString() : "—"} <span>commits</span></span>
     </div>
     {#if error}
@@ -218,7 +295,7 @@
         {#if !initialLoaded}<div class="loading-history">Loading repository history…</div>{/if}
       {/if}
     </div>
-    <footer class="history-footer"><span><span class="status-dot"></span>{repository ? "Repository snapshot" : "Ready when you are"}</span><span>{total ? `${(Math.floor(scrollTop / ROW_HEIGHT) + 1).toLocaleString()}–${Math.min(total, Math.ceil((scrollTop + viewportHeight) / ROW_HEIGHT)).toLocaleString()} of ${total.toLocaleString()}` : "No repository loaded"}</span></footer>
+    <footer class="history-footer"><span><span class="status-dot"></span>{repository ? "Live repository history" : "Ready when you are"}</span><span>{total ? `${(Math.floor(scrollTop / ROW_HEIGHT) + 1).toLocaleString()}–${Math.min(total, Math.ceil((scrollTop + viewportHeight) / ROW_HEIGHT)).toLocaleString()} of ${total.toLocaleString()}` : "No repository loaded"}</span></footer>
   </main>
 
   <aside class="details" aria-label="Commit details" aria-busy={detailLoading}>

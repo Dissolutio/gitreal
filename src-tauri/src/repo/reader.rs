@@ -1,15 +1,18 @@
 use crate::{
     model::{
-        BackendError, ChangedPath, CommitDetail, GraphPage, GraphRow, OpenRepo, RefInfo, Result,
+        BackendError, ChangedPath, CommitDetail, GraphPage, GraphRow, OpenRepo, RefInfo,
+        RefsResponse, RepoChanged, RepoError, Result,
     },
     repo::graph::{LaneLayout, assign_lanes, page_edges},
+    repo::watcher::{MetadataWatcher, WatchSignal},
 };
 use gix::bstr::ByteSlice;
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
+    sync::atomic::AtomicBool,
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Mutex, RwLock,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -19,8 +22,16 @@ const MAX_OPEN_REPOS: usize = 16;
 
 struct Repository {
     path: PathBuf,
+    state: RwLock<RepositoryState>,
+    refresh_lock: Mutex<()>,
+    watcher: Mutex<Option<MetadataWatcher>>,
+    closed: AtomicBool,
+}
+
+struct RepositoryState {
     refs: Vec<RefInfo>,
-    snapshot: OnceLock<Result<Arc<Snapshot>>>,
+    snapshot: Option<Arc<Snapshot>>,
+    generation: u64,
 }
 
 struct Snapshot {
@@ -38,13 +49,39 @@ struct SnapshotRow {
     date: i64,
 }
 
-#[derive(Default)]
 pub struct Backend {
     repositories: Mutex<HashMap<String, Arc<Repository>>>,
     next_id: AtomicU64,
+    event_sink: Arc<dyn EventSink>,
+}
+
+pub trait EventSink: Send + Sync + 'static {
+    fn repo_changed(&self, event: RepoChanged);
+    fn repo_error(&self, event: RepoError);
+}
+
+struct NullEventSink;
+
+impl EventSink for NullEventSink {
+    fn repo_changed(&self, _: RepoChanged) {}
+    fn repo_error(&self, _: RepoError) {}
+}
+
+impl Default for Backend {
+    fn default() -> Self {
+        Self::with_event_sink(Arc::new(NullEventSink))
+    }
 }
 
 impl Backend {
+    pub fn with_event_sink(event_sink: Arc<dyn EventSink>) -> Self {
+        Self {
+            repositories: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(0),
+            event_sink,
+        }
+    }
+
     pub fn open_repo(&self, path: String) -> Result<OpenRepo> {
         let path = Path::new(&path)
             .canonicalize()
@@ -54,9 +91,48 @@ impl Backend {
         let refs = read_refs(&repo)?;
         let repository = Arc::new(Repository {
             path: path.clone(),
-            refs,
-            snapshot: OnceLock::new(),
+            state: RwLock::new(RepositoryState {
+                refs,
+                snapshot: None,
+                generation: 0,
+            }),
+            refresh_lock: Mutex::new(()),
+            watcher: Mutex::new(None),
+            closed: AtomicBool::new(false),
         });
+        let repo_id = format!("repo-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
+        let event_repo_id = repo_id.clone();
+        let weak_repository = Arc::downgrade(&repository);
+        let event_sink = Arc::clone(&self.event_sink);
+        let watcher = MetadataWatcher::start(&repo, move |signal| {
+            if let Some(repository) = weak_repository.upgrade() {
+                let (refs_changed, watcher_error) = match signal {
+                    WatchSignal::Changed(refs_changed) => (refs_changed, None),
+                    WatchSignal::Error(message) => (false, Some(message)),
+                };
+                let mut watcher_error = watcher_error;
+                match repository.refresh(refs_changed) {
+                    Ok(Some(generation)) => event_sink.repo_changed(RepoChanged {
+                        repo_id: event_repo_id.clone(),
+                        generation,
+                    }),
+                    Ok(None) => {}
+                    Err(error) => watcher_error = Some(error.message),
+                }
+                if let Some(message) = watcher_error {
+                    event_sink.repo_error(RepoError {
+                        repo_id: event_repo_id.clone(),
+                        message,
+                    });
+                }
+            }
+        })
+        .map_err(|error| BackendError::new("watcher_error", error))?;
+        *repository
+            .watcher
+            .lock()
+            .map_err(|_| BackendError::new("internal_error", "Repository watcher unavailable"))? =
+            Some(watcher);
         let mut repositories = self
             .repositories
             .lock()
@@ -67,7 +143,6 @@ impl Backend {
                 "Close a repository before opening another",
             ));
         }
-        let repo_id = format!("repo-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
         repositories.insert(repo_id.clone(), repository);
         Ok(OpenRepo {
             repo_id,
@@ -81,10 +156,19 @@ impl Backend {
     }
 
     pub fn close_repo(&self, repo_id: &str) -> Result<()> {
-        self.repositories
+        let repository = self
+            .repositories
             .lock()
             .map_err(|_| BackendError::new("internal_error", "Repository state unavailable"))?
             .remove(repo_id);
+        if let Some(repository) = repository {
+            repository.closed.store(true, Ordering::Release);
+            repository
+                .watcher
+                .lock()
+                .map_err(|_| BackendError::new("internal_error", "Repository watcher unavailable"))?
+                .take();
+        }
         Ok(())
     }
 
@@ -102,8 +186,16 @@ impl Backend {
             })
     }
 
-    pub fn get_refs(&self, repo_id: &str) -> Result<Vec<RefInfo>> {
-        Ok(self.repository(repo_id)?.refs.clone())
+    pub fn get_refs(&self, repo_id: &str) -> Result<RefsResponse> {
+        let repository = self.repository(repo_id)?;
+        let state = repository
+            .state
+            .read()
+            .map_err(|_| BackendError::new("internal_error", "Repository state unavailable"))?;
+        Ok(RefsResponse {
+            refs: state.refs.clone(),
+            generation: state.generation,
+        })
     }
 
     pub fn get_graph_page(&self, repo_id: &str, offset: usize, limit: usize) -> Result<GraphPage> {
@@ -114,10 +206,10 @@ impl Backend {
             ));
         }
         let repository = self.repository(repo_id)?;
-        let snapshot = repository.snapshot()?;
+        let (snapshot, generation) = repository.snapshot()?;
         let start = offset.min(snapshot.rows.len());
         let end = start.saturating_add(limit).min(snapshot.rows.len());
-        Ok(snapshot.graph_page(start, end))
+        Ok(snapshot.graph_page(start, end, generation))
     }
 
     pub fn get_commit_detail(&self, repo_id: &str, commit_id: &str) -> Result<CommitDetail> {
@@ -130,7 +222,7 @@ impl Backend {
         }
         let repository = self.repository(repo_id)?;
         let oid = gix::ObjectId::from_hex(commit_id.as_bytes()).map_err(BackendError::git)?;
-        if !repository.snapshot()?.ids.contains(&oid) {
+        if !repository.snapshot()?.0.ids.contains(&oid) {
             return Err(BackendError::new(
                 "unknown_commit",
                 "Commit is not in this repository snapshot",
@@ -217,91 +309,145 @@ impl Backend {
 }
 
 impl Repository {
-    fn snapshot(&self) -> Result<Arc<Snapshot>> {
-        self.snapshot
-            .get_or_init(|| self.build_snapshot().map(Arc::new))
-            .clone()
+    fn snapshot(&self) -> Result<(Arc<Snapshot>, u64)> {
+        loop {
+            let (refs, generation, snapshot) = {
+                let state = self.state.read().map_err(|_| {
+                    BackendError::new("internal_error", "Repository state unavailable")
+                })?;
+                (state.refs.clone(), state.generation, state.snapshot.clone())
+            };
+            if let Some(snapshot) = snapshot {
+                return Ok((snapshot, generation));
+            }
+            let repo = gix::open(&self.path).map_err(BackendError::git)?;
+            let snapshot = Arc::new(build_snapshot(&repo, &refs)?);
+            let mut state = self
+                .state
+                .write()
+                .map_err(|_| BackendError::new("internal_error", "Repository state unavailable"))?;
+            if state.generation == generation && state.refs == refs {
+                let snapshot = state.snapshot.get_or_insert(snapshot).clone();
+                return Ok((snapshot, state.generation));
+            }
+        }
     }
 
-    fn build_snapshot(&self) -> Result<Snapshot> {
+    fn refresh(&self, refs_changed: bool) -> Result<Option<u64>> {
+        if self.closed.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let _refresh = self
+            .refresh_lock
+            .lock()
+            .map_err(|_| BackendError::new("internal_error", "Repository refresh unavailable"))?;
+        if self.closed.load(Ordering::Acquire) {
+            return Ok(None);
+        }
         let repo = gix::open(&self.path).map_err(BackendError::git)?;
-        let roots: HashSet<_> = self
-            .refs
-            .iter()
-            .filter_map(|reference| reference.target.as_ref())
-            .collect();
-        let mut roots: Vec<_> = roots
-            .iter()
-            .map(|id| gix::ObjectId::from_hex(id.as_bytes()).map_err(BackendError::git))
-            .collect::<Result<_>>()?;
-        roots.sort();
-        let mut labels: HashMap<&str, Vec<String>> = HashMap::new();
-        for reference in &self.refs {
-            if let Some(target) = &reference.target {
-                labels
-                    .entry(target)
-                    .or_default()
-                    .push(reference.name.clone());
-            }
+        let refs = read_refs(&repo)?;
+        let unchanged = {
+            let state = self
+                .state
+                .read()
+                .map_err(|_| BackendError::new("internal_error", "Repository state unavailable"))?;
+            state.refs == refs
+        };
+        if unchanged && !refs_changed {
+            // Index-only changes are ignored until status information is implemented.
+            return Ok(None);
         }
-        let mut raw_rows = Vec::new();
-        if !roots.is_empty() {
-            for entry in repo
-                .rev_walk(roots)
-                .sorting(gix::revision::walk::Sorting::TopoOrder)
-                .all()
-                .map_err(BackendError::git)?
-            {
-                let entry = entry.map_err(BackendError::git)?;
-                let commit = repo.find_commit(entry.id).map_err(BackendError::git)?;
-                let author = commit.author().map_err(BackendError::git)?;
-                let id = entry.id;
-                raw_rows.push((
-                    entry.parent_ids().map(|id| id.detach()).collect::<Vec<_>>(),
-                    SnapshotRow {
-                        id,
-                        ref_labels: labels.remove(id.to_string().as_str()).unwrap_or_default(),
-                        summary: commit
-                            .message_raw()
-                            .map_err(BackendError::git)?
-                            .lines()
-                            .next()
-                            .map(|line| String::from_utf8_lossy(line).into_owned())
-                            .unwrap_or_default(),
-                        author: author.name.to_string(),
-                        date: author.time().map_err(BackendError::git)?.seconds,
-                    },
-                ));
-            }
+        let snapshot = Arc::new(build_snapshot(&repo, &refs)?);
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| BackendError::new("internal_error", "Repository state unavailable"))?;
+        if self.closed.load(Ordering::Acquire) {
+            return Ok(None);
         }
-        let positions: HashMap<_, _> = raw_rows
-            .iter()
-            .enumerate()
-            .map(|(index, (_, row))| (row.id, index as u32))
-            .collect();
-        let ids: HashSet<_> = positions.keys().copied().collect();
-        let parents: Vec<Vec<u32>> = raw_rows
-            .iter()
-            .map(|(parent_ids, _)| {
-                parent_ids
-                    .iter()
-                    .filter_map(|id| positions.get(id).copied())
-                    .collect()
-            })
-            .collect();
-        let rows: Vec<_> = raw_rows.into_iter().map(|(_, row)| row).collect();
-        let layout = assign_lanes(&parents);
-        Ok(Snapshot {
-            rows,
-            parents,
-            ids,
-            layout,
-        })
+        state.refs = refs;
+        state.snapshot = Some(snapshot);
+        state.generation = state.generation.saturating_add(1);
+        Ok(Some(state.generation))
     }
 }
 
+fn build_snapshot(repo: &gix::Repository, refs: &[RefInfo]) -> Result<Snapshot> {
+    let roots: HashSet<_> = refs
+        .iter()
+        .filter_map(|reference| reference.target.as_ref())
+        .collect();
+    let mut roots: Vec<_> = roots
+        .iter()
+        .map(|id| gix::ObjectId::from_hex(id.as_bytes()).map_err(BackendError::git))
+        .collect::<Result<_>>()?;
+    roots.sort();
+    let mut labels: HashMap<&str, Vec<String>> = HashMap::new();
+    for reference in refs {
+        if let Some(target) = &reference.target {
+            labels
+                .entry(target)
+                .or_default()
+                .push(reference.name.clone());
+        }
+    }
+    let mut raw_rows = Vec::new();
+    if !roots.is_empty() {
+        for entry in repo
+            .rev_walk(roots)
+            .sorting(gix::revision::walk::Sorting::TopoOrder)
+            .all()
+            .map_err(BackendError::git)?
+        {
+            let entry = entry.map_err(BackendError::git)?;
+            let commit = repo.find_commit(entry.id).map_err(BackendError::git)?;
+            let author = commit.author().map_err(BackendError::git)?;
+            let id = entry.id;
+            raw_rows.push((
+                entry.parent_ids().map(|id| id.detach()).collect::<Vec<_>>(),
+                SnapshotRow {
+                    id,
+                    ref_labels: labels.remove(id.to_string().as_str()).unwrap_or_default(),
+                    summary: commit
+                        .message_raw()
+                        .map_err(BackendError::git)?
+                        .lines()
+                        .next()
+                        .map(|line| String::from_utf8_lossy(line).into_owned())
+                        .unwrap_or_default(),
+                    author: author.name.to_string(),
+                    date: author.time().map_err(BackendError::git)?.seconds,
+                },
+            ));
+        }
+    }
+    let positions: HashMap<_, _> = raw_rows
+        .iter()
+        .enumerate()
+        .map(|(index, (_, row))| (row.id, index as u32))
+        .collect();
+    let ids: HashSet<_> = positions.keys().copied().collect();
+    let parents: Vec<Vec<u32>> = raw_rows
+        .iter()
+        .map(|(parent_ids, _)| {
+            parent_ids
+                .iter()
+                .filter_map(|id| positions.get(id).copied())
+                .collect()
+        })
+        .collect();
+    let rows: Vec<_> = raw_rows.into_iter().map(|(_, row)| row).collect();
+    let layout = assign_lanes(&parents);
+    Ok(Snapshot {
+        rows,
+        parents,
+        ids,
+        layout,
+    })
+}
+
 impl Snapshot {
-    fn graph_page(&self, start: usize, end: usize) -> GraphPage {
+    fn graph_page(&self, start: usize, end: usize, generation: u64) -> GraphPage {
         let parent_edges = page_edges(&self.parents, &self.layout, start, end, |index| {
             Arc::from(self.rows[index as usize].id.to_string())
         });
@@ -330,6 +476,7 @@ impl Snapshot {
             rows,
             total: self.rows.len(),
             max_lane: self.layout.max_lane,
+            generation,
         }
     }
 }
@@ -603,10 +750,15 @@ mod tests {
 
         let repository = Arc::new(Repository {
             path: PathBuf::new(),
-            refs: Vec::new(),
-            snapshot: OnceLock::new(),
+            state: RwLock::new(RepositoryState {
+                refs: Vec::new(),
+                snapshot: Some(Arc::new(snapshot)),
+                generation: 0,
+            }),
+            refresh_lock: Mutex::new(()),
+            watcher: Mutex::new(None),
+            closed: AtomicBool::new(false),
         });
-        assert!(repository.snapshot.set(Ok(Arc::new(snapshot))).is_ok());
         let backend = Backend::default();
         backend
             .repositories

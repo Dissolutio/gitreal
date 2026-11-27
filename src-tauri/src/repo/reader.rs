@@ -621,19 +621,34 @@ fn read_refs_with_limit(repo: &gix::Repository, walk_limit: usize) -> Result<Vec
         };
         let remote = remote.to_string();
         let merge = merge.to_string();
-        let (upstream_ref, upstream_name) = if let Some(name) = merge.strip_prefix("refs/heads/") {
-            if remote == "." {
-                (merge.clone(), name.to_owned())
+        let (default_upstream_ref, upstream_name) =
+            if let Some(name) = merge.strip_prefix("refs/heads/") {
+                if remote == "." {
+                    (merge.clone(), name.to_owned())
+                } else {
+                    (
+                        format!("refs/remotes/{remote}/{name}"),
+                        format!("{remote}/{name}"),
+                    )
+                }
             } else {
-                (
-                    format!("refs/remotes/{remote}/{name}"),
-                    format!("{remote}/{name}"),
-                )
-            }
-        } else {
-            (merge.clone(), merge.clone())
-        };
+                (merge.clone(), merge.clone())
+            };
         refs[index].upstream = Some(upstream_name);
+        let upstream_ref = if remote == "." {
+            Some(default_upstream_ref)
+        } else {
+            let local_ref = repo
+                .find_reference(refs[index].full_name.as_str())
+                .map_err(BackendError::git)?;
+            repo.branch_remote_tracking_ref_name(local_ref.name(), gix::remote::Direction::Fetch)
+                .transpose()
+                .map_err(BackendError::git)?
+                .map(|name| name.as_bstr().to_string())
+        };
+        let Some(upstream_ref) = upstream_ref else {
+            continue;
+        };
         let upstream = refs
             .iter()
             .find(|reference| reference.full_name == upstream_ref);
@@ -1009,6 +1024,16 @@ mod tests {
         git(&["commit", "-m", "root"]);
         let upstream = git(&["rev-parse", "HEAD"]);
         git(&["update-ref", "refs/remotes/origin/main", &upstream]);
+        git(&[
+            "config",
+            "remote.origin.url",
+            "https://example.invalid/repository",
+        ]);
+        git(&[
+            "config",
+            "remote.origin.fetch",
+            "+refs/heads/*:refs/remotes/origin/*",
+        ]);
         git(&["config", "branch.main.remote", "origin"]);
         git(&["config", "branch.main.merge", "refs/heads/main"]);
         for index in 1..=4 {

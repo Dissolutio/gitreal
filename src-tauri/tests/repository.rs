@@ -110,11 +110,26 @@ impl TrackingFixture {
         );
         configure_user(&clone);
         configure_user(&writer);
-        let initial = git(&clone, &["rev-parse", "HEAD"]);
         git(
             &clone,
-            &["update-ref", "refs/remotes/origin/alternate", &initial],
+            &[
+                "config",
+                "--replace-all",
+                "remote.origin.fetch",
+                "+refs/heads/*:refs/remotes/upstream/*",
+            ],
         );
+        let initial = git(&clone, &["rev-parse", "HEAD"]);
+        for name in ["main", "alternate"] {
+            git(
+                &clone,
+                &[
+                    "update-ref",
+                    &format!("refs/remotes/upstream/{name}"),
+                    &initial,
+                ],
+            );
+        }
         Self {
             _directory: directory,
             clone,
@@ -466,7 +481,7 @@ fn upstream_counts_cover_ahead_behind_diverged_missing_and_deleted() {
 
     git(
         &fixture.clone,
-        &["update-ref", "-d", "refs/remotes/origin/alternate"],
+        &["update-ref", "-d", "refs/remotes/upstream/alternate"],
     );
     let deleted = wait_for_change(&backend, &id, &events, no_upstream.generation);
     assert_eq!(
@@ -476,6 +491,87 @@ fn upstream_counts_cover_ahead_behind_diverged_missing_and_deleted() {
     assert!(branch_ref(&deleted, "main").upstream_gone);
     assert_eq!(branch_ref(&deleted, "main").ahead, None);
     assert_eq!(branch_ref(&deleted, "main").behind, None);
+}
+
+#[test]
+fn default_fetch_refspec_resolves_origin_tracking_branch() {
+    let fixture = TrackingFixture::new();
+    git(
+        &fixture.clone,
+        &[
+            "config",
+            "--replace-all",
+            "remote.origin.fetch",
+            "+refs/heads/*:refs/remotes/origin/*",
+        ],
+    );
+    let backend = Backend::default();
+    let id = backend
+        .open_repo(fixture.clone.to_string_lossy().into())
+        .unwrap()
+        .repo_id;
+    let response = backend.get_refs(&id).unwrap();
+    assert_eq!(
+        branch_ref(&response, "main").upstream.as_deref(),
+        Some("origin/main")
+    );
+    assert_eq!(branch_ref(&response, "main").ahead, Some(0));
+    assert_eq!(branch_ref(&response, "main").behind, Some(0));
+}
+
+#[test]
+fn unmapped_upstream_does_not_use_a_conventional_stale_tracking_ref() {
+    let fixture = TrackingFixture::new();
+    let base = git(&fixture.clone, &["rev-parse", "HEAD"]);
+    let tree = git(&fixture.clone, &["rev-parse", "HEAD^{tree}"]);
+    let stale = git(
+        &fixture.clone,
+        &[
+            "commit-tree",
+            &tree,
+            "-p",
+            &base,
+            "-m",
+            "stale tracking target",
+        ],
+    );
+    git(
+        &fixture.clone,
+        &[
+            "config",
+            "--replace-all",
+            "remote.origin.fetch",
+            "+refs/heads/main:refs/remotes/upstream/main",
+        ],
+    );
+    git(
+        &fixture.clone,
+        &["update-ref", "refs/heads/unmapped", &base],
+    );
+    git(
+        &fixture.clone,
+        &["update-ref", "refs/remotes/origin/unmapped", &stale],
+    );
+    git(
+        &fixture.clone,
+        &["config", "branch.unmapped.remote", "origin"],
+    );
+    git(
+        &fixture.clone,
+        &["config", "branch.unmapped.merge", "refs/heads/unmapped"],
+    );
+
+    let backend = Backend::default();
+    let id = backend
+        .open_repo(fixture.clone.to_string_lossy().into())
+        .unwrap()
+        .repo_id;
+    let response = backend.get_refs(&id).unwrap();
+    let unmapped = branch_ref(&response, "unmapped");
+    assert_eq!(unmapped.upstream.as_deref(), Some("origin/unmapped"));
+    assert_eq!(unmapped.ahead, None);
+    assert_eq!(unmapped.behind, None);
+    assert!(!unmapped.upstream_gone);
 }
 
 #[test]
@@ -496,7 +592,11 @@ fn upstream_read_performance_with_two_hundred_fifty_remote_branches() {
         );
         git(
             &fixture.clone,
-            &["update-ref", &format!("refs/remotes/origin/{name}"), &base],
+            &[
+                "update-ref",
+                &format!("refs/remotes/upstream/{name}"),
+                &base,
+            ],
         );
         git(
             &fixture.clone,

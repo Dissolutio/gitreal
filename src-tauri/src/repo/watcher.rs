@@ -300,7 +300,11 @@ impl WatchScopes {
             .iter()
             .any(|directory| path == directory.join("refs/stash"))
         {
-            return Some(true);
+            return Some(WatchChanges {
+                refs: true,
+                status: false,
+                force: false,
+            });
         }
         if self
             .rebase_dirs

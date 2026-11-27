@@ -1012,13 +1012,14 @@ fn read_stash_signature(repo: &gix::Repository) -> Result<StashSignature> {
 }
 
 fn read_stashes(repo: &gix::Repository) -> Result<Vec<StashInfo>> {
-    let Some(mut reference) = repo
+    let Some(reference) = repo
         .try_find_reference("refs/stash")
         .map_err(BackendError::git)?
     else {
         return Ok(Vec::new());
     };
-    let Some(entries) = reference.log_iter().rev().map_err(BackendError::git)? else {
+    let mut log = reference.log_iter();
+    let Some(entries) = log.rev().map_err(BackendError::git)? else {
         return Ok(Vec::new());
     };
     entries
@@ -1809,6 +1810,8 @@ mod tests {
                 ref_fingerprint,
                 operation: operation.0,
                 conflicted_files: operation.1,
+                stashes: Vec::new(),
+                stash_signature: None,
                 snapshot: None,
                 generation: 0,
             }),
@@ -1973,6 +1976,8 @@ mod tests {
                 ref_fingerprint,
                 operation: operation.0,
                 conflicted_files: operation.1,
+                stashes: Vec::new(),
+                stash_signature: None,
                 snapshot: None,
                 generation: 0,
             }),

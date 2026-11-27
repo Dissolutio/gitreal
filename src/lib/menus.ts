@@ -1,4 +1,5 @@
 import type { RefInfo } from "./api";
+import { safeRefLabel } from "./display";
 
 export interface MenuItem {
   id: string;
@@ -50,8 +51,8 @@ export function branchMenuItems(state: BranchMenuState): MenuItem[] {
   const items: MenuItem[] = [];
   if ((ref.kind === "local" || ref.kind === "remote") && !ref.is_head) {
     items.push(
-      item("merge-into-current", `Merge ${ref.name} into ${currentBranch ?? "current branch"}`, historyDisabled, false, checkOutFirst),
-      item("rebase-current-onto", `Rebase ${currentBranch ?? "current branch"} onto ${ref.name}`, historyDisabled, false, checkOutFirst),
+      item("merge-into-current", `Merge ${safeRefLabel(ref.name)} into ${currentBranch ? safeRefLabel(currentBranch) : "current branch"}`, historyDisabled, false, checkOutFirst),
+      item("rebase-current-onto", `Rebase ${currentBranch ? safeRefLabel(currentBranch) : "current branch"} onto ${safeRefLabel(ref.name)}`, historyDisabled, false, checkOutFirst),
     );
   }
   items.push(item("checkout", "Checkout", mutationsDisabled || ref.is_head));
@@ -82,7 +83,7 @@ export function commitMenuItems(state: CommitMenuState | boolean): MenuItem[] {
     ? { running: state, operationInProgress: false, currentBranch: null }
     : state;
   const disabled = running || operationInProgress;
-  const branch = currentBranch ?? "HEAD";
+  const branch = currentBranch ? safeRefLabel(currentBranch) : "HEAD";
   return [
     item("checkout-commit", "Checkout this commit…", disabled),
     item("create-branch", "Create branch here…", disabled),
@@ -129,12 +130,12 @@ export function mergeCommitRefLabels(
     consumed.add(label.name);
     const refsForLabel = [ref, match?.ref].filter((value): value is RefInfo => !!value);
     merged.push({
-      name: ref?.kind === "local"
+      name: safeRefLabel(ref?.kind === "local"
         ? ref.name
         : ref?.kind === "remote"
           ? label.name.replace(/^[^/]+\//, "")
-          : label.name.replace(/^refs\/(heads|remotes|tags)\//, ""),
-      fullNames: refsForLabel.map(value => value.full_name),
+          : label.name.replace(/^refs\/(heads|remotes|tags)\//, "")),
+      fullNames: refsForLabel.map(value => safeRefLabel(value.full_name)),
       kinds: refsForLabel.map(value => value.kind),
       refs: refsForLabel,
     });

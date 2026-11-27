@@ -12,6 +12,7 @@
   import { formatAheadBehind, formatOperationBanner, operationBannerActions } from "./lib/status";
   import { snackbarStore, type JobAction, type JobFinishedEvent, type JobStartedEvent, type SnackbarEntry } from "./lib/snackbar";
   import { branchMenuItems, commitMenuItems, mergeCommitRefLabels, refIcon, stashMenuItems, type MenuItem } from "./lib/menus";
+  import { safeRefLabel } from "./lib/display";
   import { validateBranchName } from "./lib/refnames";
   import { formatRelativeDate, indexStashes, placeVisibleStashes } from "./lib/stashes";
 
@@ -564,9 +565,9 @@
       job_id: `request-${Date.now()}-${Math.random().toString(36).slice(2)}`,
       repo_id: repo.repo_id,
       kind,
-      label,
+      label: safeRefLabel(label),
       ok: false,
-      message: native.message,
+      message: safeRefLabel(native.message),
       stderr_tail: "",
     };
     snackbarStore.failed(event, repo.name);
@@ -583,7 +584,7 @@
         forceConfirmation = { repoId: repo.repo_id, branch, remote };
       }
     } catch (failure) {
-      showOperationError(repo, "force-push", `Force push ${branch}`, failure);
+      showOperationError(repo, "force-push", `Force push ${safeRefLabel(branch)}`, failure);
     }
   }
 
@@ -599,7 +600,7 @@
       const remote = await api.pushRemote(confirmation.repoId, confirmation.branch);
       if (remote !== confirmation.remote) {
         forceConfirmation = null;
-        showOperationError(repo, "force-push", `Force push ${confirmation.branch}`, {
+        showOperationError(repo, "force-push", `Force push ${safeRefLabel(confirmation.branch)}`, {
           code: "push_target_changed",
           message: "The configured push remote changed; confirm the operation again",
         });
@@ -613,7 +614,7 @@
       await runOperation("force-push", confirmation);
     } catch (failure) {
       forceConfirmation = null;
-      showOperationError(repo, "force-push", `Force push ${confirmation.branch}`, failure);
+      showOperationError(repo, "force-push", `Force push ${safeRefLabel(confirmation.branch)}`, failure);
     }
   }
 
@@ -625,7 +626,7 @@
     const repo = repository;
     if (expected && (repo.repo_id !== expected.repoId || currentBranch !== expected.branch)) return;
     const branch = expected?.branch ?? currentBranch;
-    const label = kind === "force-push" ? `Force push ${branch ?? ""}` : `${kind[0].toUpperCase()}${kind.slice(1)}${kind === "push" ? ` ${branch ?? ""}` : ""}`;
+    const label = safeRefLabel(kind === "force-push" ? `Force push ${branch ?? ""}` : `${kind[0].toUpperCase()}${kind.slice(1)}${kind === "push" ? ` ${branch ?? ""}` : ""}`);
     requestingRepoIds = [...new Set([...requestingRepoIds, repo.repo_id])];
     let enqueued = false;
     try {
@@ -649,6 +650,7 @@
   ) {
     if (!repository || activeRepoRunning || (operation !== null && !allowDuringOperation)) return;
     const repo = repository;
+    label = safeRefLabel(label);
     requestingRepoIds = [...new Set([...requestingRepoIds, repo.repo_id])];
     let enqueued = false;
     try {
@@ -689,13 +691,13 @@
       remoteCheckoutPrompt = { local, remote: ref, x: bounds.left, y: bounds.bottom };
       return;
     }
-    void enqueueCustom("checkout-remote", `Checkout ${ref.name}`, repoId => api.checkoutRemote(repoId, ref.name));
+    void enqueueCustom("checkout-remote", `Checkout ${safeRefLabel(ref.name)}`, repoId => api.checkoutRemote(repoId, ref.name));
   }
 
   function doubleClickRef(event: Event, ref: RefInfo) {
     event.preventDefault();
     if (ref.kind === "local" && !ref.is_head) {
-      void enqueueCustom("checkout", `Checkout ${ref.name}`, repoId => api.checkoutLocal(repoId, ref.name));
+      void enqueueCustom("checkout", `Checkout ${safeRefLabel(ref.name)}`, repoId => api.checkoutLocal(repoId, ref.name));
     } else if (ref.kind === "remote") {
       startRemoteCheckout(ref, event);
     }
@@ -727,11 +729,11 @@
     }
     inlinePrompt = null;
     if (prompt.kind === "create") {
-      await enqueueCustom("create-branch", `Create branch ${prompt.name}`, repoId =>
+      await enqueueCustom("create-branch", `Create branch ${safeRefLabel(prompt.name)}`, repoId =>
         api.createBranch(repoId, prompt.name, prompt.oid, prompt.checkout),
       );
     } else if (prompt.ref?.kind === "local") {
-      await enqueueCustom("rename-branch", `Rename ${prompt.ref.name}`, repoId =>
+      await enqueueCustom("rename-branch", `Rename ${safeRefLabel(prompt.ref.name)}`, repoId =>
         api.renameBranch(repoId, prompt.ref!.name, prompt.name),
       );
     }
@@ -781,9 +783,9 @@
         const expectedHead = refs.find(ref => ref.is_head && ref.target)?.target;
         if (!expectedHead) return;
         if (mode === "hard" && !window.confirm(
-          `Hard reset ${currentBranch ?? "HEAD"} to ${target.oid.slice(0, 7)}? Uncommitted changes will be lost.`,
+          `Hard reset ${currentBranch ? safeRefLabel(currentBranch) : "HEAD"} to ${target.oid.slice(0, 7)}? Uncommitted changes will be lost.`,
         )) return;
-        await enqueueCustom(`reset-${mode}`, `Reset ${currentBranch ?? "HEAD"} to ${target.oid.slice(0, 7)} (${mode})`, repoId =>
+        await enqueueCustom(`reset-${mode}`, `Reset ${currentBranch ? safeRefLabel(currentBranch) : "HEAD"} to ${target.oid.slice(0, 7)} (${mode})`, repoId =>
           api.resetCurrent(repoId, target.oid, mode, expectedHead),
         );
       } else if (id === "copy-commit") {
@@ -795,16 +797,16 @@
     const local = ref.kind === "local" ? ref : counterpartFor(ref);
     const remote = ref.kind === "remote" ? ref : counterpartFor(ref);
     if (id === "merge-into-current" && (ref.kind === "local" || ref.kind === "remote")) {
-      await enqueueCustom("merge", `Merge ${ref.name} into ${currentBranch ?? "current branch"}`, repoId =>
+      await enqueueCustom("merge", `Merge ${safeRefLabel(ref.name)} into ${currentBranch ? safeRefLabel(currentBranch) : "current branch"}`, repoId =>
         api.mergeIntoCurrent(repoId, ref.name),
       );
     } else if (id === "rebase-current-onto" && (ref.kind === "local" || ref.kind === "remote")) {
-      await enqueueCustom("rebase", `Rebase ${currentBranch ?? "current branch"} onto ${ref.name}`, repoId =>
+      await enqueueCustom("rebase", `Rebase ${currentBranch ? safeRefLabel(currentBranch) : "current branch"} onto ${safeRefLabel(ref.name)}`, repoId =>
         api.rebaseCurrentOnto(repoId, ref.name),
       );
     } else if (id === "checkout") {
       if (ref.kind === "local") {
-        await enqueueCustom("checkout", `Checkout ${ref.name}`, repoId => api.checkoutLocal(repoId, ref.name));
+        await enqueueCustom("checkout", `Checkout ${safeRefLabel(ref.name)}`, repoId => api.checkoutLocal(repoId, ref.name));
       } else if (ref.kind === "remote") {
         startRemoteCheckout(ref);
       }
@@ -813,30 +815,30 @@
     } else if (id === "rename" && ref.kind === "local") {
       startInlinePrompt("rename", target);
     } else if (id === "pull" && ref.kind === "local") {
-      await enqueueCustom("pull", `Pull ${ref.name}`, repoId => api.pull(repoId));
+      await enqueueCustom("pull", `Pull ${safeRefLabel(ref.name)}`, repoId => api.pull(repoId));
     } else if (id === "push" && ref.kind === "local") {
-      await enqueueCustom("push", `Push ${ref.name}`, repoId => api.push(repoId, ref.name));
+      await enqueueCustom("push", `Push ${safeRefLabel(ref.name)}`, repoId => api.push(repoId, ref.name));
     } else if (id === "delete-local" && ref.kind === "local") {
-      if (window.confirm(`Delete local branch '${ref.name}'?`)) {
-        await enqueueCustom("delete-local", `Delete local branch ${ref.name}`, repoId => api.deleteLocal(repoId, ref.name, false));
+      if (window.confirm(`Delete local branch '${safeRefLabel(ref.name)}'?`)) {
+        await enqueueCustom("delete-local", `Delete local branch ${safeRefLabel(ref.name)}`, repoId => api.deleteLocal(repoId, ref.name, false));
       }
     } else if (id === "delete-remote" && ref.kind === "remote") {
       const parts = remoteBranchParts(ref);
-      if (parts && window.confirm(`Delete remote branch '${ref.name}'?`)) {
-        await enqueueCustom("delete-remote", `Delete remote branch ${ref.name}`, repoId =>
+      if (parts && window.confirm(`Delete remote branch '${safeRefLabel(ref.name)}'?`)) {
+        await enqueueCustom("delete-remote", `Delete remote branch ${safeRefLabel(ref.name)}`, repoId =>
           api.deleteRemote(repoId, parts.remote, parts.branch),
         );
       }
     } else if (id === "delete-both" && local && remote) {
       const parts = remoteBranchParts(remote);
-      if (parts && window.confirm(`Delete local branch '${local.name}' and remote branch '${remote.name}'?`)) {
-        await enqueueCustom("delete-local-and-remote", `Delete local and remote branch ${local.name}`, repoId =>
+      if (parts && window.confirm(`Delete local branch '${safeRefLabel(local.name)}' and remote branch '${safeRefLabel(remote.name)}'?`)) {
+        await enqueueCustom("delete-local-and-remote", `Delete local and remote branch ${safeRefLabel(local.name)}`, repoId =>
           api.deleteLocalAndRemote(repoId, local.name, parts.remote, parts.branch),
         );
       }
     } else if (id === "reset-remote" && local && remote?.target && local.target) {
-      if (window.confirm(`Reset local branch '${local.name}' to remote branch '${remote.name}'?`)) {
-        await enqueueCustom("reset-local-to-remote", `Reset ${local.name} to ${remote.name}`, repoId =>
+      if (window.confirm(`Reset local branch '${safeRefLabel(local.name)}' to remote branch '${safeRefLabel(remote.name)}'?`)) {
+        await enqueueCustom("reset-local-to-remote", `Reset ${safeRefLabel(local.name)} to ${safeRefLabel(remote.name)}`, repoId =>
           api.resetLocalToRemote(repoId, local.name, remote.name, local.target!),
         );
       }
@@ -1015,16 +1017,16 @@
             <VirtualList {items} maxHeight={216}>
               {#snippet children(ref)}
                 <button class="ref-item" class:current={ref.is_head}
-                  title={ref.upstream ? `${ref.full_name} · upstream ${ref.upstream}${ref.upstream_gone ? " (gone)" : ""}` : ref.full_name}
+                  title={safeRefLabel(ref.upstream ? `${ref.full_name} · upstream ${ref.upstream}${ref.upstream_gone ? " (gone)" : ""}` : ref.full_name)}
                   disabled={!ref.target}
                   onclick={() => { if (ref.target) void selectCommit(ref.target); }}
                   ondblclick={(event) => doubleClickRef(event, ref)}
                   oncontextmenu={(event) => showContextMenu(event, { kind: "ref", ref })}>
-                  <span class="ref-line" aria-hidden="true">{refIcon(ref.kind)}</span><span class="truncate">{ref.kind === "remote" ? ref.name.slice(ref.name.indexOf("/") + 1) : ref.name}</span>
+                  <span class="ref-line" aria-hidden="true">{refIcon(ref.kind)}</span><span class="truncate">{safeRefLabel(ref.kind === "remote" ? ref.name.slice(ref.name.indexOf("/") + 1) : ref.name)}</span>
                   {#if ref.kind === "local" && ref.upstream_gone}<span class="upstream-gone">gone</span>{/if}
                   {#if ref.kind === "local"}
                     {@const badge = formatAheadBehind(ref.ahead, ref.behind, ref.truncated)}
-                    {#if badge}<span class="upstream-counts" title={ref.truncated ? "Upstream counts truncated at 10,000 commits" : `Upstream ${ref.upstream ?? ""}`}>{badge}</span>{/if}
+                    {#if badge}<span class="upstream-counts" title={ref.truncated ? "Upstream counts truncated at 10,000 commits" : safeRefLabel(`Upstream ${ref.upstream ?? ""}`)}>{badge}</span>{/if}
                   {/if}
                   {#if ref.is_head}<span class="head-dot" title="HEAD"></span>{/if}
                 </button>
@@ -1064,7 +1066,7 @@
 
   <main class="history">
     <div class="history-toolbar">
-      <div><span class="eyebrow">REPOSITORY HISTORY</span><h2>{repository ? head : "Commit graph"}<span class="snapshot">LIVE</span></h2></div>
+      <div><span class="eyebrow">REPOSITORY HISTORY</span><h2>{repository ? safeRefLabel(head) : "Commit graph"}<span class="snapshot">LIVE</span></h2></div>
       <div class="history-actions">
         <span class="commit-count">{initialLoaded ? total.toLocaleString() : "—"} <span>commits</span></span>
         <div class="operation-toolbar">
@@ -1090,7 +1092,7 @@
             {/if}
             {#if forceConfirmation}
               <div class="force-confirm" role="dialog" aria-label="Confirm force push">
-                <p>Force push {forceConfirmation.branch} to {forceConfirmation.remote} with lease?</p>
+                <p>Force push {safeRefLabel(forceConfirmation.branch)} to {safeRefLabel(forceConfirmation.remote)} with lease?</p>
                 <div><button onclick={() => { forceConfirmation = null; }}>Cancel</button><button class="force-confirm-action" disabled={activeRepoMutationsDisabled} onclick={() => { void executeForcePush(); }}>Force push</button></div>
               </div>
             {/if}
@@ -1100,7 +1102,7 @@
     </div>
     {#if operation}
       <div class="operation-banner" role="status">
-        <span>{formatOperationBanner(operation, conflictedFiles)}</span>
+        <span>{safeRefLabel(formatOperationBanner(operation, conflictedFiles))}</span>
         <div class="operation-controls">
           <button disabled={bannerActions?.continueDisabled} title={conflictedFiles > 0 ? "Resolve conflicts before continuing" : undefined} onclick={() => { void runOperationControl("continue"); }}>Continue</button>
           {#if bannerActions?.skipVisible}<button disabled={bannerActions.otherActionsDisabled} onclick={() => { void runOperationControl("skip"); }}>Skip</button>{/if}
@@ -1110,7 +1112,7 @@
       </div>
     {/if}
     {#if error}
-      <div class="error-banner" role="alert"><div><strong>{error.code}</strong> {error.message}</div><button onclick={retry}>Retry pages</button>{#if repository}<button onclick={reopenActiveTab}>Reopen</button>{/if}<button aria-label="Dismiss error" onclick={() => { error = null; }}>×</button></div>
+      <div class="error-banner" role="alert"><div><strong>{error.code}</strong> {safeRefLabel(error.message)}</div><button onclick={retry}>Retry pages</button>{#if repository}<button onclick={reopenActiveTab}>Reopen</button>{/if}<button aria-label="Dismiss error" onclick={() => { error = null; }}>×</button></div>
     {/if}
     <div class="column-clip"><div class="column-head" style:--graph-width="{graphWidth}px" style:transform="translateX(-{scrollLeft}px)"><span>REFERENCES</span><span>GRAPH</span><span>COMMIT MESSAGE</span><span>AUTHOR</span><span>DATE</span></div></div>
     <div class="history-scroll" bind:this={viewport} onscroll={onScroll} aria-label="Commit history" aria-busy={opening || (!!repository && !initialLoaded)}>
@@ -1119,7 +1121,7 @@
           <div class="empty-graph" aria-hidden="true"><i></i><i></i><i></i><span>⑂</span></div>
           <span class="eyebrow">A CLEARER VIEW OF YOUR CODE</span>
           <h2>{opening ? "Opening repository…" : activeTab?.error ? "Repository unavailable." : "Every commit tells a story."}</h2>
-          <p>{activeTab?.error ? activeTab.error.message : desktop ? "Open a local Git repository to explore its branches, commits, and connections." : "Gitreal is a desktop Git explorer. Open the desktop app to browse a local repository."}</p>
+          <p>{activeTab?.error ? safeRefLabel(activeTab.error.message) : desktop ? "Open a local Git repository to explore its branches, commits, and connections." : "Gitreal is a desktop Git explorer. Open the desktop app to browse a local repository."}</p>
           {#if activeTab?.error}<button class="primary-button" onclick={reopenActiveTab}>Try again</button>{/if}
           {#if desktop}<button class="primary-button" onclick={chooseRepository} disabled={opening || choosing}>▱ &nbsp; Open repository</button>{:else}<span class="desktop-note">DESKTOP APP REQUIRED</span>{/if}
           <div class="empty-features"><span>○ Virtualized history</span><span>⑂ Branch topology</span><span>◇ Commit details</span></div>
@@ -1131,7 +1133,7 @@
           {#each visibleRows as row, i (range.start + i)}
             <button class="commit-row" class:selected={row?.commit_id === selected} class:placeholder={!row}
               style:top="{(range.start + i) * ROW_HEIGHT}px" disabled={!row}
-              aria-label={row ? `${row.summary}, ${row.author}, ${row.commit_id.slice(0, 7)}` : "Loading commit"}
+              aria-label={row ? `${safeRefLabel(row.summary)}, ${safeRefLabel(row.author)}, ${row.commit_id.slice(0, 7)}` : "Loading commit"}
               aria-pressed={!!row && row.commit_id === selected}
               onclick={() => { if (row) void selectCommit(row.commit_id); }}
               oncontextmenu={(event) => { if (row) showContextMenu(event, { kind: "commit", oid: row.commit_id }); }}>
@@ -1151,8 +1153,8 @@
                   <span>{label.name}</span>
                 </span>
               {/each}{/if}</span>
-              <span></span><span class="commit-message">{row?.summary ?? "Loading commits…"}{#if row && row.parents.length > 1}<span class="merge-label">MERGE</span>{/if}</span>
-              <span class="commit-author">{row?.author ?? ""}</span><span class="commit-date">{row ? date(row.date) : ""}</span>
+              <span></span><span class="commit-message">{safeRefLabel(row?.summary ?? "Loading commits…")}{#if row && row.parents.length > 1}<span class="merge-label">MERGE</span>{/if}</span>
+              <span class="commit-author">{safeRefLabel(row?.author ?? "")}</span><span class="commit-date">{row ? date(row.date) : ""}</span>
             </button>
           {/each}
         </div>
@@ -1172,14 +1174,14 @@
     {#if detailLoading}
       <div class="details-empty"><span class="details-icon">◷</span><h3>Loading commit…</h3></div>
     {:else if detailError}
-      <div class="detail-error" role="alert"><strong>{detailError.code}</strong><p>{detailError.message}</p><button onclick={() => { if (selected) void selectCommit(selected); }}>Try again</button></div>
+      <div class="detail-error" role="alert"><strong>{detailError.code}</strong><p>{safeRefLabel(detailError.message)}</p><button onclick={() => { if (selected) void selectCommit(selected); }}>Try again</button></div>
     {:else if detail}
       <div class="detail-content">
         <span class="eyebrow">COMMIT</span><code class="full-hash">{detail.commit_id}</code>
-        <h2 class="detail-summary">{detail.summary}</h2>
-        <div class="author-card"><span class="avatar">{detail.author.slice(0, 1).toUpperCase()}</span><div><strong>{detail.author}</strong><small>{detail.author_email}</small></div></div>
+        <h2 class="detail-summary">{safeRefLabel(detail.summary)}</h2>
+        <div class="author-card"><span class="avatar">{safeRefLabel(detail.author.slice(0, 1).toUpperCase())}</span><div><strong>{safeRefLabel(detail.author)}</strong><small>{safeRefLabel(detail.author_email)}</small></div></div>
         <p class="detail-date">{new Date(detail.date * 1000).toLocaleString()}</p>
-        {#if detail.message !== detail.summary}<pre class="commit-body">{detail.message}</pre>{/if}
+        {#if detail.message !== detail.summary}<pre class="commit-body">{safeRefLabel(detail.message)}</pre>{/if}
         <div class="parent-section"><span class="eyebrow">PARENTS · {detail.parents.length}</span>
           <VirtualList items={detail.parents} maxHeight={108}>
             {#snippet children(parent)}<button class="parent-link" onclick={() => selectCommit(parent)} title={parent}>⑂ &nbsp; {parent.slice(0, 12)} <span>↗</span></button>{/snippet}
@@ -1188,7 +1190,7 @@
         </div>
         <div class="paths-heading"><span class="eyebrow">CHANGED FILES</span><span class="count">{detail.changed_paths.length}</span></div>
         <VirtualList items={detail.changed_paths} maxHeight={360}>
-          {#snippet children(change)}<div class="changed-path" title={change.old_path ? `${change.old_path} → ${change.path}` : change.path}><span class="file-status" class:added={change.status === "added"} class:deleted={change.status === "deleted"}>{change.status.slice(0, 1).toUpperCase()}</span><span class="truncate">{change.path}</span></div>{/snippet}
+          {#snippet children(change)}<div class="changed-path" title={safeRefLabel(change.old_path ? `${change.old_path} → ${change.path}` : change.path)}><span class="file-status" class:added={change.status === "added"} class:deleted={change.status === "deleted"}>{change.status.slice(0, 1).toUpperCase()}</span><span class="truncate">{safeRefLabel(change.path)}</span></div>{/snippet}
         </VirtualList>
         {#if !detail.changed_paths.length}<p class="root-label">No changed files</p>{/if}
       </div>
@@ -1202,7 +1204,7 @@
   {/if}
   {#if inlinePrompt}
     <form class="branch-prompt" style:left="{inlinePrompt.x}px" style:top="{inlinePrompt.y}px" onsubmit={submitInlinePrompt}>
-      <label>{inlinePrompt.kind === "rename" ? "Rename local branch" : "Create branch"}<input bind:value={inlinePrompt.name} /></label>
+      <label>{inlinePrompt.kind === "rename" ? "Rename local branch" : "Create branch"}<input bind:value={inlinePrompt.name} /><small>{safeRefLabel(inlinePrompt.name)}</small></label>
       {#if inlinePrompt.kind === "create"}<label class="prompt-check"><input type="checkbox" bind:checked={inlinePrompt.checkout} /> Check out after creating</label>{/if}
       {#if inlinePrompt.message}<p role="alert">{inlinePrompt.message}</p>{/if}
       <div><button type="button" onclick={() => { inlinePrompt = null; }}>Cancel</button><button type="submit" disabled={activeRepoMutationsDisabled}>Save</button></div>
@@ -1210,10 +1212,10 @@
   {/if}
   {#if remoteCheckoutPrompt}
     <div class="branch-prompt remote-checkout-prompt" style:left="{remoteCheckoutPrompt.x}px" style:top="{remoteCheckoutPrompt.y}px" role="dialog" aria-label="Choose remote branch checkout">
-      <p>Local {remoteCheckoutPrompt.local.name} is at {remoteCheckoutPrompt.local.target?.slice(0, 7)}, {remoteCheckoutPrompt.remote.name} is at {remoteCheckoutPrompt.remote.target?.slice(0, 7)}.</p>
+      <p>Local {safeRefLabel(remoteCheckoutPrompt.local.name)} is at {remoteCheckoutPrompt.local.target?.slice(0, 7)}, {safeRefLabel(remoteCheckoutPrompt.remote.name)} is at {remoteCheckoutPrompt.remote.target?.slice(0, 7)}.</p>
       <div>
-        <button disabled={activeRepoMutationsDisabled} onclick={() => { const local = remoteCheckoutPrompt!.local; remoteCheckoutPrompt = null; void enqueueCustom("checkout", `Checkout ${local.name}`, repoId => api.checkoutLocal(repoId, local.name)); }}>Checkout local</button>
-        <button disabled={activeRepoMutationsDisabled} onclick={() => { const prompt = remoteCheckoutPrompt!; remoteCheckoutPrompt = null; void enqueueCustom("reset-local-to-remote", `Reset ${prompt.local.name} to ${prompt.remote.name}`, repoId => api.resetLocalToRemote(repoId, prompt.local.name, prompt.remote.name, prompt.local.target!)); }}>Reset local to {remoteCheckoutPrompt.remote.name}</button>
+        <button disabled={activeRepoMutationsDisabled} onclick={() => { const local = remoteCheckoutPrompt!.local; remoteCheckoutPrompt = null; void enqueueCustom("checkout", `Checkout ${safeRefLabel(local.name)}`, repoId => api.checkoutLocal(repoId, local.name)); }}>Checkout local</button>
+        <button disabled={activeRepoMutationsDisabled} onclick={() => { const prompt = remoteCheckoutPrompt!; remoteCheckoutPrompt = null; void enqueueCustom("reset-local-to-remote", `Reset ${safeRefLabel(prompt.local.name)} to ${safeRefLabel(prompt.remote.name)}`, repoId => api.resetLocalToRemote(repoId, prompt.local.name, prompt.remote.name, prompt.local.target!)); }}>Reset local to {safeRefLabel(remoteCheckoutPrompt.remote.name)}</button>
         <button onclick={() => { remoteCheckoutPrompt = null; }}>Cancel</button>
       </div>
     </div>

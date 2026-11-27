@@ -81,4 +81,12 @@ describe("mergeCommitRefLabels", () => {
     );
     expect(labels).toHaveLength(2);
   });
+
+  it("makes invisible characters visible without changing the underlying refs", () => {
+    const branch = ref("main\u202e", "local", "abc");
+    const labels = mergeCommitRefLabels([branch.name], [branch]);
+    expect(labels[0].name).toBe("main⟨U+202E⟩");
+    expect(labels[0].fullNames).toEqual(["refs/heads/main⟨U+202E⟩"]);
+    expect(labels[0].refs[0].name).toBe("main\u202e");
+  });
 });

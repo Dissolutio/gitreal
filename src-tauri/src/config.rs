@@ -97,7 +97,12 @@ impl ConfigManager {
         let path = config_path()?;
         let autostart_path = autostart_path()?;
         let mut config = load_config(&path)?;
-        set_autostart_file(&autostart_path, enabled)?;
+        let executable = if enabled {
+            Some(autostart_executable()?)
+        } else {
+            None
+        };
+        set_autostart_file(&autostart_path, enabled, executable.as_deref())?;
         config.start_at_login = enabled;
         save_config(&path, &config)
     }
@@ -155,15 +160,66 @@ fn autostart_path_from(xdg_config_home: Option<&Path>, home: Option<&Path>) -> R
     Ok(config_dir.join("autostart").join("gitreal.desktop"))
 }
 
-fn set_autostart_file(path: &Path, enabled: bool) -> Result<()> {
+fn autostart_executable() -> Result<PathBuf> {
+    let appimage = std::env::var_os("APPIMAGE");
+    let current_exe = if appimage.as_deref().is_none_or(|path| path.is_empty()) {
+        Some(std::env::current_exe().map_err(|error| BackendError::new("config_error", error))?)
+    } else {
+        None
+    };
+    let current_dir =
+        std::env::current_dir().map_err(|error| BackendError::new("config_error", error))?;
+    autostart_executable_from(appimage.as_deref(), current_exe.as_deref(), &current_dir)
+}
+
+fn autostart_executable_from(
+    appimage: Option<&std::ffi::OsStr>,
+    current_exe: Option<&Path>,
+    current_dir: &Path,
+) -> Result<PathBuf> {
+    let executable = appimage
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| current_exe.map(Path::to_path_buf))
+        .ok_or_else(|| BackendError::new("config_error", "Could not determine executable path"))?;
+    Ok(if executable.is_absolute() {
+        executable
+    } else {
+        current_dir.join(executable)
+    })
+}
+
+fn exec_line(executable: &Path) -> String {
+    let path = executable.to_string_lossy();
+    let quoted = path.chars().fold(String::new(), |mut output, character| {
+        match character {
+            '\\' | '"' | '$' | '`' => {
+                output.push('\\');
+                output.push(character);
+            }
+            '%' => output.push_str("%%"),
+            _ => output.push(character),
+        }
+        output
+    });
+    format!("Exec=\"{quoted}\" --hidden\n")
+}
+
+fn set_autostart_file(path: &Path, enabled: bool, executable: Option<&Path>) -> Result<()> {
     if enabled {
+        let executable = executable.ok_or_else(|| {
+            BackendError::new("config_error", "Could not determine executable path")
+        })?;
         let parent = path.parent().ok_or_else(|| {
             BackendError::new("config_error", "Autostart path has no parent directory")
         })?;
         fs::create_dir_all(parent).map_err(|error| BackendError::new("config_error", error))?;
         fs::write(
             path,
-            "[Desktop Entry]\nType=Application\nName=Gitreal\nExec=gitreal --hidden\nX-GNOME-Autostart-enabled=true\n",
+            format!(
+                "[Desktop Entry]\nType=Application\nName=Gitreal\n{}X-GNOME-Autostart-enabled=true\n",
+                exec_line(executable)
+            ),
         )
         .map_err(|error| BackendError::new("config_error", error))
     } else {
@@ -406,14 +462,44 @@ mod tests {
     fn autostart_file_is_written_and_removed() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("autostart/gitreal.desktop");
-        set_autostart_file(&path, true).unwrap();
+        let executable = std::env::current_exe().unwrap();
+        set_autostart_file(&path, true, Some(&executable)).unwrap();
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
-            "[Desktop Entry]\nType=Application\nName=Gitreal\nExec=gitreal --hidden\nX-GNOME-Autostart-enabled=true\n"
+            format!(
+                "[Desktop Entry]\nType=Application\nName=Gitreal\n{}X-GNOME-Autostart-enabled=true\n",
+                exec_line(&executable)
+            )
         );
-        set_autostart_file(&path, false).unwrap();
+        set_autostart_file(&path, false, None).unwrap();
         assert!(!path.exists());
-        set_autostart_file(&path, false).unwrap();
+        set_autostart_file(&path, false, None).unwrap();
+    }
+
+    #[test]
+    fn autostart_exec_quotes_spaces_and_uses_appimage_when_set() {
+        let directory = tempfile::tempdir().unwrap();
+        let normal = directory.path().join("gitreal");
+        assert_eq!(
+            autostart_executable_from(None, Some(&normal), directory.path()).unwrap(),
+            normal
+        );
+        assert_eq!(
+            exec_line(&normal),
+            format!("Exec=\"{}\" --hidden\n", normal.display())
+        );
+
+        let spaced = directory.path().join("Gitreal App/gitreal");
+        assert_eq!(
+            exec_line(&spaced),
+            format!("Exec=\"{}\" --hidden\n", spaced.display())
+        );
+
+        let appimage = directory.path().join("Gitreal.AppImage");
+        assert_eq!(
+            autostart_executable_from(Some(appimage.as_os_str()), None, directory.path()).unwrap(),
+            appimage
+        );
     }
 
     #[test]
@@ -423,7 +509,7 @@ mod tests {
         let home = directory.path().join("home");
         let autostart = autostart_path_from(Some(&xdg), Some(&home)).unwrap();
         assert_eq!(autostart, xdg.join("autostart/gitreal.desktop"));
-        set_autostart_file(&autostart, true).unwrap();
+        set_autostart_file(&autostart, true, Some(&std::env::current_exe().unwrap())).unwrap();
         assert!(autostart.is_file());
         assert_eq!(
             autostart_path_from(None, Some(&home)).unwrap(),

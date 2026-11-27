@@ -186,6 +186,8 @@ impl JobQueue {
                         }
                         Err(error) => (false, error, String::new(), None),
                     };
+                    let message = redact_credentials(&message);
+                    let stderr_tail = redact_credentials(&stderr_tail);
                     event_sink.job_finished(JobFinished {
                         job_id: id,
                         repo_id: worker_repo_id.clone(),
@@ -557,6 +559,64 @@ fn terminate_child(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
+fn redact_credentials(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut redacted = String::with_capacity(text.len());
+    let mut cursor = 0;
+
+    while cursor < bytes.len() {
+        let start = cursor;
+        if bytes[cursor].is_ascii_alphabetic() {
+            let mut scheme_end = cursor + 1;
+            while scheme_end < bytes.len()
+                && (bytes[scheme_end].is_ascii_alphanumeric()
+                    || matches!(bytes[scheme_end], b'+' | b'.' | b'-'))
+            {
+                scheme_end += 1;
+            }
+            if bytes.get(scheme_end..scheme_end + 3) == Some(b"://") {
+                let authority_start = scheme_end + 3;
+                let mut authority_end = authority_start;
+                while authority_end < bytes.len()
+                    && !matches!(
+                        bytes[authority_end],
+                        b'/' | b'?'
+                            | b'#'
+                            | b' '
+                            | b'\t'
+                            | b'\n'
+                            | b'\r'
+                            | b'"'
+                            | b'\''
+                            | b'<'
+                            | b'>'
+                    )
+                {
+                    authority_end += 1;
+                }
+                if let Some(at) = text[authority_start..authority_end].rfind('@') {
+                    let host_start = authority_start + at + 1;
+                    if host_start < authority_end {
+                        redacted.push_str(&text[start..authority_start]);
+                        redacted.push_str("***@");
+                        redacted.push_str(&text[host_start..authority_end]);
+                        cursor = authority_end;
+                        continue;
+                    }
+                }
+            }
+        }
+        let character = text[cursor..]
+            .chars()
+            .next()
+            .expect("cursor is within text");
+        redacted.push(character);
+        cursor += character.len_utf8();
+    }
+
+    redacted
+}
+
 fn friendly_failure(spec: &JobSpec, stderr: &str, timed_out: bool) -> String {
     if timed_out {
         return "Git operation timed out".into();
@@ -697,6 +757,40 @@ mod tests {
     }
 
     #[test]
+    fn redacts_url_credentials() {
+        for (input, expected) in [
+            (
+                format!(
+                    "fatal: unable to access 'https://user:{}@example.com/x.git'",
+                    "secret"
+                ),
+                "fatal: unable to access 'https://***@example.com/x.git'".to_owned(),
+            ),
+            (
+                "https://token@example.com/x.git".to_owned(),
+                "https://***@example.com/x.git".to_owned(),
+            ),
+            (
+                format!(
+                    "https://user:{}@one.example/x https://token@two.example/y",
+                    "secret"
+                ),
+                "https://***@one.example/x https://***@two.example/y".to_owned(),
+            ),
+            (
+                "fatal: could not read from remote repository git@github.com:org/repo".to_owned(),
+                "fatal: could not read from remote repository git@github.com:org/repo".to_owned(),
+            ),
+            (
+                "No URL in this message".to_owned(),
+                "No URL in this message".to_owned(),
+            ),
+        ] {
+            assert_eq!(redact_credentials(&input), expected);
+        }
+    }
+
+    #[test]
     fn jobs_for_one_repository_run_in_order() {
         let (sink, receiver) = sink();
         let queue = JobQueue::new("one".into(), sink);
@@ -772,6 +866,62 @@ mod tests {
         let finished = receive_finished(&receiver);
         assert!(!finished.ok);
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn failing_push_does_not_expose_url_credentials_in_job_finished() {
+        use std::{net::TcpListener, process::Command};
+
+        let directory = tempfile::tempdir().unwrap();
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(directory.path())
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(directory.path())
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(directory.path())
+            .status()
+            .unwrap();
+        std::fs::write(directory.path().join("file"), "content").unwrap();
+        Command::new("git")
+            .args(["add", "file"])
+            .current_dir(directory.path())
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "--quiet", "-m", "test"])
+            .current_dir(directory.path())
+            .status()
+            .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let (sink, receiver) = sink();
+        let queue = JobQueue::new("redaction".into(), sink);
+        let spec = JobSpec::new(
+            "push",
+            "Push",
+            directory.path().to_path_buf(),
+            vec![
+                "push".into(),
+                format!("https://user:{}@127.0.0.1:{port}/x.git", "secret"),
+                "HEAD".into(),
+            ],
+            "Pushed",
+        );
+        queue.enqueue(spec, || {}).unwrap();
+        let finished = receive_finished(&receiver);
+
+        assert!(!finished.ok);
+        assert!(!format!("{finished:?}").contains("secret"));
     }
 
     #[test]

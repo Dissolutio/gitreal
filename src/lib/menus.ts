@@ -1,4 +1,5 @@
 import type { RefInfo } from "./api";
+import { safeRefLabel } from "./display";
 
 export interface MenuItem {
   id: string;
@@ -83,12 +84,12 @@ export function mergeCommitRefLabels(
     consumed.add(label.name);
     const refsForLabel = [ref, match?.ref].filter((value): value is RefInfo => !!value);
     merged.push({
-      name: ref?.kind === "local"
+      name: safeRefLabel(ref?.kind === "local"
         ? ref.name
         : ref?.kind === "remote"
           ? label.name.replace(/^[^/]+\//, "")
-          : label.name.replace(/^refs\/(heads|remotes|tags)\//, ""),
-      fullNames: refsForLabel.map(value => value.full_name),
+          : label.name.replace(/^refs\/(heads|remotes|tags)\//, "")),
+      fullNames: refsForLabel.map(value => safeRefLabel(value.full_name)),
       kinds: refsForLabel.map(value => value.kind),
       refs: refsForLabel,
     });

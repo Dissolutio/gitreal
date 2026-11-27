@@ -69,6 +69,36 @@ is configured in COSMIC rather than inside Gitreal.
 From VSCode, a task or keybinding can open the current workspace with
 `gitreal open ${workspaceFolder}`.
 
+### Install & updates
+
+Download the `.AppImage` from [Gitreal Releases](https://github.com/Dissolutio/gitreal/releases/latest), then make it executable and place it in `~/Applications/`:
+
+```sh
+mkdir -p ~/Applications
+chmod +x ~/Downloads/Gitreal_*.AppImage
+mv ~/Downloads/Gitreal_*.AppImage ~/Applications/
+```
+
+Start the AppImage from that location. The **Start at login** tray entry uses
+the running AppImage path from `$APPIMAGE`, so keep the file in its chosen
+location. Gitreal checks for updates about 30 seconds after startup and every
+six hours; use **Check for updates** in the tray menu to check manually. Update
+checks can be disabled from the tray menu. AppImages offer **Update & restart**;
+`.deb` installs cannot update themselves and instead open the release page.
+
+To enable signed updates for the owner, generate a signing key once:
+
+```sh
+pnpm tauri signer generate -w ~/.tauri/gitreal.key
+```
+
+Add the generated private key and password as repository secrets named
+`TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`. Copy the
+generated public key into `plugins.updater.pubkey` in `src-tauri/tauri.conf.json`
+(already set for the official repo: minisign key ID `9F2988ED5FF35989`). Never commit the private key or password. Every
+push to `main` then publishes a signed release with an AppImage, `.deb`, and
+updater metadata.
+
 ### Checks
 
 ```sh

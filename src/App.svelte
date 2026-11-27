@@ -6,7 +6,7 @@
   import VirtualList from "./VirtualList.svelte";
   import Snackbar from "./Snackbar.svelte";
   import ContextMenu from "./ContextMenu.svelte";
-  import { api, desktop, nativeError, onJobFinished, onJobStarted, onOpenPath, onRepoChanged, onRepoError, onWindowVisibility, type CommitDetail, type GraphRow, type KnownRepo, type NativeError, type OperationInfo, type RefInfo, type Repository, type StashInfo } from "./lib/api";
+  import { api, desktop, nativeError, onJobFinished, onJobStarted, onOpenPath, onRepoChanged, onRepoError, onUpdateError, onUpdateFound, onUpdateProgress, onWindowVisibility, type CommitDetail, type GraphRow, type KnownRepo, type NativeError, type OperationInfo, type RefInfo, type Repository, type StashInfo } from "./lib/api";
   import { closeTab, createTab, cycleTabs, MAX_TABS, openTab, restoreTabs, type RepoTab } from "./lib/tabs";
   import { PageCache, PAGE_SIZE, ROW_HEIGHT, pageOffsets, visibleRange } from "./lib/virtual";
   import { formatAheadBehind, formatOperationBanner, operationBannerActions } from "./lib/status";
@@ -15,6 +15,7 @@
   import { safeRefLabel } from "./lib/display";
   import { validateBranchName } from "./lib/refnames";
   import { formatRelativeDate, indexStashes, placeVisibleStashes } from "./lib/stashes";
+  import { updateStore, type UpdateSnackbarEntry } from "./lib/update";
 
   type MenuTarget = { kind: "ref"; ref: RefInfo } | { kind: "commit"; oid: string } | { kind: "stash"; stash: StashInfo };
   type PromptState = { kind: "create" | "rename"; x: number; y: number; ref?: RefInfo; oid: string; name: string; checkout: boolean; message: string };
@@ -913,6 +914,23 @@
     }
   }
 
+  async function handleUpdateAction(update: UpdateSnackbarEntry) {
+    if (!update.can_install) {
+      try {
+        await api.openReleasePage();
+      } catch (failure) {
+        updateStore.failed(nativeError(failure).message);
+      }
+      return;
+    }
+    updateStore.startInstall();
+    try {
+      await api.installUpdate();
+    } catch (failure) {
+      updateStore.failed(nativeError(failure).message);
+    }
+  }
+
   onMount(() => {
     let unlistenChanged: (() => void) | undefined;
     let unlistenError: (() => void) | undefined;
@@ -923,6 +941,9 @@
     document.addEventListener("visibilitychange", onDocumentVisibility);
     let unlistenJobStarted: (() => void) | undefined;
     let unlistenJobFinished: (() => void) | undefined;
+    let unlistenUpdateFound: (() => void) | undefined;
+    let unlistenUpdateProgress: (() => void) | undefined;
+    let unlistenUpdateError: (() => void) | undefined;
     void onRepoChanged(event => { void refreshRepository(event); }).then(unlisten => {
       if (disposed) unlisten();
       else unlistenChanged = unlisten;
@@ -934,6 +955,18 @@
     void onJobFinished(finishJob).then(unlisten => {
       if (disposed) unlisten();
       else unlistenJobFinished = unlisten;
+    }).catch(failure => { error = nativeError(failure); });
+    void onUpdateFound(update => { updateStore.found(update); }).then(unlisten => {
+      if (disposed) unlisten();
+      else unlistenUpdateFound = unlisten;
+    }).catch(failure => { error = nativeError(failure); });
+    void onUpdateProgress(progress => { updateStore.progress(progress); }).then(unlisten => {
+      if (disposed) unlisten();
+      else unlistenUpdateProgress = unlisten;
+    }).catch(failure => { error = nativeError(failure); });
+    void onUpdateError(event => { updateStore.failed(event.message); }).then(unlisten => {
+      if (disposed) unlisten();
+      else unlistenUpdateError = unlisten;
     }).catch(failure => { error = nativeError(failure); });
     void onRepoError(reportRepositoryError).then(unlisten => {
       if (disposed) unlisten();
@@ -969,6 +1002,9 @@
       document.removeEventListener("visibilitychange", onDocumentVisibility);
       unlistenJobStarted?.();
       unlistenJobFinished?.();
+      unlistenUpdateFound?.();
+      unlistenUpdateProgress?.();
+      unlistenUpdateError?.();
       observer.disconnect();
       ++epoch; ++selectionEpoch;
       for (const tab of tabs) {
@@ -1198,7 +1234,7 @@
       <div class="details-empty"><span class="details-icon">◇</span><h3>The details matter.</h3><p>Select a commit to explore its author, message, parents, and changed files.</p><span class="keyboard-hint">CLICK A COMMIT TO INSPECT</span></div>
     {/if}
   </aside>
-  <Snackbar onAction={followUpAction} />
+  <Snackbar onAction={followUpAction} onUpdateAction={handleUpdateAction} />
   {#if contextMenu}
     <ContextMenu x={contextMenu.x} y={contextMenu.y} items={contextItems} onSelect={selectContextMenuItem} onClose={() => { contextMenu = null; }} />
   {/if}

@@ -75,6 +75,8 @@ struct StashSignature {
 pub struct Backend {
     repositories: Mutex<HashMap<String, Arc<Repository>>>,
     job_queues: Mutex<HashMap<String, Arc<JobQueue>>>,
+    update_installing: Mutex<bool>,
+    pending_jobs: Arc<std::sync::atomic::AtomicUsize>,
     next_id: AtomicU64,
     event_sink: Arc<dyn EventSink>,
 }
@@ -106,6 +108,8 @@ impl Backend {
         Self {
             repositories: Mutex::new(HashMap::new()),
             job_queues: Mutex::new(HashMap::new()),
+            update_installing: Mutex::new(false),
+            pending_jobs: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             next_id: AtomicU64::new(0),
             event_sink,
         }
@@ -476,6 +480,16 @@ impl Backend {
         repository: Arc<Repository>,
         spec: JobSpec,
     ) -> Result<JobId> {
+        let update_installing = self
+            .update_installing
+            .lock()
+            .map_err(|_| BackendError::new("internal_error", "Update state unavailable"))?;
+        if *update_installing {
+            return Err(BackendError::new(
+                "update_in_progress",
+                "Wait for the Gitreal update to finish before starting a Git operation.",
+            ));
+        }
         let queue =
             {
                 let repositories = self.repositories.lock().map_err(|_| {
@@ -494,9 +508,10 @@ impl Backend {
                     BackendError::new("internal_error", "Git job queue unavailable")
                 })?;
                 Arc::clone(queues.entry(repo_id.to_owned()).or_insert_with(|| {
-                    Arc::new(JobQueue::new(
+                    Arc::new(JobQueue::new_with_pending(
                         repo_id.to_owned(),
                         Arc::clone(&self.event_sink),
+                        Arc::clone(&self.pending_jobs),
                     ))
                 }))
             };
@@ -520,6 +535,28 @@ impl Backend {
                 }
             })
             .map_err(|error| BackendError::new("internal_error", error))
+    }
+
+    pub fn begin_update_install(&self) -> Result<()> {
+        let mut update_installing = self
+            .update_installing
+            .lock()
+            .map_err(|_| BackendError::new("internal_error", "Update state unavailable"))?;
+        if *update_installing {
+            return Err(BackendError::new(
+                "update_in_progress",
+                "A Gitreal update is already being installed.",
+            ));
+        }
+        crate::updater::ensure_no_running_jobs(self.pending_jobs.load(Ordering::Acquire) > 0)?;
+        *update_installing = true;
+        Ok(())
+    }
+
+    pub fn end_update_install(&self) {
+        if let Ok(mut update_installing) = self.update_installing.lock() {
+            *update_installing = false;
+        }
     }
 
     fn repository(&self, id: &str) -> Result<Arc<Repository>> {

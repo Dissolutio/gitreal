@@ -5,15 +5,18 @@ use crate::model::{
     RepoChanged, RepoError, Result,
 };
 use crate::repo::reader::{Backend, EventSink};
+use crate::updater::{self, UpdateInfo, UpdateProgress};
 use std::{
     path::Path,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 use tauri::{
     AppHandle, Emitter, Manager, State, WindowEvent,
     menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent},
 };
+use tokio::sync::watch;
 
 #[derive(Default)]
 struct PendingOpenPaths(Mutex<PendingOpenState>);
@@ -26,6 +29,8 @@ struct PendingOpenState {
 
 #[derive(Default)]
 struct TrayState(Mutex<Option<(TrayIcon<tauri::Wry>, Menu<tauri::Wry>)>>);
+
+struct UpdateSchedule(watch::Sender<bool>);
 
 #[derive(Clone, serde::Serialize)]
 struct OpenPathEvent {
@@ -394,6 +399,57 @@ async fn get_config(config: State<'_, Arc<ConfigManager>>) -> Result<AppConfig> 
 }
 
 #[tauri::command]
+async fn check_for_update(app: AppHandle) -> Result<Option<UpdateInfo>> {
+    updater::check_and_emit(&app).await
+}
+
+#[tauri::command]
+async fn install_update_and_restart(
+    app: AppHandle,
+    backend: State<'_, Arc<Backend>>,
+) -> Result<()> {
+    if !updater::can_install_from_env(std::env::var_os("APPIMAGE").as_deref()) {
+        return Err(crate::model::BackendError::new(
+            "unsupported_installer",
+            "In-app installation is available only when Gitreal is running from an AppImage.",
+        ));
+    }
+    let backend = Arc::clone(&backend);
+    backend.begin_update_install()?;
+    let result = async {
+        let update = updater::check_update(&app).await?.ok_or_else(|| {
+            crate::model::BackendError::new("updater_error", "No update is available.")
+        })?;
+        let progress_app = app.clone();
+        let mut downloaded = 0_u64;
+        update
+            .download_and_install(
+                move |chunk, total| {
+                    downloaded += chunk as u64;
+                    let _ =
+                        progress_app.emit("update-progress", UpdateProgress { downloaded, total });
+                },
+                || {},
+            )
+            .await
+            .map_err(updater::updater_error)?;
+        Ok(())
+    }
+    .await;
+    backend.end_update_install();
+    if let Err(error) = result {
+        updater::emit_error(&app, &error);
+        return Err(error);
+    }
+    app.restart();
+}
+
+#[tauri::command]
+fn open_release_page() -> Result<()> {
+    crate::repo::history_ops::open_release_page()
+}
+
+#[tauri::command]
 fn frontend_ready(app: AppHandle, pending: State<'_, PendingOpenPaths>) {
     let paths = match pending.0.lock() {
         Ok(mut state) => {
@@ -421,7 +477,12 @@ async fn set_open_tabs(
     let menu_paths = paths.clone();
     blocking(move || manager.set_open_tabs(paths, active)).await?;
     let autostart = config.get_config()?.start_at_login;
-    refresh_tray_menu(&app, &menu_paths, autostart);
+    refresh_tray_menu(
+        &app,
+        &menu_paths,
+        autostart,
+        config.get_config()?.check_for_updates,
+    );
     Ok(())
 }
 
@@ -454,6 +515,32 @@ async fn set_start_at_login(
             .map(|tab| tab.path.clone())
             .collect::<Vec<_>>(),
         updated.start_at_login,
+        updated.check_for_updates,
+    );
+    Ok(())
+}
+
+#[tauri::command]
+async fn set_check_for_updates(
+    app: AppHandle,
+    config: State<'_, Arc<ConfigManager>>,
+    enabled: bool,
+) -> Result<()> {
+    let manager = Arc::clone(&config);
+    blocking(move || manager.set_check_for_updates(enabled)).await?;
+    let updated = config.get_config()?;
+    if let Some(schedule) = app.try_state::<UpdateSchedule>() {
+        let _ = schedule.0.send(updated.check_for_updates);
+    }
+    refresh_tray_menu(
+        &app,
+        &updated
+            .tabs
+            .iter()
+            .map(|tab| tab.path.clone())
+            .collect::<Vec<_>>(),
+        updated.start_at_login,
+        updated.check_for_updates,
     );
     Ok(())
 }
@@ -543,6 +630,7 @@ fn populate_tray_menu(
     menu: &Menu<tauri::Wry>,
     paths: &[String],
     start_at_login: bool,
+    check_for_updates: bool,
 ) -> tauri::Result<()> {
     while menu.remove_at(0)?.is_some() {}
     let heading = MenuItem::with_id(app, "open-tabs", "Open tabs", false, None::<&str>)?;
@@ -560,6 +648,14 @@ fn populate_tray_menu(
     menu.append(&toggle)?;
     let show = MenuItem::with_id(app, "show", "Show", true, None::<&str>)?;
     menu.append(&show)?;
+    let check_updates = MenuItem::with_id(
+        app,
+        "check-updates",
+        "Check for updates",
+        true,
+        None::<&str>,
+    )?;
+    menu.append(&check_updates)?;
     let autostart = CheckMenuItem::with_id(
         app,
         "autostart",
@@ -569,12 +665,26 @@ fn populate_tray_menu(
         None::<&str>,
     )?;
     menu.append(&autostart)?;
+    let update_checks = CheckMenuItem::with_id(
+        app,
+        "auto-updates",
+        "Check for updates automatically",
+        true,
+        check_for_updates,
+        None::<&str>,
+    )?;
+    menu.append(&update_checks)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     menu.append(&quit)?;
     Ok(())
 }
 
-fn refresh_tray_menu(app: &AppHandle, paths: &[String], start_at_login: bool) {
+fn refresh_tray_menu(
+    app: &AppHandle,
+    paths: &[String],
+    start_at_login: bool,
+    check_for_updates: bool,
+) {
     let Some(state) = app.try_state::<TrayState>() else {
         return;
     };
@@ -583,7 +693,7 @@ fn refresh_tray_menu(app: &AppHandle, paths: &[String], start_at_login: bool) {
         return;
     };
     if let Some((_, menu)) = guard.as_ref()
-        && let Err(error) = populate_tray_menu(app, menu, paths, start_at_login)
+        && let Err(error) = populate_tray_menu(app, menu, paths, start_at_login, check_for_updates)
     {
         eprintln!("Gitreal could not update the tray menu: {error}");
     }
@@ -607,6 +717,7 @@ fn initialize_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
             .map(|tab| tab.path.clone())
             .collect::<Vec<_>>(),
         config.start_at_login,
+        config.check_for_updates,
     )?;
     let mut builder = TrayIconBuilder::new()
         .menu(&menu)
@@ -617,6 +728,12 @@ fn initialize_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
                 "toggle" => toggle_window(app),
                 "show" => show_window(app),
                 "quit" => app.exit(0),
+                "check-updates" => {
+                    let app = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let _ = updater::check_and_emit(&app).await;
+                    });
+                }
                 "autostart" => {
                     if let Some(config) = app.try_state::<Arc<ConfigManager>>() {
                         match config.get_config() {
@@ -634,11 +751,41 @@ fn initialize_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
                                             .map(|tab| tab.path.clone())
                                             .collect::<Vec<_>>(),
                                         updated.start_at_login,
+                                        updated.check_for_updates,
                                     );
                                 }
                             }
                             Err(error) => {
                                 eprintln!("Gitreal could not read autostart setting: {error}")
+                            }
+                        }
+                    }
+                }
+                "auto-updates" => {
+                    if let Some(config) = app.try_state::<Arc<ConfigManager>>() {
+                        match config.get_config() {
+                            Ok(current) => {
+                                let enabled = !current.check_for_updates;
+                                if let Err(error) = config.set_check_for_updates(enabled) {
+                                    eprintln!("Gitreal could not update update checks: {error}");
+                                } else if let Ok(updated) = config.get_config() {
+                                    if let Some(schedule) = app.try_state::<UpdateSchedule>() {
+                                        let _ = schedule.0.send(updated.check_for_updates);
+                                    }
+                                    refresh_tray_menu(
+                                        app,
+                                        &updated
+                                            .tabs
+                                            .iter()
+                                            .map(|tab| tab.path.clone())
+                                            .collect::<Vec<_>>(),
+                                        updated.start_at_login,
+                                        updated.check_for_updates,
+                                    );
+                                }
+                            }
+                            Err(error) => {
+                                eprintln!("Gitreal could not read update-check setting: {error}")
                             }
                         }
                     }
@@ -675,6 +822,37 @@ fn initialize_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+fn start_update_scheduler(app: AppHandle, mut enabled: watch::Receiver<bool>) {
+    if cfg!(debug_assertions) || !updater::updater_configured() {
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        let start = Instant::now();
+        let mut last_check = None;
+        loop {
+            if !*enabled.borrow() {
+                if enabled.changed().await.is_err() {
+                    break;
+                }
+                continue;
+            }
+            let now = start.elapsed();
+            let next =
+                updater::next_check_time(Duration::ZERO, last_check, now, true).unwrap_or(now);
+            match tokio::time::timeout(next.saturating_sub(now), enabled.changed()).await {
+                Ok(Ok(())) => continue,
+                Ok(Err(_)) => break,
+                Err(_) => {
+                    if *enabled.borrow() {
+                        let _ = updater::check_and_emit(&app).await;
+                        last_check = Some(start.elapsed());
+                    }
+                }
+            }
+        }
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let argv = std::env::args().collect::<Vec<_>>();
@@ -703,9 +881,17 @@ pub fn run() {
             app.manage(Arc::new(ConfigManager::default()));
             app.manage(PendingOpenPaths::default());
             app.manage(TrayState::default());
+            let updates_enabled = app
+                .state::<Arc<ConfigManager>>()
+                .get_config()
+                .map(|config| config.check_for_updates)
+                .unwrap_or(true);
+            let (updates_sender, updates_receiver) = watch::channel(updates_enabled);
+            app.manage(UpdateSchedule(updates_sender));
             if let Err(error) = initialize_tray(app.handle()) {
                 eprintln!("Gitreal could not create a tray icon: {error}");
             }
+            start_update_scheduler(app.handle().clone(), updates_receiver);
             handle_cli_action(app.handle(), startup_action, &startup_cwd);
             Ok(())
         })
@@ -718,6 +904,7 @@ pub fn run() {
             }
         })
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             open_repo,
             close_repo,
@@ -754,11 +941,15 @@ pub fn run() {
             open_in_vscode,
             stash_and_checkout,
             get_config,
+            check_for_update,
+            install_update_and_restart,
+            open_release_page,
             frontend_ready,
             set_open_tabs,
             add_known_repo,
             remove_known_repo,
             set_start_at_login,
+            set_check_for_updates,
             get_window_visibility,
             quit_app
         ])

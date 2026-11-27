@@ -80,13 +80,42 @@ enum QueueMessage {
 pub struct JobQueue {
     sender: mpsc::Sender<QueueMessage>,
     cancelled: Arc<AtomicBool>,
+    pending: Arc<std::sync::atomic::AtomicUsize>,
+    all_pending: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+struct PendingJob {
+    pending: Arc<std::sync::atomic::AtomicUsize>,
+    all_pending: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for PendingJob {
+    fn drop(&mut self) {
+        self.pending.fetch_sub(1, Ordering::AcqRel);
+        self.all_pending.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl JobQueue {
     pub fn new(repo_id: String, event_sink: Arc<dyn EventSink>) -> Self {
+        Self::new_with_pending(
+            repo_id,
+            event_sink,
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        )
+    }
+
+    pub fn new_with_pending(
+        repo_id: String,
+        event_sink: Arc<dyn EventSink>,
+        all_pending: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
         let (sender, receiver) = mpsc::channel();
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
+        let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let worker_pending = Arc::clone(&pending);
+        let worker_all_pending = Arc::clone(&all_pending);
         let worker_repo_id = repo_id.clone();
         thread::Builder::new()
             .name(format!("git-jobs-{repo_id}"))
@@ -97,6 +126,10 @@ impl JobQueue {
                     after_job,
                 }) = receiver.recv()
                 {
+                    let _pending_job = PendingJob {
+                        pending: Arc::clone(&worker_pending),
+                        all_pending: Arc::clone(&worker_all_pending),
+                    };
                     if worker_cancelled.load(Ordering::Acquire) {
                         event_sink.job_finished(JobFinished {
                             job_id: id,
@@ -201,7 +234,12 @@ impl JobQueue {
                 }
             })
             .expect("failed to start Git job worker");
-        Self { sender, cancelled }
+        Self {
+            sender,
+            cancelled,
+            pending,
+            all_pending,
+        }
     }
 
     pub fn enqueue(
@@ -210,14 +248,24 @@ impl JobQueue {
         after_job: impl FnOnce() + Send + 'static,
     ) -> std::io::Result<JobId> {
         let id = format!("job-{}", NEXT_JOB_ID.fetch_add(1, Ordering::Relaxed));
+        self.pending.fetch_add(1, Ordering::AcqRel);
+        self.all_pending.fetch_add(1, Ordering::AcqRel);
         self.sender
             .send(QueueMessage::Run {
                 id: id.clone(),
                 spec,
                 after_job: Box::new(after_job),
             })
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
+            .map_err(|error| {
+                self.pending.fetch_sub(1, Ordering::AcqRel);
+                self.all_pending.fetch_sub(1, Ordering::AcqRel);
+                std::io::Error::other(error.to_string())
+            })?;
         Ok(id)
+    }
+
+    pub fn is_busy(&self) -> bool {
+        self.pending.load(Ordering::Acquire) > 0
     }
 
     pub fn cancel_queued(&self) {
@@ -553,7 +601,7 @@ fn terminate_child(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
-fn redact_credentials(text: &str) -> String {
+pub fn redact_credentials(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut redacted = String::with_capacity(text.len());
     let mut cursor = 0;
@@ -804,6 +852,23 @@ mod tests {
                 .flat_map(|id| [("start", id.clone()), ("finish", id)])
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn queue_remains_busy_for_running_and_waiting_jobs() {
+        let (sink, receiver) = sink();
+        let queue = JobQueue::new("one".into(), sink);
+        queue.enqueue(slow_spec("0.1"), || {}).unwrap();
+        queue.enqueue(slow_spec("0.1"), || {}).unwrap();
+        assert!(queue.is_busy());
+        receive_finished(&receiver);
+        assert!(queue.is_busy());
+        receive_finished(&receiver);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while queue.is_busy() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!queue.is_busy());
     }
 
     #[test]

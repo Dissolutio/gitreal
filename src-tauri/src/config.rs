@@ -17,6 +17,10 @@ const MAX_KNOWN_REPOS: usize = 50;
 const MAX_TABS: usize = 16;
 static TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
+fn default_check_for_updates() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct KnownRepo {
     pub path: String,
@@ -36,6 +40,8 @@ pub struct AppConfig {
     pub active_tab: Option<String>,
     #[serde(default)]
     pub start_at_login: bool,
+    #[serde(default = "default_check_for_updates")]
+    pub check_for_updates: bool,
     pub repos: Vec<KnownRepo>,
     pub tabs: Vec<OpenTab>,
 }
@@ -46,6 +52,7 @@ impl Default for AppConfig {
             version: CONFIG_VERSION,
             active_tab: None,
             start_at_login: false,
+            check_for_updates: true,
             repos: Vec::new(),
             tabs: Vec::new(),
         }
@@ -104,6 +111,14 @@ impl ConfigManager {
         };
         set_autostart_file(&autostart_path, enabled, executable.as_deref())?;
         config.start_at_login = enabled;
+        save_config(&path, &config)
+    }
+
+    pub fn set_check_for_updates(&self, enabled: bool) -> Result<()> {
+        let _guard = self.lock()?;
+        let path = config_path()?;
+        let mut config = load_config(&path)?;
+        config.check_for_updates = enabled;
         save_config(&path, &config)
     }
 
@@ -395,6 +410,7 @@ mod tests {
             version: CONFIG_VERSION,
             active_tab: Some("/repo/one".into()),
             start_at_login: true,
+            check_for_updates: true,
             repos: vec![KnownRepo {
                 path: "/repo/one".into(),
                 name: "one".into(),
@@ -428,6 +444,7 @@ mod tests {
     fn older_config_defaults_start_at_login_to_false() {
         let config: AppConfig = toml::from_str("version = 1\nrepos = []\ntabs = []").unwrap();
         assert!(!config.start_at_login);
+        assert!(config.check_for_updates);
     }
 
     #[test]

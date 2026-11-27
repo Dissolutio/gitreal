@@ -1,6 +1,7 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { JobFinishedEvent, JobStartedEvent } from "./snackbar";
+import type { UpdateInfo, UpdateProgress } from "./update";
 
 export interface Repository { repo_id: string; path: string; name: string }
 export interface KnownRepo { path: string; name: string; last_opened: number }
@@ -9,6 +10,7 @@ export interface AppConfig {
   version: number;
   active_tab: string | null;
   start_at_login: boolean;
+  check_for_updates: boolean;
   repos: KnownRepo[];
   tabs: PersistedTab[];
 }
@@ -107,6 +109,15 @@ export function onJobStarted(handler: (event: JobStartedEvent) => void): Promise
 export function onJobFinished(handler: (event: JobFinishedEvent) => void): Promise<UnlistenFn> {
   return desktop ? listen<JobFinishedEvent>("job-finished", event => handler(event.payload)) : Promise.resolve(() => {});
 }
+export function onUpdateFound(handler: (event: UpdateInfo) => void): Promise<UnlistenFn> {
+  return desktop ? listen<UpdateInfo>("update-found", event => handler(event.payload)) : Promise.resolve(() => {});
+}
+export function onUpdateProgress(handler: (event: UpdateProgress) => void): Promise<UnlistenFn> {
+  return desktop ? listen<UpdateProgress>("update-progress", event => handler(event.payload)) : Promise.resolve(() => {});
+}
+export function onUpdateError(handler: (event: { message: string }) => void): Promise<UnlistenFn> {
+  return desktop ? listen<{ message: string }>("update-error", event => handler(event.payload)) : Promise.resolve(() => {});
+}
 export const api = {
   open: (path: string) => call<Repository>("open_repo", { path }),
   close: (repoId: string) => call<null>("close_repo", { repoId }),
@@ -171,6 +182,8 @@ export const api = {
   pushRemote: (repoId: string, branch: string) =>
     call<string>("get_push_remote", { repoId, branch }),
   config: () => call<AppConfig>("get_config", {}),
+  installUpdate: () => call<void>("install_update_and_restart", {}),
+  openReleasePage: () => call<void>("open_release_page", {}),
   frontendReady: () => call<void>("frontend_ready", {}),
   windowVisible: () => call<boolean>("get_window_visibility", {}),
   quit: () => call<void>("quit_app", {}),

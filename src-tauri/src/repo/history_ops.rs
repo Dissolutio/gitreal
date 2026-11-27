@@ -175,6 +175,25 @@ pub fn open_in_vscode(path: &Path) -> Result<()> {
     open_in_vscode_with_search_path(path, None)
 }
 
+pub fn open_release_page() -> Result<()> {
+    let mut child = std::process::Command::new("xdg-open")
+        .arg(crate::updater::RELEASE_PAGE)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|error| {
+            BackendError::new(
+                "opener_unavailable",
+                format!("Could not open the release page: {error}"),
+            )
+        })?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
 fn open_in_vscode_with_search_path(
     path: &Path,
     search_path: Option<&std::ffi::OsStr>,

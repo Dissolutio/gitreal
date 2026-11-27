@@ -171,6 +171,7 @@ mod tests {
             config["plugins"]["updater"]["endpoints"][0],
             "https://github.com/Dissolutio/gitreal/releases/latest/download/latest.json"
         );
+        assert_eq!(config["plugins"]["updater"]["requireSignedVersion"], true);
         assert_eq!(config["bundle"]["createUpdaterArtifacts"], true);
         assert!(!updater_configured_with_key(Some(PLACEHOLDER_PUBKEY)));
         assert!(!updater_configured_with_key(None));

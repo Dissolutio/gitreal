@@ -1,5 +1,6 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import type { JobFinishedEvent, JobStartedEvent } from "./snackbar";
 
 export interface Repository { repo_id: string; path: string; name: string }
 export interface KnownRepo { path: string; name: string; last_opened: number }
@@ -17,8 +18,25 @@ export interface RefInfo {
   kind: "local" | "remote" | "tag" | "head";
   target: string | null;
   is_head: boolean;
+  upstream: string | null;
+  ahead: number | null;
+  behind: number | null;
+  upstream_gone: boolean;
+  truncated: boolean;
 }
-export interface RefsResponse { refs: RefInfo[]; generation: number }
+export interface OperationInfo {
+  kind: "merge" | "rebase" | "cherry-pick" | "revert" | "bisect";
+  head_name: string | null;
+  onto: string | null;
+  step: number | null;
+  total_steps: number | null;
+}
+export interface RefsResponse {
+  refs: RefInfo[];
+  operation: OperationInfo | null;
+  conflicted_files: number;
+  generation: number;
+}
 export interface RepoChangedEvent { repo_id: string; generation: number }
 export interface RepoErrorEvent { repo_id: string; message: string }
 export interface GraphEdge { from_lane: number; to_lane: number; parent_id: string }
@@ -75,6 +93,12 @@ export function onOpenPath(handler: (path: string) => void): Promise<UnlistenFn>
 export function onWindowVisibility(handler: (visible: boolean) => void): Promise<UnlistenFn> {
   return desktop ? listen<boolean>("window-visibility", event => handler(event.payload)) : Promise.resolve(() => {});
 }
+export function onJobStarted(handler: (event: JobStartedEvent) => void): Promise<UnlistenFn> {
+  return desktop ? listen<JobStartedEvent>("job-started", event => handler(event.payload)) : Promise.resolve(() => {});
+}
+export function onJobFinished(handler: (event: JobFinishedEvent) => void): Promise<UnlistenFn> {
+  return desktop ? listen<JobFinishedEvent>("job-finished", event => handler(event.payload)) : Promise.resolve(() => {});
+}
 export const api = {
   open: (path: string) => call<Repository>("open_repo", { path }),
   close: (repoId: string) => call<null>("close_repo", { repoId }),
@@ -83,6 +107,15 @@ export const api = {
     call<GraphPage>("get_graph_page", { repoId, offset, limit }),
   detail: (repoId: string, commitId: string) =>
     call<CommitDetail>("get_commit_detail", { repoId, commitId }),
+  fetch: (repoId: string, remote?: string) =>
+    call<string>("fetch", { repoId, remote }),
+  pull: (repoId: string) => call<string>("pull", { repoId }),
+  push: (repoId: string, branch: string) =>
+    call<string>("push", { repoId, branch }),
+  forcePush: (repoId: string, branch: string) =>
+    call<string>("force_push", { repoId, branch }),
+  pushRemote: (repoId: string, branch: string) =>
+    call<string>("get_push_remote", { repoId, branch }),
   config: () => call<AppConfig>("get_config", {}),
   frontendReady: () => call<void>("frontend_ready", {}),
   windowVisible: () => call<boolean>("get_window_visibility", {}),

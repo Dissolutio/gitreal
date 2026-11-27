@@ -1,7 +1,8 @@
 use crate::cli::{self, CliAction};
 use crate::config::{AppConfig, ConfigManager};
 use crate::model::{
-    BackendError, CommitDetail, GraphPage, OpenRepo, RefsResponse, RepoChanged, RepoError, Result,
+    BackendError, CommitDetail, GraphPage, JobFinished, JobId, JobStarted, OpenRepo, RefsResponse,
+    RepoChanged, RepoError, Result,
 };
 use crate::repo::reader::{Backend, EventSink};
 use std::{
@@ -40,6 +41,14 @@ impl EventSink for TauriEventSink {
 
     fn repo_error(&self, event: RepoError) {
         let _ = self.0.emit("repo-error", event);
+    }
+
+    fn job_started(&self, event: JobStarted) {
+        let _ = self.0.emit("job-started", event);
+    }
+
+    fn job_finished(&self, event: JobFinished) {
+        let _ = self.0.emit("job-finished", event);
     }
 }
 
@@ -88,6 +97,48 @@ async fn get_commit_detail(
 ) -> Result<CommitDetail> {
     let backend = Arc::clone(&backend);
     blocking(move || backend.get_commit_detail(&repo_id, &commit_id)).await
+}
+
+#[tauri::command]
+async fn fetch(
+    backend: State<'_, Arc<Backend>>,
+    repo_id: String,
+    remote: Option<String>,
+) -> Result<JobId> {
+    let backend = Arc::clone(&backend);
+    blocking(move || backend.fetch(&repo_id, remote.as_deref())).await
+}
+
+#[tauri::command]
+async fn pull(backend: State<'_, Arc<Backend>>, repo_id: String) -> Result<JobId> {
+    let backend = Arc::clone(&backend);
+    blocking(move || backend.pull(&repo_id)).await
+}
+
+#[tauri::command]
+async fn push(backend: State<'_, Arc<Backend>>, repo_id: String, branch: String) -> Result<JobId> {
+    let backend = Arc::clone(&backend);
+    blocking(move || backend.push(&repo_id, &branch)).await
+}
+
+#[tauri::command]
+async fn force_push(
+    backend: State<'_, Arc<Backend>>,
+    repo_id: String,
+    branch: String,
+) -> Result<JobId> {
+    let backend = Arc::clone(&backend);
+    blocking(move || backend.force_push(&repo_id, &branch)).await
+}
+
+#[tauri::command]
+async fn get_push_remote(
+    backend: State<'_, Arc<Backend>>,
+    repo_id: String,
+    branch: String,
+) -> Result<String> {
+    let backend = Arc::clone(&backend);
+    blocking(move || backend.push_remote(&repo_id, &branch)).await
 }
 
 #[tauri::command]
@@ -427,6 +478,11 @@ pub fn run() {
             get_refs,
             get_graph_page,
             get_commit_detail,
+            fetch,
+            pull,
+            push,
+            force_push,
+            get_push_remote,
             get_config,
             frontend_ready,
             set_open_tabs,

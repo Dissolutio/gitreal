@@ -4,9 +4,12 @@
   import Tabs from "./Tabs.svelte";
   import GraphCanvas from "./GraphCanvas.svelte";
   import VirtualList from "./VirtualList.svelte";
-  import { api, desktop, nativeError, onOpenPath, onRepoChanged, onRepoError, onWindowVisibility, type CommitDetail, type GraphRow, type KnownRepo, type NativeError, type RefInfo, type Repository } from "./lib/api";
+  import Snackbar from "./Snackbar.svelte";
+  import { api, desktop, nativeError, onJobFinished, onJobStarted, onOpenPath, onRepoChanged, onRepoError, onWindowVisibility, type CommitDetail, type GraphRow, type KnownRepo, type NativeError, type OperationInfo, type RefInfo, type Repository } from "./lib/api";
   import { closeTab, createTab, cycleTabs, MAX_TABS, openTab, restoreTabs, type RepoTab } from "./lib/tabs";
   import { PageCache, PAGE_SIZE, ROW_HEIGHT, pageOffsets, visibleRange } from "./lib/virtual";
+  import { formatAheadBehind, formatOperationBanner } from "./lib/status";
+  import { snackbarStore, type JobFinishedEvent, type JobStartedEvent } from "./lib/snackbar";
 
   let tabs = $state<RepoTab[]>([]);
   let activePath = $state<string | null>(null);
@@ -14,10 +17,16 @@
   let activeTab = $derived(tabs.find(tab => tab.path === activePath) ?? null);
   let repository = $state<Repository | null>(null);
   let refs = $state<RefInfo[]>([]);
+  let operation = $state<OperationInfo | null>(null);
+  let conflictedFiles = $state(0);
   let filter = $state("");
   let collapsed = $state<Record<string, boolean>>({});
   let opening = $state(false);
   let choosing = $state(false);
+  let pushMenuOpen = $state(false);
+  let forceConfirmation = $state<{ repoId: string; branch: string; remote: string } | null>(null);
+  let runningRepoIds = $state<string[]>([]);
+  let requestingRepoIds = $state<string[]>([]);
   let error = $state<NativeError | null>(null);
   let detailError = $state<NativeError | null>(null);
   let selected = $state<string | null>(null);
@@ -38,12 +47,18 @@
   let selectionEpoch = 0;
   let cache = new PageCache<GraphRow>();
   const caches = new Map<string, PageCache<GraphRow>>();
+  const operationStates = new Map<string, { operation: OperationInfo | null; conflictedFiles: number }>();
   const pending = new Set<number>();
   const failed = new Set<number>();
   const openingTabs = new Set<number>();
   const groups = [{ kind: "local", label: "Local", icon: "⑂" }, { kind: "remote", label: "Remote", icon: "◎" }, { kind: "tag", label: "Tags", icon: "◇" }];
   let initialized = false;
   let disposed = false;
+  const runningJobs = new Map<string, string>();
+  const activeRepoRunning = $derived(!!repository && (
+    runningRepoIds.includes(repository.repo_id) || requestingRepoIds.includes(repository.repo_id)
+  ));
+  const currentBranch = $derived(refs.find(ref => ref.kind === "local" && ref.is_head)?.name ?? null);
   let persistTimer: ReturnType<typeof setTimeout> | undefined;
   const range = $derived(visibleRange(scrollTop, viewportHeight, total));
   const visibleRows = $derived.by(() => {
@@ -74,6 +89,9 @@
   function activateView(tab: RepoTab | undefined) {
     repository = tab?.repository ?? null;
     refs = tab?.refs ?? [];
+    const status = tab ? operationStates.get(tab.path) : undefined;
+    operation = status?.operation ?? null;
+    conflictedFiles = status?.conflictedFiles ?? 0;
     error = null;
     detailError = null;
     selected = tab?.selected ?? null;
@@ -116,6 +134,8 @@
     saveActiveTab();
     ++epoch;
     ++selectionEpoch;
+    pushMenuOpen = false;
+    forceConfirmation = null;
     activePath = tab.path;
     activateView(tab);
     opening = openingTabs.has(tab.tabId);
@@ -164,6 +184,10 @@
       tab.refs = loaded.refs;
       tab.generation = loaded.generation;
       tab.eventGeneration = loaded.generation;
+      operationStates.set(next.path, {
+        operation: loaded.operation,
+        conflictedFiles: loaded.conflicted_files,
+      });
       if (activePath === next.path) activateView(tab);
       if (remember) {
         try {
@@ -226,6 +250,7 @@
     activePath = next.activePath;
     if (tab?.repository) void api.close(tab.repository.repo_id).catch(() => {});
     caches.delete(path);
+    operationStates.delete(path);
     if (!wasActive) {
       schedulePersist();
       return;
@@ -359,6 +384,12 @@
       const result = await api.refs(repoId);
       if (token !== epoch || repository?.repo_id !== repoId) return;
       refs = result.refs;
+      operation = result.operation;
+      conflictedFiles = result.conflicted_files;
+      operationStates.set(repository.path, {
+        operation: result.operation,
+        conflictedFiles: result.conflicted_files,
+      });
       generation = Math.max(event.generation, result.generation);
       const tab = tabs.find(item => item.repository?.repo_id === repoId);
       if (tab) {
@@ -441,6 +472,107 @@
     }
   }
 
+  function repositoryNameFor(repoId: string) {
+    return tabs.find(tab => tab.repository?.repo_id === repoId)?.name ?? repoId;
+  }
+
+  function startJob(event: JobStartedEvent) {
+    requestingRepoIds = requestingRepoIds.filter(repoId => repoId !== event.repo_id);
+    runningJobs.set(event.job_id, event.repo_id);
+    runningRepoIds = [...new Set(runningJobs.values())];
+    snackbarStore.jobStarted(event, repositoryNameFor(event.repo_id));
+  }
+
+  function finishJob(event: JobFinishedEvent) {
+    requestingRepoIds = requestingRepoIds.filter(repoId => repoId !== event.repo_id);
+    runningJobs.delete(event.job_id);
+    runningRepoIds = [...new Set(runningJobs.values())];
+    snackbarStore.jobFinished(event, repositoryNameFor(event.repo_id));
+  }
+
+  function showOperationError(repo: Repository, kind: string, label: string, failure: unknown) {
+    const native = nativeError(failure);
+    const event: JobFinishedEvent = {
+      job_id: `request-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      repo_id: repo.repo_id,
+      kind,
+      label,
+      ok: false,
+      message: native.message,
+      stderr_tail: "",
+    };
+    snackbarStore.failed(event, repo.name);
+  }
+
+  async function confirmForcePush() {
+    if (!repository || !currentBranch) return;
+    const repo = repository;
+    const branch = currentBranch;
+    pushMenuOpen = false;
+    try {
+      const remote = await api.pushRemote(repo.repo_id, branch);
+      if (repository?.repo_id === repo.repo_id && currentBranch === branch) {
+        forceConfirmation = { repoId: repo.repo_id, branch, remote };
+      }
+    } catch (failure) {
+      showOperationError(repo, "force-push", `Force push ${branch}`, failure);
+    }
+  }
+
+  async function executeForcePush() {
+    const confirmation = forceConfirmation;
+    if (!confirmation) return;
+    if (repository?.repo_id !== confirmation.repoId || currentBranch !== confirmation.branch) {
+      forceConfirmation = null;
+      return;
+    }
+    const repo = repository;
+    try {
+      const remote = await api.pushRemote(confirmation.repoId, confirmation.branch);
+      if (remote !== confirmation.remote) {
+        forceConfirmation = null;
+        showOperationError(repo, "force-push", `Force push ${confirmation.branch}`, {
+          code: "push_target_changed",
+          message: "The configured push remote changed; confirm the operation again",
+        });
+        return;
+      }
+      if (repository?.repo_id !== confirmation.repoId || currentBranch !== confirmation.branch) {
+        forceConfirmation = null;
+        return;
+      }
+      forceConfirmation = null;
+      await runOperation("force-push", confirmation);
+    } catch (failure) {
+      forceConfirmation = null;
+      showOperationError(repo, "force-push", `Force push ${confirmation.branch}`, failure);
+    }
+  }
+
+  async function runOperation(
+    kind: "fetch" | "pull" | "push" | "force-push",
+    expected?: { repoId: string; branch: string },
+  ) {
+    if (!repository || activeRepoRunning) return;
+    const repo = repository;
+    if (expected && (repo.repo_id !== expected.repoId || currentBranch !== expected.branch)) return;
+    const branch = expected?.branch ?? currentBranch;
+    const label = kind === "force-push" ? `Force push ${branch ?? ""}` : `${kind[0].toUpperCase()}${kind.slice(1)}${kind === "push" ? ` ${branch ?? ""}` : ""}`;
+    requestingRepoIds = [...new Set([...requestingRepoIds, repo.repo_id])];
+    let enqueued = false;
+    try {
+      if (kind === "fetch") await api.fetch(repo.repo_id);
+      else if (kind === "pull") await api.pull(repo.repo_id);
+      else if (kind === "push" && branch) await api.push(repo.repo_id, branch);
+      else if (kind === "force-push" && branch) await api.forcePush(repo.repo_id, branch);
+      enqueued = true;
+    } catch (failure) {
+      showOperationError(repo, kind, label, failure);
+    } finally {
+      if (!enqueued) requestingRepoIds = requestingRepoIds.filter(repoId => repoId !== repo.repo_id);
+    }
+  }
+
   onMount(() => {
     let unlistenChanged: (() => void) | undefined;
     let unlistenError: (() => void) | undefined;
@@ -449,9 +581,19 @@
     windowVisible = document.visibilityState === "visible";
     const onDocumentVisibility = () => updateWindowVisibility(document.visibilityState === "visible");
     document.addEventListener("visibilitychange", onDocumentVisibility);
+    let unlistenJobStarted: (() => void) | undefined;
+    let unlistenJobFinished: (() => void) | undefined;
     void onRepoChanged(event => { void refreshRepository(event); }).then(unlisten => {
       if (disposed) unlisten();
       else unlistenChanged = unlisten;
+    }).catch(failure => { error = nativeError(failure); });
+    void onJobStarted(startJob).then(unlisten => {
+      if (disposed) unlisten();
+      else unlistenJobStarted = unlisten;
+    }).catch(failure => { error = nativeError(failure); });
+    void onJobFinished(finishJob).then(unlisten => {
+      if (disposed) unlisten();
+      else unlistenJobFinished = unlisten;
     }).catch(failure => { error = nativeError(failure); });
     void onRepoError(reportRepositoryError).then(unlisten => {
       if (disposed) unlisten();
@@ -485,6 +627,8 @@
       unlistenOpenPath?.();
       unlistenVisibility?.();
       document.removeEventListener("visibilitychange", onDocumentVisibility);
+      unlistenJobStarted?.();
+      unlistenJobFinished?.();
       observer.disconnect();
       ++epoch; ++selectionEpoch;
       for (const tab of tabs) {
@@ -500,7 +644,7 @@
 <div class="workspace">
   <header class="topbar">
     <div class="brand"><span class="brand-mark">⑂</span> gitreal<span class="brand-caption">REPOSITORY EXPLORER</span></div>
-    <div class="read-only"><span></span> READ ONLY</div>
+    {#if activeRepoRunning}<div class="job-indicator"><span class="snackbar-spinner"></span> Git operation running</div>{/if}
   </header>
 
   <Tabs
@@ -532,9 +676,17 @@
           {#if !collapsed[group.kind]}
             <VirtualList {items} maxHeight={216}>
               {#snippet children(ref)}
-                <button class="ref-item" class:current={ref.is_head} title={ref.full_name} disabled={!ref.target}
+                <button class="ref-item" class:current={ref.is_head}
+                  title={ref.upstream ? `${ref.full_name} · upstream ${ref.upstream}${ref.upstream_gone ? " (gone)" : ""}` : ref.full_name}
+                  disabled={!ref.target}
                   onclick={() => { if (ref.target) void selectCommit(ref.target); }}>
-                  <span class="ref-line" aria-hidden="true">⑂</span><span class="truncate">{ref.name}</span>{#if ref.is_head}<span class="head-dot" title="HEAD"></span>{/if}
+                  <span class="ref-line" aria-hidden="true">⑂</span><span class="truncate">{ref.name}</span>
+                  {#if ref.kind === "local" && ref.upstream_gone}<span class="upstream-gone">gone</span>{/if}
+                  {#if ref.kind === "local"}
+                    {@const badge = formatAheadBehind(ref.ahead, ref.behind, ref.truncated)}
+                    {#if badge}<span class="upstream-counts" title={ref.truncated ? "Upstream counts truncated at 10,000 commits" : `Upstream ${ref.upstream ?? ""}`}>{badge}</span>{/if}
+                  {/if}
+                  {#if ref.is_head}<span class="head-dot" title="HEAD"></span>{/if}
                 </button>
               {/snippet}
             </VirtualList>
@@ -543,14 +695,43 @@
         </section>
       {/each}
     </nav>
-    <div class="sidebar-bottom"><span class="status-dot"></span> Local. Private. Read-only.<small>Watching Git metadata · No polling</small></div>
+    <div class="sidebar-bottom"><span class="status-dot"></span> Git on disk is source of truth.<small>Watching Git metadata · No polling</small></div>
   </aside>
 
   <main class="history">
     <div class="history-toolbar">
       <div><span class="eyebrow">REPOSITORY HISTORY</span><h2>{repository ? head : "Commit graph"}<span class="snapshot">LIVE</span></h2></div>
-      <span class="commit-count">{initialLoaded ? total.toLocaleString() : "—"} <span>commits</span></span>
+      <div class="history-actions">
+        <span class="commit-count">{initialLoaded ? total.toLocaleString() : "—"} <span>commits</span></span>
+        <div class="operation-toolbar">
+          <button disabled={!repository || activeRepoRunning} onclick={() => runOperation("fetch")}>Fetch</button>
+          <button disabled={!repository || !currentBranch || activeRepoRunning} onclick={() => runOperation("pull")}>Pull</button>
+          <button disabled={!repository || !currentBranch || activeRepoRunning} onclick={() => runOperation("push")}>Push</button>
+          <div class="push-menu">
+            <button class="push-menu-toggle" aria-label="More push options" aria-expanded={pushMenuOpen} disabled={!repository || !currentBranch || activeRepoRunning} onclick={() => { pushMenuOpen = !pushMenuOpen; }}>⌄</button>
+            {#if pushMenuOpen}
+              <div class="push-menu-panel">
+                <button onclick={() => { void confirmForcePush(); }}>Force push with lease…</button>
+              </div>
+            {/if}
+            {#if forceConfirmation}
+              <div class="force-confirm" role="dialog" aria-label="Confirm force push">
+                <p>Force push {forceConfirmation.branch} to {forceConfirmation.remote} with lease?</p>
+                <div><button onclick={() => { forceConfirmation = null; }}>Cancel</button><button class="force-confirm-action" onclick={() => { void executeForcePush(); }}>Force push</button></div>
+              </div>
+            {/if}
+          </div>
+        </div>
+      </div>
     </div>
+    {#snippet operationControlsSlot()}{/snippet}
+    {#if operation}
+      <div class="operation-banner" role="status">
+        <span>{formatOperationBanner(operation, conflictedFiles)}</span>
+        {@render operationControlsSlot()}
+        <a class="vscode-soon" role="link" aria-disabled="true" tabindex="-1" title="coming soon">Open in VSCode</a>
+      </div>
+    {/if}
     {#if error}
       <div class="error-banner" role="alert"><div><strong>{error.code}</strong> {error.message}</div><button onclick={retry}>Retry pages</button>{#if repository}<button onclick={reopenActiveTab}>Reopen</button>{/if}<button aria-label="Dismiss error" onclick={() => { error = null; }}>×</button></div>
     {/if}
@@ -619,4 +800,5 @@
       <div class="details-empty"><span class="details-icon">◇</span><h3>The details matter.</h3><p>Select a commit to explore its author, message, parents, and changed files.</p><span class="keyboard-hint">CLICK A COMMIT TO INSPECT</span></div>
     {/if}
   </aside>
+  <Snackbar />
 </div>

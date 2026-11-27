@@ -4,12 +4,14 @@ A lightweight, always-open Linux desktop git browser: a minimal GitKraken
 alternative built with Tauri 2, Svelte 5, TypeScript, Vite, and gix. Target:
 Pop!_OS 24.04 with COSMIC/Wayland, with low idle RAM and CPU as a priority.
 
-## Read-only MVP
+## Repository explorer and local operations
 
 Open a repository with the native folder picker, browse local branches, remote
 branches and tags, scroll a virtualized commit graph, and select a commit for its
 message, author, date, parents and changed paths. Git reads use gix, not libgit2.
-There are no git mutations, network requests, or polling loops. A metadata-only
+Fetch, fast-forward-only pull, push, and lease-protected force push run through a
+per-repository serialized Git CLI queue. The UI refreshes from confirmed Git
+state after each operation; it never updates optimistically. A metadata-only
 watcher keeps references and history current after external Git activity; it
 never watches the working tree. It watches Git metadata in the resolved worktree
 and common directories, debounces events for 150 ms, and ignores lock and
@@ -79,7 +81,8 @@ cargo test --locked
 ```
 
 Rust integration tests create temporary repositories using the Git CLI; the
-application itself only reads repositories through gix. Graph tests cover
+application reads repositories through gix and uses the CLI only for queued
+Git operations. Graph tests cover
 linear, branched/merged, octopus, multiple-root and criss-cross histories.
 
 ### Layout
@@ -94,8 +97,14 @@ linear, branched/merged, octopus, multiple-root and criss-cross histories.
 - `open_repo(path)` returns `{ repo_id, path, name }`; subsequent commands use
   the opaque handle. `close_repo(repo_id)` releases it when switching repos.
 - `get_refs(repo_id)` returns local/remote/tag/HEAD entries. Annotated tags are
-  peeled; unborn HEAD and non-commit tags have a null target. The response also
-  includes the repository generation.
+  peeled; unborn HEAD and non-commit tags have a null target. Local branches
+  include `upstream` (for example, `origin/main`), `ahead`, and `behind`; absent
+  tracking data is null, a deleted upstream sets `upstream_gone`, and counts
+  stop at 10,000 commits per side with `truncated` set when the bound is hit.
+  The response also includes `operation` (null or merge/rebase/cherry-pick/
+  revert/bisect state), `conflicted_files`, and the repository generation.
+  Merge, cherry-pick, revert, and bisect markers are read from their Git metadata
+  files; rebase state is read from `rebase-merge/` or `rebase-apply/`.
 - `get_graph_page(repo_id, offset, limit)` returns
   `{ rows, total, max_lane, generation }`, with page sizes 1–500. `max_lane` is
   the widest lane index in the snapshot. Each row has commit metadata, labels, a
@@ -105,18 +114,23 @@ linear, branched/merged, octopus, multiple-root and criss-cross histories.
 - `get_commit_detail(repo_id, commit_id)` accepts a full hexadecimal object ID
   in the snapshot, not revision expressions. It returns the message, author,
   Unix date, original parents and changed-path objects.
+- `fetch(repo_id, remote?)`, `pull(repo_id)`, `push(repo_id, branch)`, and
+  `force_push(repo_id, branch)` enqueue an operation and immediately return a
+  job ID. `job-started` and `job-finished` events report progress and results.
+  Pull uses `--ff-only`; force push always uses `--force-with-lease` against the
+  remote-tracking object ID currently known to Gitreal. `get_push_remote`
+  resolves the configured push target for the force-push confirmation.
 - Errors serialize as `{ code, message }`. Blocking git work runs off the
   async runtime. At most 16 repository handles may remain open.
 
 Keep the Rust lockfile: the pinned Tauri release uses matching runtime and macro
 versions, which should be updated together.
 
-Git on disk remains the source of truth. Future mutations will run via the Git
-CLI in a per-repository serialized job queue, then re-read state and emit UI
-events. No optimistic updates; force pushes must use `--force-with-lease`.
+Git on disk remains the source of truth. Queued operations re-read repository
+state after completion and emit `repo-changed` only when the snapshot advances.
+No optimistic updates; force pushes must use `--force-with-lease`.
 
 ## Roadmap
 
 - Tabs and configuration persistence.
-- Branch operations, push/pull/fetch, and snackbar notifications.
 - Merge/rebase via drag and context menu, with a conflict banner.

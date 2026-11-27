@@ -4,9 +4,11 @@
   import Tabs from "./Tabs.svelte";
   import GraphCanvas from "./GraphCanvas.svelte";
   import VirtualList from "./VirtualList.svelte";
-  import { api, desktop, nativeError, onRepoChanged, onRepoError, type CommitDetail, type GraphRow, type KnownRepo, type NativeError, type RefInfo, type Repository } from "./lib/api";
+  import Snackbar from "./Snackbar.svelte";
+  import { api, desktop, nativeError, onJobFinished, onJobStarted, onRepoChanged, onRepoError, type CommitDetail, type GraphRow, type KnownRepo, type NativeError, type RefInfo, type Repository } from "./lib/api";
   import { closeTab, createTab, cycleTabs, MAX_TABS, openTab, restoreTabs, type RepoTab } from "./lib/tabs";
   import { PageCache, PAGE_SIZE, ROW_HEIGHT, pageOffsets, visibleRange } from "./lib/virtual";
+  import { snackbarStore, type JobFinishedEvent, type JobStartedEvent } from "./lib/snackbar";
 
   let tabs = $state<RepoTab[]>([]);
   let activePath = $state<string | null>(null);
@@ -18,6 +20,10 @@
   let collapsed = $state<Record<string, boolean>>({});
   let opening = $state(false);
   let choosing = $state(false);
+  let pushMenuOpen = $state(false);
+  let forceConfirmation = $state<{ repoId: string; branch: string; remote: string } | null>(null);
+  let runningRepoIds = $state<string[]>([]);
+  let requestingRepoIds = $state<string[]>([]);
   let error = $state<NativeError | null>(null);
   let detailError = $state<NativeError | null>(null);
   let selected = $state<string | null>(null);
@@ -43,6 +49,11 @@
   const groups = [{ kind: "local", label: "Local", icon: "⑂" }, { kind: "remote", label: "Remote", icon: "◎" }, { kind: "tag", label: "Tags", icon: "◇" }];
   let initialized = false;
   let disposed = false;
+  const runningJobs = new Map<string, string>();
+  const activeRepoRunning = $derived(!!repository && (
+    runningRepoIds.includes(repository.repo_id) || requestingRepoIds.includes(repository.repo_id)
+  ));
+  const currentBranch = $derived(refs.find(ref => ref.kind === "local" && ref.is_head)?.name ?? null);
   let persistTimer: ReturnType<typeof setTimeout> | undefined;
   const range = $derived(visibleRange(scrollTop, viewportHeight, total));
   const visibleRows = $derived.by(() => {
@@ -115,6 +126,8 @@
     saveActiveTab();
     ++epoch;
     ++selectionEpoch;
+    pushMenuOpen = false;
+    forceConfirmation = null;
     activePath = tab.path;
     activateView(tab);
     opening = openingTabs.has(tab.tabId);
@@ -405,12 +418,123 @@
   }
   function onScroll() { scrollTop = viewport.scrollTop; scrollLeft = viewport.scrollLeft; saveActiveTab(); }
 
+  function repositoryNameFor(repoId: string) {
+    return tabs.find(tab => tab.repository?.repo_id === repoId)?.name ?? repoId;
+  }
+
+  function startJob(event: JobStartedEvent) {
+    requestingRepoIds = requestingRepoIds.filter(repoId => repoId !== event.repo_id);
+    runningJobs.set(event.job_id, event.repo_id);
+    runningRepoIds = [...new Set(runningJobs.values())];
+    snackbarStore.jobStarted(event, repositoryNameFor(event.repo_id));
+  }
+
+  function finishJob(event: JobFinishedEvent) {
+    requestingRepoIds = requestingRepoIds.filter(repoId => repoId !== event.repo_id);
+    runningJobs.delete(event.job_id);
+    runningRepoIds = [...new Set(runningJobs.values())];
+    snackbarStore.jobFinished(event, repositoryNameFor(event.repo_id));
+  }
+
+  function showOperationError(repo: Repository, kind: string, label: string, failure: unknown) {
+    const native = nativeError(failure);
+    const event: JobFinishedEvent = {
+      job_id: `request-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      repo_id: repo.repo_id,
+      kind,
+      label,
+      ok: false,
+      message: native.message,
+      stderr_tail: "",
+    };
+    snackbarStore.failed(event, repo.name);
+  }
+
+  async function confirmForcePush() {
+    if (!repository || !currentBranch) return;
+    const repo = repository;
+    const branch = currentBranch;
+    pushMenuOpen = false;
+    try {
+      const remote = await api.pushRemote(repo.repo_id, branch);
+      if (repository?.repo_id === repo.repo_id && currentBranch === branch) {
+        forceConfirmation = { repoId: repo.repo_id, branch, remote };
+      }
+    } catch (failure) {
+      showOperationError(repo, "force-push", `Force push ${branch}`, failure);
+    }
+  }
+
+  async function executeForcePush() {
+    const confirmation = forceConfirmation;
+    if (!confirmation) return;
+    if (repository?.repo_id !== confirmation.repoId || currentBranch !== confirmation.branch) {
+      forceConfirmation = null;
+      return;
+    }
+    const repo = repository;
+    try {
+      const remote = await api.pushRemote(confirmation.repoId, confirmation.branch);
+      if (remote !== confirmation.remote) {
+        forceConfirmation = null;
+        showOperationError(repo, "force-push", `Force push ${confirmation.branch}`, {
+          code: "push_target_changed",
+          message: "The configured push remote changed; confirm the operation again",
+        });
+        return;
+      }
+      if (repository?.repo_id !== confirmation.repoId || currentBranch !== confirmation.branch) {
+        forceConfirmation = null;
+        return;
+      }
+      forceConfirmation = null;
+      await runOperation("force-push", confirmation);
+    } catch (failure) {
+      forceConfirmation = null;
+      showOperationError(repo, "force-push", `Force push ${confirmation.branch}`, failure);
+    }
+  }
+
+  async function runOperation(
+    kind: "fetch" | "pull" | "push" | "force-push",
+    expected?: { repoId: string; branch: string },
+  ) {
+    if (!repository || activeRepoRunning) return;
+    const repo = repository;
+    if (expected && (repo.repo_id !== expected.repoId || currentBranch !== expected.branch)) return;
+    const branch = expected?.branch ?? currentBranch;
+    const label = kind === "force-push" ? `Force push ${branch ?? ""}` : `${kind[0].toUpperCase()}${kind.slice(1)}${kind === "push" ? ` ${branch ?? ""}` : ""}`;
+    requestingRepoIds = [...new Set([...requestingRepoIds, repo.repo_id])];
+    let enqueued = false;
+    try {
+      if (kind === "fetch") await api.fetch(repo.repo_id);
+      else if (kind === "pull") await api.pull(repo.repo_id);
+      else if (kind === "push" && branch) await api.push(repo.repo_id, branch);
+      else if (kind === "force-push" && branch) await api.forcePush(repo.repo_id, branch);
+      enqueued = true;
+    } catch (failure) {
+      showOperationError(repo, kind, label, failure);
+    } finally {
+      if (!enqueued) requestingRepoIds = requestingRepoIds.filter(repoId => repoId !== repo.repo_id);
+    }
+  }
+
   onMount(() => {
     let unlistenChanged: (() => void) | undefined;
     let unlistenError: (() => void) | undefined;
+    let unlistenJobStarted: (() => void) | undefined;
+    let unlistenJobFinished: (() => void) | undefined;
     void onRepoChanged(event => { void refreshRepository(event); }).then(unlisten => {
       if (disposed) unlisten();
       else unlistenChanged = unlisten;
+    }).catch(failure => { error = nativeError(failure); });
+    void onJobStarted(startJob).then(unlisten => {
+      if (disposed) unlisten();
+      else unlistenJobStarted = unlisten;
+    }).catch(failure => { error = nativeError(failure); });
+    void onJobFinished(finishJob).then(unlisten => {
+      if (disposed) unlisten();
+      else unlistenJobFinished = unlisten;
     }).catch(failure => { error = nativeError(failure); });
     void onRepoError(reportRepositoryError).then(unlisten => {
       if (disposed) unlisten();
@@ -425,6 +549,8 @@
       clearTimeout(persistTimer);
       unlistenChanged?.();
       unlistenError?.();
+      unlistenJobStarted?.();
+      unlistenJobFinished?.();
       observer.disconnect();
       ++epoch; ++selectionEpoch;
       for (const tab of tabs) {
@@ -439,7 +565,7 @@
 <div class="workspace">
   <header class="topbar">
     <div class="brand"><span class="brand-mark">⑂</span> gitreal<span class="brand-caption">REPOSITORY EXPLORER</span></div>
-    <div class="read-only"><span></span> READ ONLY</div>
+    {#if activeRepoRunning}<div class="job-indicator"><span class="snackbar-spinner"></span> Git operation running</div>{/if}
   </header>
 
   <Tabs
@@ -482,13 +608,34 @@
         </section>
       {/each}
     </nav>
-    <div class="sidebar-bottom"><span class="status-dot"></span> Local. Private. Read-only.<small>Watching Git metadata · No polling</small></div>
+    <div class="sidebar-bottom"><span class="status-dot"></span> Git on disk is source of truth.<small>Watching Git metadata · No polling</small></div>
   </aside>
 
   <main class="history">
     <div class="history-toolbar">
       <div><span class="eyebrow">REPOSITORY HISTORY</span><h2>{repository ? head : "Commit graph"}<span class="snapshot">LIVE</span></h2></div>
-      <span class="commit-count">{initialLoaded ? total.toLocaleString() : "—"} <span>commits</span></span>
+      <div class="history-actions">
+        <span class="commit-count">{initialLoaded ? total.toLocaleString() : "—"} <span>commits</span></span>
+        <div class="operation-toolbar">
+          <button disabled={!repository || activeRepoRunning} onclick={() => runOperation("fetch")}>Fetch</button>
+          <button disabled={!repository || !currentBranch || activeRepoRunning} onclick={() => runOperation("pull")}>Pull</button>
+          <button disabled={!repository || !currentBranch || activeRepoRunning} onclick={() => runOperation("push")}>Push</button>
+          <div class="push-menu">
+            <button class="push-menu-toggle" aria-label="More push options" aria-expanded={pushMenuOpen} disabled={!repository || !currentBranch || activeRepoRunning} onclick={() => { pushMenuOpen = !pushMenuOpen; }}>⌄</button>
+            {#if pushMenuOpen}
+              <div class="push-menu-panel">
+                <button onclick={() => { void confirmForcePush(); }}>Force push with lease…</button>
+              </div>
+            {/if}
+            {#if forceConfirmation}
+              <div class="force-confirm" role="dialog" aria-label="Confirm force push">
+                <p>Force push {forceConfirmation.branch} to {forceConfirmation.remote} with lease?</p>
+                <div><button onclick={() => { forceConfirmation = null; }}>Cancel</button><button class="force-confirm-action" onclick={() => { void executeForcePush(); }}>Force push</button></div>
+              </div>
+            {/if}
+          </div>
+        </div>
+      </div>
     </div>
     {#if error}
       <div class="error-banner" role="alert"><div><strong>{error.code}</strong> {error.message}</div><button onclick={retry}>Retry pages</button>{#if repository}<button onclick={reopenActiveTab}>Reopen</button>{/if}<button aria-label="Dismiss error" onclick={() => { error = null; }}>×</button></div>
@@ -558,4 +705,5 @@
       <div class="details-empty"><span class="details-icon">◇</span><h3>The details matter.</h3><p>Select a commit to explore its author, message, parents, and changed files.</p><span class="keyboard-hint">CLICK A COMMIT TO INSPECT</span></div>
     {/if}
   </aside>
+  <Snackbar />
 </div>

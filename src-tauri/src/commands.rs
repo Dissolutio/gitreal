@@ -1,3 +1,4 @@
+use crate::config::{AppConfig, ConfigManager};
 use crate::model::{
     BackendError, CommitDetail, GraphPage, OpenRepo, RefsResponse, RepoChanged, RepoError, Result,
 };
@@ -64,6 +65,34 @@ async fn get_commit_detail(
     blocking(move || backend.get_commit_detail(&repo_id, &commit_id)).await
 }
 
+#[tauri::command]
+async fn get_config(config: State<'_, Arc<ConfigManager>>) -> Result<AppConfig> {
+    let config = Arc::clone(&config);
+    blocking(move || config.get_config()).await
+}
+
+#[tauri::command]
+async fn set_open_tabs(
+    config: State<'_, Arc<ConfigManager>>,
+    paths: Vec<String>,
+    active: Option<String>,
+) -> Result<()> {
+    let config = Arc::clone(&config);
+    blocking(move || config.set_open_tabs(paths, active)).await
+}
+
+#[tauri::command]
+async fn add_known_repo(config: State<'_, Arc<ConfigManager>>, path: String) -> Result<()> {
+    let config = Arc::clone(&config);
+    blocking(move || config.add_known_repo(path)).await
+}
+
+#[tauri::command]
+async fn remove_known_repo(config: State<'_, Arc<ConfigManager>>, path: String) -> Result<()> {
+    let config = Arc::clone(&config);
+    blocking(move || config.remove_known_repo(path)).await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -71,6 +100,7 @@ pub fn run() {
             app.manage(Arc::new(Backend::with_event_sink(Arc::new(
                 TauriEventSink(app.handle().clone()),
             ))));
+            app.manage(Arc::new(ConfigManager::default()));
             Ok(())
         })
         .plugin(tauri_plugin_dialog::init())
@@ -79,7 +109,11 @@ pub fn run() {
             close_repo,
             get_refs,
             get_graph_page,
-            get_commit_detail
+            get_commit_detail,
+            get_config,
+            set_open_tabs,
+            add_known_repo,
+            remove_known_repo
         ])
         .run(tauri::generate_context!())
         .expect("error while running Gitreal");

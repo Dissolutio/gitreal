@@ -2,6 +2,14 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 export interface Repository { repo_id: string; path: string; name: string }
+export interface KnownRepo { path: string; name: string; last_opened: number }
+export interface PersistedTab { path: string }
+export interface AppConfig {
+  version: number;
+  active_tab: string | null;
+  repos: KnownRepo[];
+  tabs: PersistedTab[];
+}
 export interface RefInfo {
   name: string;
   full_name: string;
@@ -68,4 +76,9 @@ export const api = {
     call<GraphPage>("get_graph_page", { repoId, offset, limit }),
   detail: (repoId: string, commitId: string) =>
     call<CommitDetail>("get_commit_detail", { repoId, commitId }),
+  config: () => call<AppConfig>("get_config", {}),
+  setOpenTabs: (paths: string[], active: string | null) =>
+    call<void>("set_open_tabs", { paths, active }),
+  addKnownRepo: (path: string) => call<void>("add_known_repo", { path }),
+  removeKnownRepo: (path: string) => call<void>("remove_known_repo", { path }),
 };

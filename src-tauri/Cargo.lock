@@ -1455,6 +1455,7 @@ name = "gitreal"
 version = "0.1.0"
 dependencies = [
  "gix",
+ "libc",
  "notify",
  "serde",
  "serde_json",

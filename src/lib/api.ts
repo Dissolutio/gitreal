@@ -114,6 +114,29 @@ export const api = {
     call<string>("push", { repoId, branch }),
   forcePush: (repoId: string, branch: string) =>
     call<string>("force_push", { repoId, branch }),
+  checkoutLocal: (repoId: string, branch: string) =>
+    call<string>("checkout_local", { repoId, branch }),
+  checkoutRemote: (repoId: string, remoteBranch: string) =>
+    call<string>("checkout_remote", { repoId, remoteBranch }),
+  resetLocalToRemote: (repoId: string, branch: string, remoteBranch: string, expectedLocalOid: string) =>
+    call<string>("reset_local_to_remote", { repoId, branch, remoteBranch, expectedLocalOid }),
+  checkoutCommit: (repoId: string, oid: string) =>
+    call<string>("checkout_commit", { repoId, oid }),
+  createBranch: (repoId: string, name: string, atOid: string, checkout: boolean) =>
+    call<string>("create_branch", { repoId, name, atOid, checkout }),
+  renameBranch: (repoId: string, old: string, newName: string) =>
+    call<string>("rename_branch", { repoId, old, new: newName }),
+  deleteLocal: (repoId: string, branch: string, force: boolean) =>
+    call<string>("delete_local", { repoId, branch, force }),
+  deleteRemote: (repoId: string, remote: string, branch: string) =>
+    call<string>("delete_remote", { repoId, remote, branch }),
+  deleteLocalAndRemote: (repoId: string, branch: string, remote: string, remoteBranch: string) =>
+    call<string>("delete_local_and_remote", { repoId, branch, remote, remoteBranch }),
+  stashPush: (repoId: string, includeUntracked: boolean, message?: string) =>
+    call<string>("stash_push", { repoId, includeUntracked, message }),
+  stashPop: (repoId: string) => call<string>("stash_pop", { repoId }),
+  stashAndCheckout: (repoId: string, targetKind: string, target: string) =>
+    call<string>("stash_and_checkout", { repoId, targetKind, target }),
   pushRemote: (repoId: string, branch: string) =>
     call<string>("get_push_remote", { repoId, branch }),
   config: () => call<AppConfig>("get_config", {}),

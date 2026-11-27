@@ -142,6 +142,137 @@ async fn get_push_remote(
 }
 
 #[tauri::command]
+async fn checkout_local(
+    backend: State<'_, Arc<Backend>>,
+    repo_id: String,
+    branch: String,
+) -> Result<JobId> {
+    let backend = Arc::clone(&backend);
+    blocking(move || backend.checkout_local(&repo_id, &branch)).await
+}
+
+#[tauri::command]
+async fn checkout_remote(
+    backend: State<'_, Arc<Backend>>,
+    repo_id: String,
+    remote_branch: String,
+) -> Result<JobId> {
+    let backend = Arc::clone(&backend);
+    blocking(move || backend.checkout_remote(&repo_id, &remote_branch)).await
+}
+
+#[tauri::command]
+async fn reset_local_to_remote(
+    backend: State<'_, Arc<Backend>>,
+    repo_id: String,
+    branch: String,
+    remote_branch: String,
+    expected_local_oid: String,
+) -> Result<JobId> {
+    let backend = Arc::clone(&backend);
+    blocking(move || {
+        backend.reset_local_to_remote(&repo_id, &branch, &remote_branch, &expected_local_oid)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn checkout_commit(
+    backend: State<'_, Arc<Backend>>,
+    repo_id: String,
+    oid: String,
+) -> Result<JobId> {
+    let backend = Arc::clone(&backend);
+    blocking(move || backend.checkout_commit(&repo_id, &oid)).await
+}
+
+#[tauri::command]
+async fn create_branch(
+    backend: State<'_, Arc<Backend>>,
+    repo_id: String,
+    name: String,
+    at_oid: String,
+    checkout: bool,
+) -> Result<JobId> {
+    let backend = Arc::clone(&backend);
+    blocking(move || backend.create_branch(&repo_id, &name, &at_oid, checkout)).await
+}
+
+#[tauri::command]
+async fn rename_branch(
+    backend: State<'_, Arc<Backend>>,
+    repo_id: String,
+    old: String,
+    new: String,
+) -> Result<JobId> {
+    let backend = Arc::clone(&backend);
+    blocking(move || backend.rename_branch(&repo_id, &old, &new)).await
+}
+
+#[tauri::command]
+async fn delete_local(
+    backend: State<'_, Arc<Backend>>,
+    repo_id: String,
+    branch: String,
+    force: bool,
+) -> Result<JobId> {
+    let backend = Arc::clone(&backend);
+    blocking(move || backend.delete_local(&repo_id, &branch, force)).await
+}
+
+#[tauri::command]
+async fn delete_remote(
+    backend: State<'_, Arc<Backend>>,
+    repo_id: String,
+    remote: String,
+    branch: String,
+) -> Result<JobId> {
+    let backend = Arc::clone(&backend);
+    blocking(move || backend.delete_remote(&repo_id, &remote, &branch)).await
+}
+
+#[tauri::command]
+async fn delete_local_and_remote(
+    backend: State<'_, Arc<Backend>>,
+    repo_id: String,
+    branch: String,
+    remote: String,
+    remote_branch: String,
+) -> Result<JobId> {
+    let backend = Arc::clone(&backend);
+    blocking(move || backend.delete_local_and_remote(&repo_id, &branch, &remote, &remote_branch))
+        .await
+}
+
+#[tauri::command]
+async fn stash_push(
+    backend: State<'_, Arc<Backend>>,
+    repo_id: String,
+    include_untracked: bool,
+    message: Option<String>,
+) -> Result<JobId> {
+    let backend = Arc::clone(&backend);
+    blocking(move || backend.stash_push(&repo_id, include_untracked, message.as_deref())).await
+}
+
+#[tauri::command]
+async fn stash_pop(backend: State<'_, Arc<Backend>>, repo_id: String) -> Result<JobId> {
+    let backend = Arc::clone(&backend);
+    blocking(move || backend.stash_pop(&repo_id)).await
+}
+
+#[tauri::command]
+async fn stash_and_checkout(
+    backend: State<'_, Arc<Backend>>,
+    repo_id: String,
+    target_kind: String,
+    target: String,
+) -> Result<JobId> {
+    let backend = Arc::clone(&backend);
+    blocking(move || backend.stash_and_checkout(&repo_id, &target_kind, &target)).await
+}
+
+#[tauri::command]
 async fn get_config(config: State<'_, Arc<ConfigManager>>) -> Result<AppConfig> {
     let config = Arc::clone(&config);
     blocking(move || config.get_config()).await
@@ -483,6 +614,18 @@ pub fn run() {
             push,
             force_push,
             get_push_remote,
+            checkout_local,
+            checkout_remote,
+            reset_local_to_remote,
+            checkout_commit,
+            create_branch,
+            rename_branch,
+            delete_local,
+            delete_remote,
+            delete_local_and_remote,
+            stash_push,
+            stash_pop,
+            stash_and_checkout,
             get_config,
             frontend_ready,
             set_open_tabs,

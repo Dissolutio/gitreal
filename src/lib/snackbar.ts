@@ -9,6 +9,13 @@ export interface JobFinishedEvent extends JobStartedEvent {
   ok: boolean;
   message: string;
   stderr_tail: string;
+  action?: JobAction | null;
+}
+
+export interface JobAction {
+  kind: string;
+  label: string;
+  payload: Record<string, unknown> | null;
 }
 
 export interface SnackbarEntry extends JobStartedEvent {
@@ -17,6 +24,7 @@ export interface SnackbarEntry extends JobStartedEvent {
   message: string;
   stderr_tail: string;
   details_open: boolean;
+  action?: JobAction | null;
 }
 
 export function createSnackbarStore() {
@@ -83,6 +91,7 @@ export function createSnackbarStore() {
         ok: event.ok,
         message: event.message,
         stderr_tail: event.stderr_tail,
+        action: event.action,
         details_open: previous?.details_open ?? false,
       }, !previous);
       if (event.ok && entries.some(entry => entry.job_id === event.job_id)) {

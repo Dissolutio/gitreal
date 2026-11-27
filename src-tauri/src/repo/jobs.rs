@@ -1,4 +1,4 @@
-use crate::model::{JobFinished, JobId, JobStarted};
+use crate::model::{JobAction, JobFinished, JobId, JobStarted};
 use crate::repo::reader::EventSink;
 use std::{
     ffi::OsString,
@@ -22,9 +22,20 @@ pub struct JobSpec {
     pub label: String,
     pub cwd: PathBuf,
     pub args: Vec<String>,
+    pub additional_steps: Vec<Vec<String>>,
+    pub rollback_steps: Vec<Vec<String>>,
+    pub step_labels: Vec<String>,
+    pub preconditions: Vec<JobPrecondition>,
+    pub action_on_failure: Option<JobAction>,
     pub success_message: String,
     pub timeout: Duration,
     program: OsString,
+}
+
+pub enum JobPrecondition {
+    BranchOid { branch: String, expected: String },
+    CurrentBranch { branch: String },
+    WorkingTreeClean,
 }
 
 impl JobSpec {
@@ -40,6 +51,11 @@ impl JobSpec {
             label: label.into(),
             cwd,
             args,
+            additional_steps: Vec::new(),
+            rollback_steps: Vec::new(),
+            step_labels: Vec::new(),
+            preconditions: Vec::new(),
+            action_on_failure: None,
             success_message: success_message.into(),
             timeout: JOB_TIMEOUT,
             program: OsString::from("git"),
@@ -84,6 +100,7 @@ impl JobQueue {
                             ok: false,
                             message: "Job cancelled because the repository was closed".into(),
                             stderr_tail: String::new(),
+                            action: None,
                         });
                         continue;
                     }
@@ -96,20 +113,36 @@ impl JobQueue {
                     });
                     let result = run_git(&spec);
                     after_job();
-                    let (ok, message, stderr_tail) = match result {
+                    let (ok, message, stderr_tail, action) = match result {
                         Ok(output) if output.success => {
                             let _captured_output = (&output.stdout, output.exit_code);
-                            (true, spec.success_message, output.stderr_tail)
+                            (true, spec.success_message, output.stderr_tail, None)
                         }
                         Ok(output) => {
                             let _captured_output = (&output.stdout, output.exit_code);
-                            (
-                                false,
-                                friendly_failure(&spec, &output.stderr, output.timed_out),
-                                output.stderr_tail,
-                            )
+                            let step = spec
+                                .step_labels
+                                .get(output.failed_step)
+                                .cloned()
+                                .unwrap_or_else(|| spec.label.clone());
+                            let message = friendly_failure(&spec, &output.stderr, output.timed_out);
+                            let message = if spec.step_labels.len() > 1 {
+                                format!("{step} failed: {message}")
+                            } else {
+                                message
+                            };
+                            let action = spec.action_on_failure.clone().filter(|action| {
+                                (action.kind == "stash_and_retry"
+                                    && is_local_changes_failure(&output.stderr))
+                                    || (action.kind == "force_delete"
+                                        && output
+                                            .stderr
+                                            .to_ascii_lowercase()
+                                            .contains("not fully merged"))
+                            });
+                            (false, message, output.stderr_tail, action)
                         }
-                        Err(error) => (false, error, String::new()),
+                        Err(error) => (false, error, String::new(), None),
                     };
                     event_sink.job_finished(JobFinished {
                         job_id: id,
@@ -119,6 +152,7 @@ impl JobQueue {
                         ok,
                         message,
                         stderr_tail,
+                        action,
                     });
                 }
             })
@@ -154,13 +188,133 @@ struct GitOutput {
     stderr: String,
     stderr_tail: String,
     timed_out: bool,
+    failed_step: usize,
 }
 
 fn run_git(spec: &JobSpec) -> Result<GitOutput, String> {
-    let mut command = Command::new(&spec.program);
+    for precondition in &spec.preconditions {
+        let (args, expected) = match precondition {
+            JobPrecondition::BranchOid { branch, expected } => (
+                vec!["rev-parse".into(), format!("refs/heads/{branch}")],
+                Some(expected.clone()),
+            ),
+            JobPrecondition::CurrentBranch { branch } => (
+                vec!["symbolic-ref".into(), "--quiet".into(), "HEAD".into()],
+                Some(format!("refs/heads/{branch}")),
+            ),
+            JobPrecondition::WorkingTreeClean => (
+                vec!["status".into(), "--porcelain".into()],
+                Some(String::new()),
+            ),
+        };
+        let result = run_git_args(&spec.program, &spec.cwd, &args, spec.timeout)?;
+        let actual = if matches!(precondition, JobPrecondition::WorkingTreeClean) {
+            result.stdout.trim_end()
+        } else {
+            result.stdout.trim()
+        };
+        if !result.success || expected.as_deref() != Some(actual) {
+            return Ok(GitOutput {
+                success: false,
+                exit_code: result.exit_code,
+                stderr: match precondition {
+                    JobPrecondition::BranchOid { .. } => {
+                        "Local branch changed since the operation was requested".into()
+                    }
+                    JobPrecondition::CurrentBranch { .. } => {
+                        "The checked-out branch changed since the operation was requested".into()
+                    }
+                    JobPrecondition::WorkingTreeClean => "The working tree is not clean".into(),
+                },
+                stderr_tail: String::new(),
+                stdout: String::new(),
+                timed_out: false,
+                failed_step: 0,
+            });
+        }
+    }
+
+    let mut steps = Vec::with_capacity(spec.additional_steps.len() + 1);
+    steps.push(spec.args.clone());
+    steps.extend(spec.additional_steps.iter().cloned());
+    let mut last_output = None;
+    for (index, args) in steps.iter().enumerate() {
+        let output = run_git_args(&spec.program, &spec.cwd, args, spec.timeout)?;
+        if !output.success {
+            let mut output = output;
+            if index > 0 {
+                for rollback_args in &spec.rollback_steps {
+                    match run_git_args(&spec.program, &spec.cwd, rollback_args, spec.timeout) {
+                        Ok(rollback) if rollback.success => {}
+                        Ok(rollback) => {
+                            let detail = rollback
+                                .stderr
+                                .lines()
+                                .rev()
+                                .find(|line| !line.trim().is_empty())
+                                .unwrap_or("unknown error");
+                            output.stderr.push_str(&format!(
+                                "\nRollback failed; the remote branch may still be deleted: {detail}"
+                            ));
+                            output.stderr_tail = output
+                                .stderr
+                                .lines()
+                                .rev()
+                                .take(20)
+                                .collect::<Vec<_>>()
+                                .into_iter()
+                                .rev()
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            break;
+                        }
+                        Err(error) => {
+                            output.stderr.push_str(&format!(
+                                "\nRollback failed; the remote branch may still be deleted: {error}"
+                            ));
+                            output.stderr_tail = output
+                                .stderr
+                                .lines()
+                                .rev()
+                                .take(20)
+                                .collect::<Vec<_>>()
+                                .into_iter()
+                                .rev()
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            break;
+                        }
+                    }
+                }
+            }
+            return Ok(GitOutput {
+                failed_step: index,
+                ..output
+            });
+        }
+        last_output = Some(output);
+    }
+    Ok(last_output.unwrap_or(GitOutput {
+        success: true,
+        exit_code: Some(0),
+        stdout: String::new(),
+        stderr: String::new(),
+        stderr_tail: String::new(),
+        timed_out: false,
+        failed_step: 0,
+    }))
+}
+
+fn run_git_args(
+    program: &OsString,
+    cwd: &PathBuf,
+    args: &[String],
+    timeout: Duration,
+) -> Result<GitOutput, String> {
+    let mut command = Command::new(program);
     command
-        .args(&spec.args)
-        .current_dir(&spec.cwd)
+        .args(args)
+        .current_dir(cwd)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env_remove("GIT_ASKPASS")
         .stdin(Stdio::null())
@@ -198,7 +352,7 @@ fn run_git(spec: &JobSpec) -> Result<GitOutput, String> {
     });
     drop(output_sender);
 
-    let deadline = Instant::now() + spec.timeout;
+    let deadline = Instant::now() + timeout;
     let mut timed_out = false;
     let status = loop {
         match child.try_wait() {
@@ -270,7 +424,13 @@ fn run_git(spec: &JobSpec) -> Result<GitOutput, String> {
         stderr,
         stderr_tail,
         timed_out,
+        failed_step: 0,
     })
+}
+
+fn is_local_changes_failure(stderr: &str) -> bool {
+    let text = stderr.to_ascii_lowercase();
+    text.contains("local changes") || text.contains("would be overwritten")
 }
 
 fn terminate_child(child: &mut std::process::Child) {
@@ -293,7 +453,13 @@ fn friendly_failure(spec: &JobSpec, stderr: &str, timed_out: bool) -> String {
         return "Git operation timed out".into();
     }
     let text = stderr.to_ascii_lowercase();
-    if text.contains("authentication failed")
+    if matches!(
+        spec.kind.as_str(),
+        "checkout" | "checkout-remote" | "checkout-commit"
+    ) && is_local_changes_failure(stderr)
+    {
+        "Checkout blocked by local changes; stash them to continue".into()
+    } else if text.contains("authentication failed")
         || text.contains("could not read username")
         || text.contains("permission denied (publickey)")
         || text.contains("invalid username or password")
@@ -325,6 +491,13 @@ fn friendly_failure(spec: &JobSpec, stderr: &str, timed_out: bool) -> String {
         || text.contains("connection refused")
     {
         "Network unreachable; check your connection and remote".into()
+    } else if spec
+        .preconditions
+        .iter()
+        .any(|condition| matches!(condition, JobPrecondition::WorkingTreeClean))
+        && text.contains("working tree is not clean")
+    {
+        "Reset refused: the working tree is not clean".into()
     } else {
         stderr
             .lines()

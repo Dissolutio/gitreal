@@ -41,7 +41,7 @@ describe("branchMenuItems", () => {
       hasLocalCounterpart: true,
     });
     expect(items.map(item => item.id)).toEqual([
-      "checkout", "create-branch", "delete-remote", "reset-remote", "copy",
+      "checkout", "create-branch", "delete-remote", "delete-both", "reset-remote", "copy",
     ]);
     expect(items.filter(item => item.id !== "copy").every(item => item.disabled)).toBe(true);
   });

@@ -42,6 +42,7 @@ export function branchMenuItems(state: BranchMenuState): MenuItem[] {
   } else if (ref.kind === "remote") {
     items.push(item("delete-remote", "Delete remote branch…", running, true));
     if (state.hasLocalCounterpart) {
+      items.push(item("delete-both", "Delete local and remote…", running, true));
       items.push(item("reset-remote", "Reset local to remote…", running, true));
     }
   }

@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Gitreal
+Exec=gitreal
+Icon=gitreal
+Categories=Development;
+Terminal=false

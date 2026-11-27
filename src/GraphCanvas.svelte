@@ -3,9 +3,9 @@
   import type { GraphRow } from "./lib/api";
   import { ROW_HEIGHT } from "./lib/virtual";
 
-  let { rows, start, scrollTop, height, selected, width = 168, laneWidth = 168 }: {
+  let { rows, start, scrollTop, height, selected, width = 168, laneWidth = 168, visible = true }: {
     rows: (GraphRow | undefined)[]; start: number; scrollTop: number;
-    height: number; selected: string | null; width?: number; laneWidth?: number;
+    height: number; selected: string | null; width?: number; laneWidth?: number; visible?: boolean;
   } = $props();
   let canvas: HTMLCanvasElement;
   let dpr = $state(1);
@@ -24,7 +24,7 @@
   });
 
   $effect(() => {
-    if (!canvas) return;
+    if (!canvas || !visible) return;
     canvas.width = Math.round(width * dpr);
     canvas.height = Math.round(height * dpr);
     const context = canvas.getContext("2d");

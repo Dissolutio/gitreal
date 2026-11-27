@@ -4,7 +4,7 @@
   import Tabs from "./Tabs.svelte";
   import GraphCanvas from "./GraphCanvas.svelte";
   import VirtualList from "./VirtualList.svelte";
-  import { api, desktop, nativeError, onRepoChanged, onRepoError, type CommitDetail, type GraphRow, type KnownRepo, type NativeError, type RefInfo, type Repository } from "./lib/api";
+  import { api, desktop, nativeError, onOpenPath, onRepoChanged, onRepoError, onWindowVisibility, type CommitDetail, type GraphRow, type KnownRepo, type NativeError, type RefInfo, type Repository } from "./lib/api";
   import { closeTab, createTab, cycleTabs, MAX_TABS, openTab, restoreTabs, type RepoTab } from "./lib/tabs";
   import { PageCache, PAGE_SIZE, ROW_HEIGHT, pageOffsets, visibleRange } from "./lib/virtual";
 
@@ -29,6 +29,7 @@
   let scrollTop = $state(0);
   let scrollLeft = $state(0);
   let viewportHeight = $state(600);
+  let windowVisible = $state(true);
   let viewport: HTMLDivElement;
   let revision = $state(0);
   let generation = 0;
@@ -301,7 +302,7 @@
 
   $effect(() => {
     void revision;
-    if (!repository) return;
+    if (!windowVisible || !repository) return;
     const offsets = initialLoaded ? pageOffsets(range.start, range.end) : [0];
     for (const offset of offsets) {
       if (pending.size >= 3) break;
@@ -330,6 +331,13 @@
 
   async function refreshRepository(event: { repo_id: string; generation: number }) {
     const owner = tabs.find(tab => tab.repository?.repo_id === event.repo_id);
+    if (!windowVisible) {
+      if (owner) {
+        owner.staleGeneration = Math.max(owner.staleGeneration, event.generation);
+        caches.delete(owner.path);
+      }
+      return;
+    }
     if (owner && owner.repository?.repo_id !== repository?.repo_id) {
       // No work for inactive tabs: drop their cached pages and refresh on focus.
       owner.staleGeneration = Math.max(owner.staleGeneration, event.generation);
@@ -405,9 +413,38 @@
   }
   function onScroll() { scrollTop = viewport.scrollTop; scrollLeft = viewport.scrollLeft; saveActiveTab(); }
 
+  function updateWindowVisibility(visible: boolean) {
+    const wasVisible = windowVisible;
+    windowVisible = visible;
+    if (wasVisible && !visible) {
+      ++epoch;
+      ++selectionEpoch;
+      pending.clear();
+      detailLoading = false;
+    }
+    if (!wasVisible && visible && activeTab?.repository && activeTab.staleGeneration > eventGeneration) {
+      void refreshRepository({
+        repo_id: activeTab.repository.repo_id,
+        generation: activeTab.staleGeneration,
+      });
+    }
+  }
+
+  function handleShortcut(event: KeyboardEvent) {
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "q") {
+      event.preventDefault();
+      void api.quit().catch(failure => { error = nativeError(failure); });
+    }
+  }
+
   onMount(() => {
     let unlistenChanged: (() => void) | undefined;
     let unlistenError: (() => void) | undefined;
+    let unlistenOpenPath: (() => void) | undefined;
+    let unlistenVisibility: (() => void) | undefined;
+    windowVisible = document.visibilityState === "visible";
+    const onDocumentVisibility = () => updateWindowVisibility(document.visibilityState === "visible");
+    document.addEventListener("visibilitychange", onDocumentVisibility);
     void onRepoChanged(event => { void refreshRepository(event); }).then(unlisten => {
       if (disposed) unlisten();
       else unlistenChanged = unlisten;
@@ -415,6 +452,22 @@
     void onRepoError(reportRepositoryError).then(unlisten => {
       if (disposed) unlisten();
       else unlistenError = unlisten;
+    }).catch(failure => { error = nativeError(failure); });
+    void Promise.all([
+      onOpenPath(path => { void openTabPath(path, true); }),
+      onWindowVisibility(updateWindowVisibility),
+    ]).then(async ([unlistenOpen, unlistenWindow]) => {
+      if (disposed) {
+        unlistenOpen();
+        unlistenWindow();
+        return;
+      }
+      unlistenOpenPath = unlistenOpen;
+      unlistenVisibility = unlistenWindow;
+      if (desktop) {
+        await api.frontendReady();
+        updateWindowVisibility(await api.windowVisible());
+      }
     }).catch(failure => { error = nativeError(failure); });
     const observer = new ResizeObserver(() => { viewportHeight = viewport.clientHeight; });
     observer.observe(viewport);
@@ -425,6 +478,9 @@
       clearTimeout(persistTimer);
       unlistenChanged?.();
       unlistenError?.();
+      unlistenOpenPath?.();
+      unlistenVisibility?.();
+      document.removeEventListener("visibilitychange", onDocumentVisibility);
       observer.disconnect();
       ++epoch; ++selectionEpoch;
       for (const tab of tabs) {
@@ -434,6 +490,7 @@
   });
 </script>
 
+<svelte:window onkeydown={handleShortcut} />
 <svelte:head><title>{repository ? `${repository.name} · Gitreal` : "Gitreal — Repository explorer"}</title></svelte:head>
 
 <div class="workspace">
@@ -521,7 +578,7 @@
           {/each}
         </div>
         <div class="canvas-position" style:left="156px" style:top="{scrollTop}px">
-          <GraphCanvas rows={visibleRows} start={range.start} {scrollTop} height={viewportHeight} {selected} width={graphWidth} laneWidth={maxLaneWidth} />
+          <GraphCanvas rows={visibleRows} start={range.start} {scrollTop} height={viewportHeight} {selected} width={graphWidth} laneWidth={maxLaneWidth} visible={windowVisible} />
         </div>
         {#if !initialLoaded}<div class="loading-history">Loading repository history…</div>{/if}
       {/if}

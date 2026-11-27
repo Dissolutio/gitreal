@@ -39,8 +39,8 @@ pub fn parse_argv(argv: &[String]) -> Result<CliAction> {
     parse_args(args)
 }
 
-pub fn discover_worktree(path: Option<&Path>, cwd: &Path) -> Result<PathBuf> {
-    let requested = path.map_or_else(
+pub fn resolve_path(path: Option<&Path>, cwd: &Path) -> PathBuf {
+    path.map_or_else(
         || cwd.to_path_buf(),
         |path| {
             if path.is_absolute() {
@@ -49,7 +49,11 @@ pub fn discover_worktree(path: Option<&Path>, cwd: &Path) -> Result<PathBuf> {
                 cwd.join(path)
             }
         },
-    );
+    )
+}
+
+pub fn discover_worktree(path: Option<&Path>, cwd: &Path) -> Result<PathBuf> {
+    let requested = resolve_path(path, cwd);
     let repository = gix::discover(&requested).map_err(|_| {
         BackendError::new(
             "not_repository",
@@ -107,14 +111,7 @@ mod tests {
         let CliAction::Open(Some(path)) = action else {
             panic!("expected an open request");
         };
-        assert_eq!(
-            if path.is_absolute() {
-                path
-            } else {
-                cwd.join(path)
-            },
-            cwd.join("nested/repo")
-        );
+        assert_eq!(resolve_path(Some(&path), &cwd), cwd.join("nested/repo"));
     }
 
     #[test]

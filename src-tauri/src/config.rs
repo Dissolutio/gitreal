@@ -369,6 +369,12 @@ mod tests {
     }
 
     #[test]
+    fn older_config_defaults_start_at_login_to_false() {
+        let config: AppConfig = toml::from_str("version = 1\nrepos = []\ntabs = []").unwrap();
+        assert!(!config.start_at_login);
+    }
+
+    #[test]
     fn corrupt_config_is_backed_up_and_defaults_are_returned() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.toml");
@@ -415,10 +421,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let xdg = directory.path().join("xdg");
         let home = directory.path().join("home");
-        assert_eq!(
-            autostart_path_from(Some(&xdg), Some(&home)).unwrap(),
-            xdg.join("autostart/gitreal.desktop")
-        );
+        let autostart = autostart_path_from(Some(&xdg), Some(&home)).unwrap();
+        assert_eq!(autostart, xdg.join("autostart/gitreal.desktop"));
+        set_autostart_file(&autostart, true).unwrap();
+        assert!(autostart.is_file());
         assert_eq!(
             autostart_path_from(None, Some(&home)).unwrap(),
             home.join(".config/autostart/gitreal.desktop")

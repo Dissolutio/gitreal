@@ -32,9 +32,9 @@ export function branchMenuItems(state: BranchMenuState): MenuItem[] {
   if (ref.kind === "local") {
     items.push(item("rename", "Rename…", running));
     items.push(item(ref.is_head ? "pull" : "push", ref.is_head ? "Pull" : "Push", running));
-    items.push(item("delete-local", "Delete local branch…", running, true));
+    items.push(item("delete-local", "Delete local branch…", running || ref.is_head, true));
     if (state.hasRemoteCounterpart) {
-      items.push(item("delete-both", "Delete local and remote…", running, true));
+      items.push(item("delete-both", "Delete local and remote…", running || ref.is_head, true));
     }
     if (state.hasRemoteCounterpart) {
       items.push(item("reset-remote", "Reset local to remote…", running, true));

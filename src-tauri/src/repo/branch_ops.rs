@@ -5,6 +5,7 @@ use crate::{
         remote_ops::validate_name,
     },
 };
+use gix::config::AsBStr;
 use std::path::PathBuf;
 
 pub fn checkout_local(path: PathBuf, branch: &str) -> Result<JobSpec> {
@@ -29,12 +30,13 @@ pub fn checkout_remote(path: PathBuf, remote_branch: &str) -> Result<JobSpec> {
         .is_some();
     let tracks_target = {
         let config = repo.config_snapshot();
+        let expected_merge = format!("refs/heads/{branch}");
         config
             .string(&format!("branch.{branch}.remote"))
-            .is_some_and(|value| value.to_string() == remote)
+            .is_some_and(|value| value.as_bstr() == remote)
             && config
                 .string(&format!("branch.{branch}.merge"))
-                .is_some_and(|value| value.to_string() == format!("refs/heads/{branch}"))
+                .is_some_and(|value| value.as_bstr() == expected_merge.as_str())
     };
     let (args, message) = if !local_exists {
         (

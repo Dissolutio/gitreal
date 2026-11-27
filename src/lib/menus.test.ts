@@ -31,6 +31,7 @@ describe("branchMenuItems", () => {
       "reset-remote", "copy",
     ]);
     expect(items[0].disabled).toBe(true);
+    expect(items.find(item => item.id === "delete-local")?.disabled).toBe(true);
   });
 
   it("offers remote branch actions and disables mutations while a job runs", () => {

@@ -50,15 +50,24 @@
     if (menu && !menu.contains(event.target as Node)) onClose();
   }
 
+  $effect(() => {
+    position();
+  });
+
   onMount(() => {
     position();
     buttons.find(button => button && !button.disabled)?.focus();
+    const closeOnScroll = () => onClose();
     window.addEventListener("resize", position);
-    return () => window.removeEventListener("resize", position);
+    document.addEventListener("scroll", closeOnScroll, true);
+    return () => {
+      window.removeEventListener("resize", position);
+      document.removeEventListener("scroll", closeOnScroll, true);
+    };
   });
 </script>
 
-<svelte:window onkeydown={handleKeydown} onpointerdown={handlePointerDown} onscroll={onClose} onblur={onClose} />
+<svelte:window onkeydown={handleKeydown} onpointerdown={handlePointerDown} onblur={onClose} />
 
 <div bind:this={menu} class="context-menu" role="menu" style:left="{left}px" style:top="{top}px">
   {#each items as item, index (item.id)}

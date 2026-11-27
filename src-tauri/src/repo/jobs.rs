@@ -1,0 +1,517 @@
+use crate::model::{JobFinished, JobId, JobStarted};
+use crate::repo::reader::EventSink;
+use std::{
+    ffi::OsString,
+    io::Read,
+    path::PathBuf,
+    process::{Command, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc,
+    },
+    thread,
+    time::{Duration, Instant},
+};
+
+pub const JOB_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(1);
+
+pub struct JobSpec {
+    pub kind: String,
+    pub label: String,
+    pub cwd: PathBuf,
+    pub args: Vec<String>,
+    pub success_message: String,
+    pub timeout: Duration,
+    program: OsString,
+}
+
+impl JobSpec {
+    pub fn new(
+        kind: impl Into<String>,
+        label: impl Into<String>,
+        cwd: PathBuf,
+        args: Vec<String>,
+        success_message: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: kind.into(),
+            label: label.into(),
+            cwd,
+            args,
+            success_message: success_message.into(),
+            timeout: JOB_TIMEOUT,
+            program: OsString::from("git"),
+        }
+    }
+}
+
+enum QueueMessage {
+    Run {
+        id: JobId,
+        spec: JobSpec,
+        after_job: Box<dyn FnOnce() + Send>,
+    },
+}
+
+pub struct JobQueue {
+    sender: mpsc::Sender<QueueMessage>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl JobQueue {
+    pub fn new(repo_id: String, event_sink: Arc<dyn EventSink>) -> Self {
+        let (sender, receiver) = mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let worker_repo_id = repo_id.clone();
+        thread::Builder::new()
+            .name(format!("git-jobs-{repo_id}"))
+            .spawn(move || {
+                while let Ok(QueueMessage::Run {
+                    id,
+                    spec,
+                    after_job,
+                }) = receiver.recv()
+                {
+                    if worker_cancelled.load(Ordering::Acquire) {
+                        event_sink.job_finished(JobFinished {
+                            job_id: id,
+                            repo_id: worker_repo_id.clone(),
+                            kind: spec.kind,
+                            label: spec.label,
+                            ok: false,
+                            message: "Job cancelled because the repository was closed".into(),
+                            stderr_tail: String::new(),
+                        });
+                        continue;
+                    }
+
+                    event_sink.job_started(JobStarted {
+                        job_id: id.clone(),
+                        repo_id: worker_repo_id.clone(),
+                        kind: spec.kind.clone(),
+                        label: spec.label.clone(),
+                    });
+                    let result = run_git(&spec);
+                    after_job();
+                    let (ok, message, stderr_tail) = match result {
+                        Ok(output) if output.success => {
+                            let _captured_output = (&output.stdout, output.exit_code);
+                            (true, spec.success_message, output.stderr_tail)
+                        }
+                        Ok(output) => {
+                            let _captured_output = (&output.stdout, output.exit_code);
+                            (
+                                false,
+                                friendly_failure(&spec, &output.stderr, output.timed_out),
+                                output.stderr_tail,
+                            )
+                        }
+                        Err(error) => (false, error, String::new()),
+                    };
+                    event_sink.job_finished(JobFinished {
+                        job_id: id,
+                        repo_id: worker_repo_id.clone(),
+                        kind: spec.kind,
+                        label: spec.label,
+                        ok,
+                        message,
+                        stderr_tail,
+                    });
+                }
+            })
+            .expect("failed to start Git job worker");
+        Self { sender, cancelled }
+    }
+
+    pub fn enqueue(
+        &self,
+        spec: JobSpec,
+        after_job: impl FnOnce() + Send + 'static,
+    ) -> std::io::Result<JobId> {
+        let id = format!("job-{}", NEXT_JOB_ID.fetch_add(1, Ordering::Relaxed));
+        self.sender
+            .send(QueueMessage::Run {
+                id: id.clone(),
+                spec,
+                after_job: Box::new(after_job),
+            })
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        Ok(id)
+    }
+
+    pub fn cancel_queued(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+}
+
+struct GitOutput {
+    success: bool,
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+    stderr_tail: String,
+    timed_out: bool,
+}
+
+fn run_git(spec: &JobSpec) -> Result<GitOutput, String> {
+    let mut command = Command::new(&spec.program);
+    command
+        .args(&spec.args)
+        .current_dir(&spec.cwd)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env_remove("GIT_ASKPASS")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("Could not start Git: {error}"))?;
+
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Could not capture Git output".to_owned())?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "Could not capture Git errors".to_owned())?;
+    let (output_sender, output_receiver) = mpsc::channel();
+    let stdout_sender = output_sender.clone();
+    let stdout_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout.read_to_end(&mut bytes);
+        let _ = stdout_sender.send((true, bytes));
+    });
+    let stderr_sender = output_sender.clone();
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stderr.read_to_end(&mut bytes);
+        let _ = stderr_sender.send((false, bytes));
+    });
+    drop(output_sender);
+
+    let deadline = Instant::now() + spec.timeout;
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
+            Ok(None) => {
+                timed_out = true;
+                terminate_child(&mut child);
+                break child
+                    .wait()
+                    .map_err(|error| format!("Could not stop Git: {error}"))?;
+            }
+            Err(error) => {
+                terminate_child(&mut child);
+                return Err(format!("Could not wait for Git: {error}"));
+            }
+        }
+    };
+
+    let mut captured_stdout = None;
+    let mut captured_stderr = None;
+    let output_deadline = if timed_out {
+        Instant::now() + Duration::from_millis(250)
+    } else {
+        deadline
+    };
+    while captured_stdout.is_none() || captured_stderr.is_none() {
+        let remaining = output_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            timed_out = true;
+            terminate_child(&mut child);
+            break;
+        }
+        match output_receiver.recv_timeout(remaining) {
+            Ok((true, output)) => captured_stdout = Some(output),
+            Ok((false, output)) => captured_stderr = Some(output),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                timed_out = true;
+                terminate_child(&mut child);
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    if captured_stdout.is_some() && captured_stderr.is_some() {
+        stdout_reader
+            .join()
+            .map_err(|_| "Git output reader stopped unexpectedly".to_owned())?;
+        stderr_reader
+            .join()
+            .map_err(|_| "Git error reader stopped unexpectedly".to_owned())?;
+    }
+    let captured_stdout = captured_stdout.unwrap_or_default();
+    let stderr = captured_stderr.unwrap_or_default();
+    let stderr = String::from_utf8_lossy(&stderr).into_owned();
+    let stderr_tail = stderr
+        .lines()
+        .rev()
+        .take(20)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(GitOutput {
+        success: status.success() && !timed_out,
+        exit_code: status.code(),
+        stdout: String::from_utf8_lossy(&captured_stdout).into_owned(),
+        stderr,
+        stderr_tail,
+        timed_out,
+    })
+}
+
+fn terminate_child(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let process_group = format!("-{}", child.id());
+        let _ = Command::new("kill")
+            .args(["-KILL", "--", &process_group])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn friendly_failure(spec: &JobSpec, stderr: &str, timed_out: bool) -> String {
+    if timed_out {
+        return "Git operation timed out".into();
+    }
+    let text = stderr.to_ascii_lowercase();
+    if text.contains("authentication failed")
+        || text.contains("could not read username")
+        || text.contains("permission denied (publickey)")
+        || text.contains("invalid username or password")
+    {
+        "Authentication failed; check your Git credentials".into()
+    } else if spec.kind == "pull"
+        && (text.contains("not possible to fast-forward")
+            || text.contains("divergent branches")
+            || text.contains("have diverged"))
+    {
+        "Branch has diverged from upstream; merge or rebase instead".into()
+    } else if spec.kind == "force-push"
+        && (text.contains("stale info") || text.contains("force-with-lease"))
+    {
+        "Force push rejected: remote changed since Gitreal last read it".into()
+    } else if text.contains("non-fast-forward")
+        || text.contains("[rejected]")
+        || text.contains("fetch first")
+    {
+        "Push rejected: remote has new commits".into()
+    } else if text.contains("no upstream")
+        || text.contains("no tracking information")
+        || text.contains("has no upstream branch")
+    {
+        "No upstream configured for this branch".into()
+    } else if text.contains("network is unreachable")
+        || text.contains("could not resolve host")
+        || text.contains("failed to connect")
+        || text.contains("connection refused")
+    {
+        "Network unreachable; check your connection and remote".into()
+    } else {
+        stderr
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("Git operation failed")
+            .trim()
+            .to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{JobFinished, JobStarted, RepoChanged, RepoError};
+    use std::sync::mpsc::{self, Receiver};
+
+    enum RecordedJobEvent {
+        Started(JobStarted),
+        Finished(JobFinished),
+    }
+
+    struct Recorder(mpsc::Sender<RecordedJobEvent>);
+
+    impl EventSink for Recorder {
+        fn repo_changed(&self, _: RepoChanged) {}
+        fn repo_error(&self, _: RepoError) {}
+        fn job_started(&self, event: JobStarted) {
+            let _ = self.0.send(RecordedJobEvent::Started(event));
+        }
+        fn job_finished(&self, event: JobFinished) {
+            let _ = self.0.send(RecordedJobEvent::Finished(event));
+        }
+    }
+
+    fn sink() -> (Arc<dyn EventSink>, Receiver<RecordedJobEvent>) {
+        let (sender, receiver) = mpsc::channel();
+        (Arc::new(Recorder(sender)), receiver)
+    }
+
+    fn slow_spec(delay: &str) -> JobSpec {
+        let mut spec = JobSpec::new(
+            "test",
+            "Test job",
+            std::env::current_dir().unwrap(),
+            vec!["-c".into(), format!("exec sleep {delay}")],
+            "Done",
+        );
+        spec.program = OsString::from("sh");
+        spec.timeout = Duration::from_secs(3);
+        spec
+    }
+
+    fn receive_finished(receiver: &Receiver<RecordedJobEvent>) -> JobFinished {
+        loop {
+            match receiver.recv_timeout(Duration::from_secs(5)).unwrap() {
+                RecordedJobEvent::Finished(event) => return event,
+                RecordedJobEvent::Started(_) => {}
+            }
+        }
+    }
+
+    #[test]
+    fn failure_messages_are_friendly_for_common_git_errors() {
+        let spec = JobSpec::new("pull", "Pull main", PathBuf::new(), vec![], "Pulled main");
+        assert_eq!(
+            friendly_failure(
+                &spec,
+                "fatal: Not possible to fast-forward, aborting.",
+                false
+            ),
+            "Branch has diverged from upstream; merge or rebase instead"
+        );
+        assert_eq!(
+            friendly_failure(&spec, "fatal: Authentication failed", false),
+            "Authentication failed; check your Git credentials"
+        );
+    }
+
+    #[test]
+    fn timeout_failure_is_reported() {
+        let spec = JobSpec::new("fetch", "Fetch", PathBuf::new(), vec![], "Fetched");
+        assert_eq!(friendly_failure(&spec, "", true), "Git operation timed out");
+    }
+
+    #[test]
+    fn jobs_for_one_repository_run_in_order() {
+        let (sink, receiver) = sink();
+        let queue = JobQueue::new("one".into(), sink);
+        let ids = (0..3)
+            .map(|_| queue.enqueue(slow_spec("0.05"), || {}).unwrap())
+            .collect::<Vec<_>>();
+        let mut observed = Vec::new();
+        while observed.len() < 6 {
+            match receiver.recv_timeout(Duration::from_secs(5)).unwrap() {
+                RecordedJobEvent::Started(event) => observed.push(("start", event.job_id)),
+                RecordedJobEvent::Finished(event) => observed.push(("finish", event.job_id)),
+            }
+        }
+        assert_eq!(
+            observed,
+            ids.into_iter()
+                .flat_map(|id| [("start", id.clone()), ("finish", id)])
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn different_repository_workers_overlap() {
+        let (sink, receiver) = sink();
+        let first = JobQueue::new("one".into(), Arc::clone(&sink));
+        let second = JobQueue::new("two".into(), sink);
+        first.enqueue(slow_spec("0.3"), || {}).unwrap();
+        loop {
+            if let RecordedJobEvent::Started(event) =
+                receiver.recv_timeout(Duration::from_secs(2)).unwrap()
+                && event.repo_id == "one"
+            {
+                break;
+            }
+        }
+        second.enqueue(slow_spec("0.3"), || {}).unwrap();
+        let mut second_started = false;
+        while !second_started {
+            match receiver.recv_timeout(Duration::from_secs(2)).unwrap() {
+                RecordedJobEvent::Started(event) if event.repo_id == "two" => {
+                    second_started = true;
+                }
+                RecordedJobEvent::Finished(event) if event.repo_id == "one" => {
+                    panic!("first repository job finished before the second started");
+                }
+                _ => {}
+            }
+        }
+        assert!(second_started);
+    }
+
+    #[test]
+    fn timeout_kills_and_reaps_the_child() {
+        let (sink, receiver) = sink();
+        let queue = JobQueue::new("timeout".into(), sink);
+        let mut spec = slow_spec("10");
+        spec.timeout = Duration::from_millis(100);
+        queue.enqueue(spec, || {}).unwrap();
+        let finished = receive_finished(&receiver);
+        assert!(!finished.ok);
+        assert_eq!(finished.message, "Git operation timed out");
+    }
+
+    #[test]
+    fn timeout_also_terminates_transport_children_holding_output_pipes() {
+        let (sink, receiver) = sink();
+        let queue = JobQueue::new("timeout-tree".into(), sink);
+        let mut spec = slow_spec("10");
+        spec.args = vec!["-c".into(), "sleep 10 & wait".into()];
+        spec.timeout = Duration::from_millis(100);
+        let started = Instant::now();
+        queue.enqueue(spec, || {}).unwrap();
+        let finished = receive_finished(&receiver);
+        assert!(!finished.ok);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn closing_a_queue_cancels_waiting_jobs_but_finishes_the_running_job() {
+        let (sink, receiver) = sink();
+        let queue = JobQueue::new("closing".into(), sink);
+        let running = queue.enqueue(slow_spec("0.2"), || {}).unwrap();
+        loop {
+            if let RecordedJobEvent::Started(event) =
+                receiver.recv_timeout(Duration::from_secs(2)).unwrap()
+                && event.job_id == running
+            {
+                break;
+            }
+        }
+        let queued = queue.enqueue(slow_spec("0.2"), || {}).unwrap();
+        queue.cancel_queued();
+        let first = receive_finished(&receiver);
+        let second = receive_finished(&receiver);
+        assert_eq!(first.job_id, running);
+        assert!(first.ok);
+        assert_eq!(second.job_id, queued);
+        assert!(!second.ok);
+        assert_eq!(
+            second.message,
+            "Job cancelled because the repository was closed"
+        );
+    }
+}

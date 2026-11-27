@@ -22,6 +22,7 @@ impl BackendError {
 }
 
 pub type Result<T> = std::result::Result<T, BackendError>;
+pub type JobId = String;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct OpenRepo {
@@ -82,6 +83,25 @@ pub struct RepoChanged {
 pub struct RepoError {
     pub repo_id: String,
     pub message: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct JobStarted {
+    pub job_id: JobId,
+    pub repo_id: String,
+    pub kind: String,
+    pub label: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct JobFinished {
+    pub job_id: JobId,
+    pub repo_id: String,
+    pub kind: String,
+    pub label: String,
+    pub ok: bool,
+    pub message: String,
+    pub stderr_tail: String,
 }
 
 #[derive(Debug, Serialize)]

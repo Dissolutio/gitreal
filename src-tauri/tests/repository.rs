@@ -1,5 +1,5 @@
 use gitreal_lib::{
-    model::{RefsResponse, RepoChanged, RepoError},
+    model::{JobFinished, JobStarted, RefsResponse, RepoChanged, RepoError},
     repo::reader::{Backend, EventSink},
 };
 use std::{
@@ -29,6 +29,10 @@ impl EventSink for EventRecorder {
     fn repo_error(&self, event: RepoError) {
         let _ = self.0.send(RecordedEvent::Error(event));
     }
+
+    fn job_started(&self, _: JobStarted) {}
+
+    fn job_finished(&self, _: JobFinished) {}
 }
 
 struct Fixture {

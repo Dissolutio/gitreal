@@ -783,9 +783,9 @@
         const expectedHead = refs.find(ref => ref.is_head && ref.target)?.target;
         if (!expectedHead) return;
         if (mode === "hard" && !window.confirm(
-          `Hard reset ${currentBranch ?? "HEAD"} to ${target.oid.slice(0, 7)}? Uncommitted changes will be lost.`,
+          `Hard reset ${currentBranch ? safeRefLabel(currentBranch) : "HEAD"} to ${target.oid.slice(0, 7)}? Uncommitted changes will be lost.`,
         )) return;
-        await enqueueCustom(`reset-${mode}`, `Reset ${currentBranch ?? "HEAD"} to ${target.oid.slice(0, 7)} (${mode})`, repoId =>
+        await enqueueCustom(`reset-${mode}`, `Reset ${currentBranch ? safeRefLabel(currentBranch) : "HEAD"} to ${target.oid.slice(0, 7)} (${mode})`, repoId =>
           api.resetCurrent(repoId, target.oid, mode, expectedHead),
         );
       } else if (id === "copy-commit") {

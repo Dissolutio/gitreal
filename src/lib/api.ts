@@ -1,4 +1,5 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 export interface Repository { repo_id: string; path: string; name: string }
 export interface KnownRepo { path: string; name: string; last_opened: number }
@@ -16,6 +17,9 @@ export interface RefInfo {
   target: string | null;
   is_head: boolean;
 }
+export interface RefsResponse { refs: RefInfo[]; generation: number }
+export interface RepoChangedEvent { repo_id: string; generation: number }
+export interface RepoErrorEvent { repo_id: string; message: string }
 export interface GraphEdge { from_lane: number; to_lane: number; parent_id: string }
 export interface GraphRow {
   commit_id: string;
@@ -27,7 +31,7 @@ export interface GraphRow {
   date: number;
   parents: string[];
 }
-export interface GraphPage { rows: GraphRow[]; total: number }
+export interface GraphPage { rows: GraphRow[]; total: number; max_lane: number; generation: number }
 export interface ChangedPath {
   path: string;
   status: "added" | "modified" | "deleted" | "renamed";
@@ -58,10 +62,16 @@ async function call<T>(command: string, args: Record<string, unknown>): Promise<
 }
 
 export const desktop = isTauri();
+export function onRepoChanged(handler: (event: RepoChangedEvent) => void): Promise<UnlistenFn> {
+  return desktop ? listen<RepoChangedEvent>("repo-changed", event => handler(event.payload)) : Promise.resolve(() => {});
+}
+export function onRepoError(handler: (event: RepoErrorEvent) => void): Promise<UnlistenFn> {
+  return desktop ? listen<RepoErrorEvent>("repo-error", event => handler(event.payload)) : Promise.resolve(() => {});
+}
 export const api = {
   open: (path: string) => call<Repository>("open_repo", { path }),
   close: (repoId: string) => call<null>("close_repo", { repoId }),
-  refs: (repoId: string) => call<RefInfo[]>("get_refs", { repoId }),
+  refs: (repoId: string) => call<RefsResponse>("get_refs", { repoId }),
   page: (repoId: string, offset: number, limit: number) =>
     call<GraphPage>("get_graph_page", { repoId, offset, limit }),
   detail: (repoId: string, commitId: string) =>

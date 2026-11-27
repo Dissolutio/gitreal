@@ -1,4 +1,5 @@
 use serde::Serialize;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize, thiserror::Error)]
 #[error("{message}")]
@@ -29,7 +30,7 @@ pub struct OpenRepo {
     pub name: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct RefInfo {
     pub name: String,
     pub full_name: String,
@@ -42,7 +43,7 @@ pub struct RefInfo {
 pub struct GraphEdge {
     pub from_lane: usize,
     pub to_lane: usize,
-    pub parent_id: String,
+    pub parent_id: Arc<str>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -61,6 +62,26 @@ pub struct GraphRow {
 pub struct GraphPage {
     pub rows: Vec<GraphRow>,
     pub total: usize,
+    pub max_lane: usize,
+    pub generation: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RefsResponse {
+    pub refs: Vec<RefInfo>,
+    pub generation: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RepoChanged {
+    pub repo_id: String,
+    pub generation: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RepoError {
+    pub repo_id: String,
+    pub message: String,
 }
 
 #[derive(Debug, Serialize)]

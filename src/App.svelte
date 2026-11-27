@@ -4,7 +4,7 @@
   import Tabs from "./Tabs.svelte";
   import GraphCanvas from "./GraphCanvas.svelte";
   import VirtualList from "./VirtualList.svelte";
-  import { api, desktop, nativeError, type CommitDetail, type GraphRow, type KnownRepo, type NativeError, type RefInfo, type Repository } from "./lib/api";
+  import { api, desktop, nativeError, onRepoChanged, onRepoError, type CommitDetail, type GraphRow, type KnownRepo, type NativeError, type RefInfo, type Repository } from "./lib/api";
   import { closeTab, createTab, cycleTabs, MAX_TABS, openTab, restoreTabs, type RepoTab } from "./lib/tabs";
   import { PageCache, PAGE_SIZE, ROW_HEIGHT, pageOffsets, visibleRange } from "./lib/virtual";
 
@@ -24,12 +24,15 @@
   let detail = $state<CommitDetail | null>(null);
   let detailLoading = $state(false);
   let total = $state(0);
+  let maxLane = $state(0);
   let initialLoaded = $state(false);
   let scrollTop = $state(0);
   let scrollLeft = $state(0);
   let viewportHeight = $state(600);
   let viewport: HTMLDivElement;
   let revision = $state(0);
+  let generation = 0;
+  let eventGeneration = 0;
   let epoch = 0;
   let selectionEpoch = 0;
   let cache = new PageCache<GraphRow>();
@@ -46,9 +49,7 @@
     void revision;
     return Array.from({ length: range.end - range.start }, (_, i) => cache.row(range.start + i));
   });
-  const maxLaneWidth = $derived(Math.max(168, ...visibleRows.flatMap(row => row ? [
-    32 + row.lane * 15, ...row.parent_edges.map(edge => 32 + Math.max(edge.from_lane, edge.to_lane) * 15),
-  ] : [])));
+  const maxLaneWidth = $derived(Math.max(168, 32 + maxLane * 15));
   const graphWidth = $derived(Math.min(360, maxLaneWidth));
   const filtered = $derived(refs.filter(ref => ref.name.toLowerCase().includes(filter.toLowerCase())));
   const head = $derived(refs.find(ref => ref.kind === "local" && ref.is_head)?.name ?? refs.find(ref => ref.is_head)?.name ?? "Detached HEAD");
@@ -61,6 +62,9 @@
     tab.detail = detail;
     tab.total = total;
     tab.initialLoaded = initialLoaded;
+    tab.maxLane = maxLane;
+    tab.generation = generation;
+    tab.eventGeneration = eventGeneration;
     tab.scrollTop = scrollTop;
     tab.scrollLeft = scrollLeft;
     if (cache.size) caches.set(tab.path, cache);
@@ -76,6 +80,9 @@
     detailLoading = false;
     total = tab?.total ?? 0;
     initialLoaded = tab?.initialLoaded ?? false;
+    maxLane = tab?.maxLane ?? 0;
+    generation = tab?.generation ?? 0;
+    eventGeneration = tab?.eventGeneration ?? 0;
     scrollTop = tab?.scrollTop ?? 0;
     scrollLeft = tab?.scrollLeft ?? 0;
     cache = tab ? caches.get(tab.path) ?? new PageCache<GraphRow>() : new PageCache<GraphRow>();
@@ -86,6 +93,10 @@
     if (viewport) {
       viewport.scrollTop = scrollTop;
       viewport.scrollLeft = scrollLeft;
+    }
+    // An inactive tab only records that its repository changed; catch up now.
+    if (tab?.repository && tab.staleGeneration > eventGeneration) {
+      void refreshRepository({ repo_id: tab.repository.repo_id, generation: tab.staleGeneration });
     }
   }
 
@@ -142,14 +153,16 @@
       tab.repository = next;
       tab.error = null;
       if (activePath === oldPath) activePath = next.path;
-      const loadedRefs = await api.refs(next.repo_id);
+      const loaded = await api.refs(next.repo_id);
       if (disposed || !tabs.some(item => item.tabId === tab.tabId)) {
         void api.close(next.repo_id).catch(() => {});
         opened = null;
         return;
       }
       opened = null;
-      tab.refs = loadedRefs;
+      tab.refs = loaded.refs;
+      tab.generation = loaded.generation;
+      tab.eventGeneration = loaded.generation;
       if (activePath === next.path) activateView(tab);
       if (remember) {
         try {
@@ -270,8 +283,11 @@
     try {
       const page = await api.page(repoId, offset, PAGE_SIZE);
       if (token !== epoch) return;
+      if (page.generation < generation) return;
+      generation = page.generation;
       cache.set(offset, page.rows);
       total = page.total;
+      maxLane = page.max_lane;
       initialLoaded = true;
       saveActiveTab();
     } catch (failure) {
@@ -312,6 +328,75 @@
     }
   }
 
+  async function refreshRepository(event: { repo_id: string; generation: number }) {
+    const owner = tabs.find(tab => tab.repository?.repo_id === event.repo_id);
+    if (owner && owner.repository?.repo_id !== repository?.repo_id) {
+      // No work for inactive tabs: drop their cached pages and refresh on focus.
+      owner.staleGeneration = Math.max(owner.staleGeneration, event.generation);
+      caches.delete(owner.path);
+      return;
+    }
+    if (!repository || event.repo_id !== repository.repo_id || event.generation <= eventGeneration) return;
+    const repoId = repository.repo_id;
+    eventGeneration = event.generation;
+    const token = ++epoch;
+    const selectedAtRefresh = selected;
+    const selectionToken = selectionEpoch;
+    cache.clear(); pending.clear(); failed.clear(); revision++;
+    error = null;
+    detail = null;
+    detailError = null;
+    detailLoading = !!selectedAtRefresh;
+    try {
+      const result = await api.refs(repoId);
+      if (token !== epoch || repository?.repo_id !== repoId) return;
+      refs = result.refs;
+      generation = Math.max(event.generation, result.generation);
+      const tab = tabs.find(item => item.repository?.repo_id === repoId);
+      if (tab) {
+        tab.refs = result.refs;
+        tab.staleGeneration = 0;
+      }
+      saveActiveTab();
+      opening = false;
+      if (selectedAtRefresh && selectionToken === selectionEpoch) {
+        try {
+          const nextDetail = await api.detail(repoId, selectedAtRefresh);
+          if (token !== epoch || selectionToken !== selectionEpoch) return;
+          detail = nextDetail;
+          detailError = null;
+          detailLoading = false;
+        } catch (failure) {
+          if (token !== epoch || selectionToken !== selectionEpoch) return;
+          const nextError = nativeError(failure);
+          if (nextError.code === "unknown_commit") {
+            selected = null;
+            detail = null;
+            detailError = null;
+          } else {
+            detail = null;
+            detailError = nextError;
+          }
+          detailLoading = false;
+        }
+      }
+    } catch (failure) {
+      if (token === epoch) {
+        error = nativeError(failure);
+        opening = false;
+        detailLoading = false;
+      }
+    } finally {
+      if (token === epoch) revision++;
+    }
+  }
+
+  function reportRepositoryError(event: { repo_id: string; message: string }) {
+    if (repository?.repo_id === event.repo_id) {
+      error = { code: "repo_error", message: event.message };
+    }
+  }
+
   function retry() { error = null; failed.clear(); revision++; }
   function reopenActiveTab() {
     if (!activeTab) return;
@@ -321,6 +406,16 @@
   function onScroll() { scrollTop = viewport.scrollTop; scrollLeft = viewport.scrollLeft; saveActiveTab(); }
 
   onMount(() => {
+    let unlistenChanged: (() => void) | undefined;
+    let unlistenError: (() => void) | undefined;
+    void onRepoChanged(event => { void refreshRepository(event); }).then(unlisten => {
+      if (disposed) unlisten();
+      else unlistenChanged = unlisten;
+    }).catch(failure => { error = nativeError(failure); });
+    void onRepoError(reportRepositoryError).then(unlisten => {
+      if (disposed) unlisten();
+      else unlistenError = unlisten;
+    }).catch(failure => { error = nativeError(failure); });
     const observer = new ResizeObserver(() => { viewportHeight = viewport.clientHeight; });
     observer.observe(viewport);
     viewportHeight = viewport.clientHeight;
@@ -328,6 +423,8 @@
     return () => {
       disposed = true;
       clearTimeout(persistTimer);
+      unlistenChanged?.();
+      unlistenError?.();
       observer.disconnect();
       ++epoch; ++selectionEpoch;
       for (const tab of tabs) {
@@ -385,12 +482,12 @@
         </section>
       {/each}
     </nav>
-    <div class="sidebar-bottom"><span class="status-dot"></span> Local. Private. Read-only.<small>No background refresh · Reopen to update</small></div>
+    <div class="sidebar-bottom"><span class="status-dot"></span> Local. Private. Read-only.<small>Watching Git metadata · No polling</small></div>
   </aside>
 
   <main class="history">
     <div class="history-toolbar">
-      <div><span class="eyebrow">REPOSITORY HISTORY</span><h2>{repository ? head : "Commit graph"}<span class="snapshot">SNAPSHOT</span></h2></div>
+      <div><span class="eyebrow">REPOSITORY HISTORY</span><h2>{repository ? head : "Commit graph"}<span class="snapshot">LIVE</span></h2></div>
       <span class="commit-count">{initialLoaded ? total.toLocaleString() : "—"} <span>commits</span></span>
     </div>
     {#if error}
@@ -429,7 +526,7 @@
         {#if !initialLoaded}<div class="loading-history">Loading repository history…</div>{/if}
       {/if}
     </div>
-    <footer class="history-footer"><span><span class="status-dot"></span>{repository ? "Repository snapshot" : "Ready when you are"}</span><span>{total ? `${(Math.floor(scrollTop / ROW_HEIGHT) + 1).toLocaleString()}–${Math.min(total, Math.ceil((scrollTop + viewportHeight) / ROW_HEIGHT)).toLocaleString()} of ${total.toLocaleString()}` : "No repository loaded"}</span></footer>
+    <footer class="history-footer"><span><span class="status-dot"></span>{repository ? "Live repository history" : "Ready when you are"}</span><span>{total ? `${(Math.floor(scrollTop / ROW_HEIGHT) + 1).toLocaleString()}–${Math.min(total, Math.ceil((scrollTop + viewportHeight) / ROW_HEIGHT)).toLocaleString()} of ${total.toLocaleString()}` : "No repository loaded"}</span></footer>
   </main>
 
   <aside class="details" aria-label="Commit details" aria-busy={detailLoading}>

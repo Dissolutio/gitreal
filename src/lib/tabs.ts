@@ -16,6 +16,13 @@ export interface RepoTab {
   detail: CommitDetail | null;
   total: number;
   initialLoaded: boolean;
+  maxLane: number;
+  /** Repository generation the tab's cached pages and refs belong to. */
+  generation: number;
+  /** Newest `repo-changed` generation the tab has applied. */
+  eventGeneration: number;
+  /** Newest generation seen while the tab was inactive; 0 when up to date. */
+  staleGeneration: number;
 }
 
 export interface TabsState {
@@ -37,6 +44,10 @@ export function createTab(path: string, name = repositoryName(path)): RepoTab {
     detail: null,
     total: 0,
     initialLoaded: false,
+    maxLane: 0,
+    generation: 0,
+    eventGeneration: 0,
+    staleGeneration: 0,
   };
 }
 

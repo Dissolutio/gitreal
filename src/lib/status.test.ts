@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatAheadBehind, formatOperationBanner } from "./status";
+import { formatAheadBehind, formatOperationBanner, operationBannerActions } from "./status";
 
 describe("branch status formatting", () => {
   it("omits zero ahead and behind counts", () => {
@@ -8,6 +8,33 @@ describe("branch status formatting", () => {
     expect(formatAheadBehind(0, 0)).toBe("");
     expect(formatAheadBehind(null, null)).toBe("");
     expect(formatAheadBehind(10_000, 0, true)).toBe("↑10000…");
+  });
+
+  describe("operation banner controls", () => {
+    const operation = {
+      kind: "rebase" as const,
+      head_name: "topic",
+      onto: "main",
+      step: null,
+      total_steps: null,
+    };
+
+    it("disables Continue while conflicts remain and allows other controls when idle", () => {
+      expect(operationBannerActions(operation, 2, false)).toEqual({
+        continueDisabled: true,
+        skipVisible: true,
+        otherActionsDisabled: false,
+      });
+    });
+
+    it("shows Skip only for rebase and cherry-pick and disables controls while a job runs", () => {
+      expect(operationBannerActions({ ...operation, kind: "merge" }, 0, true)).toEqual({
+        continueDisabled: true,
+        skipVisible: false,
+        otherActionsDisabled: true,
+      });
+      expect(operationBannerActions({ ...operation, kind: "cherry-pick" }, 0, false).skipVisible).toBe(true);
+    });
   });
 
   it("formats a rebase with progress and conflicts", () => {

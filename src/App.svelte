@@ -6,15 +6,16 @@
   import VirtualList from "./VirtualList.svelte";
   import Snackbar from "./Snackbar.svelte";
   import ContextMenu from "./ContextMenu.svelte";
-  import { api, desktop, nativeError, onJobFinished, onJobStarted, onOpenPath, onRepoChanged, onRepoError, onWindowVisibility, type CommitDetail, type GraphRow, type KnownRepo, type NativeError, type OperationInfo, type RefInfo, type Repository } from "./lib/api";
+  import { api, desktop, nativeError, onJobFinished, onJobStarted, onOpenPath, onRepoChanged, onRepoError, onWindowVisibility, type CommitDetail, type GraphRow, type KnownRepo, type NativeError, type OperationInfo, type RefInfo, type Repository, type StashInfo } from "./lib/api";
   import { closeTab, createTab, cycleTabs, MAX_TABS, openTab, restoreTabs, type RepoTab } from "./lib/tabs";
   import { PageCache, PAGE_SIZE, ROW_HEIGHT, pageOffsets, visibleRange } from "./lib/virtual";
-  import { formatAheadBehind, formatOperationBanner } from "./lib/status";
+  import { formatAheadBehind, formatOperationBanner, operationBannerActions } from "./lib/status";
   import { snackbarStore, type JobAction, type JobFinishedEvent, type JobStartedEvent, type SnackbarEntry } from "./lib/snackbar";
-  import { branchMenuItems, commitMenuItems, mergeCommitRefLabels, refIcon, type MenuItem } from "./lib/menus";
+  import { branchMenuItems, commitMenuItems, mergeCommitRefLabels, refIcon, stashMenuItems, type MenuItem } from "./lib/menus";
   import { validateBranchName } from "./lib/refnames";
+  import { formatRelativeDate, indexStashes, placeVisibleStashes } from "./lib/stashes";
 
-  type MenuTarget = { kind: "ref"; ref: RefInfo } | { kind: "commit"; oid: string };
+  type MenuTarget = { kind: "ref"; ref: RefInfo } | { kind: "commit"; oid: string } | { kind: "stash"; stash: StashInfo };
   type PromptState = { kind: "create" | "rename"; x: number; y: number; ref?: RefInfo; oid: string; name: string; checkout: boolean; message: string };
 
   let tabs = $state<RepoTab[]>([]);
@@ -23,6 +24,7 @@
   let activeTab = $derived(tabs.find(tab => tab.path === activePath) ?? null);
   let repository = $state<Repository | null>(null);
   let refs = $state<RefInfo[]>([]);
+  let stashes = $state<StashInfo[]>([]);
   let operation = $state<OperationInfo | null>(null);
   let conflictedFiles = $state(0);
   let filter = $state("");
@@ -69,10 +71,18 @@
   const activeRepoRunning = $derived(!!repository && (
     runningRepoIds.includes(repository.repo_id) || requestingRepoIds.includes(repository.repo_id)
   ));
+  const activeRepoMutationsDisabled = $derived(activeRepoRunning || operation !== null);
   const currentBranch = $derived(refs.find(ref => ref.kind === "local" && ref.is_head)?.name ?? null);
   const contextItems = $derived.by(() => {
     if (!contextMenu) return [];
-    if (contextMenu.target.kind === "commit") return commitMenuItems(activeRepoRunning);
+    if (contextMenu.target.kind === "stash") return stashMenuItems(activeRepoRunning, operation !== null);
+    if (contextMenu.target.kind === "commit") {
+      return commitMenuItems({
+        running: activeRepoRunning,
+        currentBranch,
+        operationInProgress: operation !== null,
+      });
+    }
     const ref = contextMenu.target.ref;
     const counterpart = ref.kind === "local"
       ? refs.some(candidate => candidate.kind === "remote" && candidate.name.endsWith(`/${ref.name}`))
@@ -82,10 +92,15 @@
     return branchMenuItems({
       ref,
       running: activeRepoRunning,
+      currentBranch,
+      operationInProgress: operation !== null,
       hasLocalCounterpart: ref.kind === "remote" && counterpart,
       hasRemoteCounterpart: ref.kind === "local" && counterpart,
     });
   });
+  const bannerActions = $derived(operation
+    ? operationBannerActions(operation, conflictedFiles, activeRepoRunning)
+    : null);
   let persistTimer: ReturnType<typeof setTimeout> | undefined;
   const range = $derived(visibleRange(scrollTop, viewportHeight, total));
   const visibleRows = $derived.by(() => {
@@ -93,7 +108,20 @@
     return Array.from({ length: range.end - range.start }, (_, i) => cache.row(range.start + i));
   });
   const maxLaneWidth = $derived(Math.max(168, 32 + maxLane * 15));
-  const graphWidth = $derived(Math.min(360, maxLaneWidth));
+  const graphLaneWidth = $derived(Math.min(360, maxLaneWidth));
+  const stashIndex = $derived(indexStashes(stashes));
+  const maxStashStack = $derived(
+    Array.from(stashIndex.values()).reduce((maximum, group) => Math.max(maximum, group.length), 0),
+  );
+  const graphWidth = $derived(graphLaneWidth + (maxStashStack ? 18 + maxStashStack * 14 : 0));
+  const stashPlacements = $derived(placeVisibleStashes(
+    stashIndex,
+    visibleRows,
+    range.start,
+    scrollTop,
+    viewportHeight,
+    graphLaneWidth + 10,
+  ));
   const filtered = $derived(refs.filter(ref => ref.name.toLowerCase().includes(filter.toLowerCase())));
   const head = $derived(refs.find(ref => ref.kind === "local" && ref.is_head)?.name ?? refs.find(ref => ref.is_head)?.name ?? "Detached HEAD");
   const date = (timestamp: number) => new Date(timestamp * 1000).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
@@ -103,6 +131,7 @@
     if (!tab) return;
     tab.selected = selected;
     tab.detail = detail;
+    tab.stashes = stashes;
     tab.total = total;
     tab.initialLoaded = initialLoaded;
     tab.maxLane = maxLane;
@@ -113,9 +142,14 @@
     if (cache.size) caches.set(tab.path, cache);
   }
 
+  function showStashContextMenu(event: MouseEvent, stash: StashInfo) {
+    showContextMenu(event, { kind: "stash", stash });
+  }
+
   function activateView(tab: RepoTab | undefined) {
     repository = tab?.repository ?? null;
     refs = tab?.refs ?? [];
+    stashes = tab?.stashes ?? [];
     const status = tab ? operationStates.get(tab.path) : undefined;
     operation = status?.operation ?? null;
     conflictedFiles = status?.conflictedFiles ?? 0;
@@ -212,6 +246,7 @@
       }
       opened = null;
       tab.refs = loaded.refs;
+      tab.stashes = loaded.stashes;
       tab.generation = loaded.generation;
       tab.eventGeneration = loaded.generation;
       operationStates.set(next.path, {
@@ -234,6 +269,7 @@
         if (activePath === openingPath || activePath === tab.path) {
           repository = null;
           refs = [];
+          stashes = [];
           opening = false;
         }
       }
@@ -414,6 +450,7 @@
       const result = await api.refs(repoId);
       if (token !== epoch || repository?.repo_id !== repoId) return;
       refs = result.refs;
+      stashes = result.stashes;
       operation = result.operation;
       conflictedFiles = result.conflicted_files;
       operationStates.set(repository.path, {
@@ -424,6 +461,7 @@
       const tab = tabs.find(item => item.repository?.repo_id === repoId);
       if (tab) {
         tab.refs = result.refs;
+        tab.stashes = result.stashes;
         tab.staleGeneration = 0;
       }
       saveActiveTab();
@@ -535,7 +573,7 @@
   }
 
   async function confirmForcePush() {
-    if (!repository || !currentBranch) return;
+    if (!repository || !currentBranch || activeRepoMutationsDisabled) return;
     const repo = repository;
     const branch = currentBranch;
     pushMenuOpen = false;
@@ -583,7 +621,7 @@
     kind: "fetch" | "pull" | "push" | "force-push",
     expected?: { repoId: string; branch: string },
   ) {
-    if (!repository || activeRepoRunning) return;
+    if (!repository || activeRepoMutationsDisabled) return;
     const repo = repository;
     if (expected && (repo.repo_id !== expected.repoId || currentBranch !== expected.branch)) return;
     const branch = expected?.branch ?? currentBranch;
@@ -606,14 +644,15 @@
   async function enqueueCustom(
     kind: string,
     label: string,
-    operation: (repoId: string) => Promise<string>,
+    enqueue: (repoId: string) => Promise<string>,
+    allowDuringOperation = false,
   ) {
-    if (!repository || activeRepoRunning) return;
+    if (!repository || activeRepoRunning || (operation !== null && !allowDuringOperation)) return;
     const repo = repository;
     requestingRepoIds = [...new Set([...requestingRepoIds, repo.repo_id])];
     let enqueued = false;
     try {
-      await operation(repo.repo_id);
+      await enqueue(repo.repo_id);
       enqueued = true;
     } catch (failure) {
       showOperationError(repo, kind, label, failure);
@@ -709,6 +748,19 @@
     const target = contextMenu?.target;
     contextMenu = null;
     if (!target || !repository) return;
+    if (target.kind === "stash") {
+      const { stash } = target;
+      if (id === "stash-apply") {
+        await enqueueCustom("stash-apply", `Apply stash ${stash.index}`, repoId => api.stashApply(repoId, stash.index));
+      } else if (id === "stash-pop-at") {
+        await enqueueCustom("stash-pop", `Pop stash ${stash.index}`, repoId => api.stashPopAt(repoId, stash.index));
+      } else if (id === "stash-drop" && window.confirm(`Drop stash '${stash.message}'?`)) {
+        await enqueueCustom("stash-drop", `Drop stash ${stash.index}`, repoId =>
+          api.stashDrop(repoId, stash.index, stash.oid),
+        );
+      }
+      return;
+    }
     if (target.kind === "commit") {
       if (id === "checkout-commit" && window.confirm(`Checkout commit ${target.oid.slice(0, 7)} in detached HEAD?`)) {
         await enqueueCustom("checkout-commit", `Checkout commit ${target.oid.slice(0, 7)}`, repoId =>
@@ -716,6 +768,24 @@
         );
       } else if (id === "create-branch") {
         startInlinePrompt("create", target);
+      } else if (id === "cherry-pick") {
+        await enqueueCustom("cherry-pick", `Cherry-pick ${target.oid.slice(0, 7)}`, repoId =>
+          api.cherryPick(repoId, target.oid),
+        );
+      } else if (id === "revert-commit") {
+        await enqueueCustom("revert", `Revert ${target.oid.slice(0, 7)}`, repoId =>
+          api.revert(repoId, target.oid),
+        );
+      } else if (id === "reset-soft" || id === "reset-mixed" || id === "reset-hard") {
+        const mode = id.slice("reset-".length) as "soft" | "mixed" | "hard";
+        const expectedHead = refs.find(ref => ref.is_head && ref.target)?.target;
+        if (!expectedHead) return;
+        if (mode === "hard" && !window.confirm(
+          `Hard reset ${currentBranch ?? "HEAD"} to ${target.oid.slice(0, 7)}? Uncommitted changes will be lost.`,
+        )) return;
+        await enqueueCustom(`reset-${mode}`, `Reset ${currentBranch ?? "HEAD"} to ${target.oid.slice(0, 7)} (${mode})`, repoId =>
+          api.resetCurrent(repoId, target.oid, mode, expectedHead),
+        );
       } else if (id === "copy-commit") {
         await navigator.clipboard.writeText(target.oid).catch(() => {});
       }
@@ -724,7 +794,15 @@
     const ref = target.ref;
     const local = ref.kind === "local" ? ref : counterpartFor(ref);
     const remote = ref.kind === "remote" ? ref : counterpartFor(ref);
-    if (id === "checkout") {
+    if (id === "merge-into-current" && (ref.kind === "local" || ref.kind === "remote")) {
+      await enqueueCustom("merge", `Merge ${ref.name} into ${currentBranch ?? "current branch"}`, repoId =>
+        api.mergeIntoCurrent(repoId, ref.name),
+      );
+    } else if (id === "rebase-current-onto" && (ref.kind === "local" || ref.kind === "remote")) {
+      await enqueueCustom("rebase", `Rebase ${currentBranch ?? "current branch"} onto ${ref.name}`, repoId =>
+        api.rebaseCurrentOnto(repoId, ref.name),
+      );
+    } else if (id === "checkout") {
       if (ref.kind === "local") {
         await enqueueCustom("checkout", `Checkout ${ref.name}`, repoId => api.checkoutLocal(repoId, ref.name));
       } else if (ref.kind === "remote") {
@@ -768,7 +846,14 @@
   }
 
   async function followUpAction(action: JobAction, entry: SnackbarEntry) {
-    if (action.kind === "force_delete") {
+    if (action.kind === "open_in_vscode") {
+      try {
+        await api.openInVSCode(entry.repo_id);
+      } catch (failure) {
+        const repo = tabs.find(tab => tab.repository?.repo_id === entry.repo_id)?.repository;
+        if (repo) showOperationError(repo, "open-in-vscode", action.label, failure);
+      }
+    } else if (action.kind === "force_delete") {
       const branch = String(action.payload?.branch ?? "");
       if (branch && repository?.repo_id === entry.repo_id) {
         const remote = action.payload?.remote ? String(action.payload.remote) : undefined;
@@ -797,6 +882,33 @@
 
   async function runStashPop() {
     await enqueueCustom("stash-pop", "Pop stash", repoId => api.stashPop(repoId));
+  }
+
+  async function runOperationControl(action: "continue" | "skip" | "abort") {
+    if (!repository || !operation || activeRepoRunning) return;
+    const kind = operation.kind;
+    if (action === "skip" && kind !== "rebase" && kind !== "cherry-pick") return;
+    const fn = action === "continue"
+      ? api.continueOperation
+      : action === "abort"
+        ? api.abortOperation
+        : api.skipOperation;
+    await enqueueCustom(
+      `${action}-${kind}`,
+      `${action[0].toUpperCase()}${action.slice(1)} ${kind}`,
+      repoId => fn(repoId, kind),
+      true,
+    );
+  }
+
+  async function openRepositoryInVSCode() {
+    if (!repository) return;
+    const repo = repository;
+    try {
+      await api.openInVSCode(repo.repo_id);
+    } catch (failure) {
+      showOperationError(repo, "open-in-vscode", "Open in VSCode", failure);
+    }
   }
 
   onMount(() => {
@@ -922,6 +1034,30 @@
           {/if}
         </section>
       {/each}
+      <section class="ref-group stash-group">
+        <button class="group-toggle" aria-expanded={!collapsed.stashes} onclick={() => { collapsed.stashes = !collapsed.stashes; }}>
+          <span class:closed={collapsed.stashes} class="chevron">⌄</span><span class="group-icon">▱</span>Stashes<span class="count">{stashes.length}</span>
+        </button>
+        {#if !collapsed.stashes}
+          {#if stashes.length}
+            <VirtualList items={stashes} maxHeight={216}>
+              {#snippet children(stash)}
+                <button class="ref-item stash-item" class:selected-stash={selected === stash.oid}
+                  title={`${stash.message} · ${new Date(stash.timestamp * 1000).toLocaleString()}`}
+                  disabled={!repository}
+                  onclick={() => { void selectCommit(stash.oid); }}
+                  oncontextmenu={(event) => showStashContextMenu(event, stash)}>
+                  <span class="ref-line" aria-hidden="true">▱</span>
+                  <span class="truncate">{stash.message}</span>
+                  <span class="stash-date">{formatRelativeDate(stash.timestamp)}</span>
+                </button>
+              {/snippet}
+            </VirtualList>
+          {:else}
+            <p class="no-refs">No stashes</p>
+          {/if}
+        {/if}
+      </section>
     </nav>
     <div class="sidebar-bottom"><span class="status-dot"></span> Git on disk is source of truth.<small>Watching Git metadata · No polling</small></div>
   </aside>
@@ -933,41 +1069,44 @@
         <span class="commit-count">{initialLoaded ? total.toLocaleString() : "—"} <span>commits</span></span>
         <div class="operation-toolbar">
           <div class="stash-menu">
-            <button disabled={!repository || activeRepoRunning} onclick={() => { stashPopover = !stashPopover; }}>Stash</button>
+            <button disabled={!repository || activeRepoMutationsDisabled} onclick={() => { stashPopover = !stashPopover; }}>Stash</button>
             {#if stashPopover}
               <div class="stash-popover">
                 <label><input type="checkbox" bind:checked={stashIncludeUntracked} /> Include untracked files</label>
-                <button disabled={!repository || activeRepoRunning} onclick={() => { void runStash(stashIncludeUntracked); }}>Stash changes</button>
+                <button disabled={!repository || activeRepoMutationsDisabled} onclick={() => { void runStash(stashIncludeUntracked); }}>Stash changes</button>
               </div>
             {/if}
           </div>
-          <button disabled={!repository || activeRepoRunning} onclick={() => { void runStashPop(); }}>Pop</button>
-          <button disabled={!repository || activeRepoRunning} onclick={() => runOperation("fetch")}>Fetch</button>
-          <button disabled={!repository || !currentBranch || activeRepoRunning} onclick={() => runOperation("pull")}>Pull</button>
-          <button disabled={!repository || !currentBranch || activeRepoRunning} onclick={() => runOperation("push")}>Push</button>
+          <button disabled={!repository || activeRepoMutationsDisabled} onclick={() => { void runStashPop(); }}>Pop</button>
+          <button disabled={!repository || activeRepoMutationsDisabled} onclick={() => runOperation("fetch")}>Fetch</button>
+          <button disabled={!repository || !currentBranch || activeRepoMutationsDisabled} onclick={() => runOperation("pull")}>Pull</button>
+          <button disabled={!repository || !currentBranch || activeRepoMutationsDisabled} onclick={() => runOperation("push")}>Push</button>
           <div class="push-menu">
-            <button class="push-menu-toggle" aria-label="More push options" aria-expanded={pushMenuOpen} disabled={!repository || !currentBranch || activeRepoRunning} onclick={() => { pushMenuOpen = !pushMenuOpen; }}>⌄</button>
+            <button class="push-menu-toggle" aria-label="More push options" aria-expanded={pushMenuOpen} disabled={!repository || !currentBranch || activeRepoMutationsDisabled} onclick={() => { pushMenuOpen = !pushMenuOpen; }}>⌄</button>
             {#if pushMenuOpen}
               <div class="push-menu-panel">
-                <button onclick={() => { void confirmForcePush(); }}>Force push with lease…</button>
+                <button disabled={activeRepoMutationsDisabled} onclick={() => { void confirmForcePush(); }}>Force push with lease…</button>
               </div>
             {/if}
             {#if forceConfirmation}
               <div class="force-confirm" role="dialog" aria-label="Confirm force push">
                 <p>Force push {forceConfirmation.branch} to {forceConfirmation.remote} with lease?</p>
-                <div><button onclick={() => { forceConfirmation = null; }}>Cancel</button><button class="force-confirm-action" onclick={() => { void executeForcePush(); }}>Force push</button></div>
+                <div><button onclick={() => { forceConfirmation = null; }}>Cancel</button><button class="force-confirm-action" disabled={activeRepoMutationsDisabled} onclick={() => { void executeForcePush(); }}>Force push</button></div>
               </div>
             {/if}
           </div>
         </div>
       </div>
     </div>
-    {#snippet operationControlsSlot()}{/snippet}
     {#if operation}
       <div class="operation-banner" role="status">
         <span>{formatOperationBanner(operation, conflictedFiles)}</span>
-        {@render operationControlsSlot()}
-        <a class="vscode-soon" role="link" aria-disabled="true" tabindex="-1" title="coming soon">Open in VSCode</a>
+        <div class="operation-controls">
+          <button disabled={bannerActions?.continueDisabled} title={conflictedFiles > 0 ? "Resolve conflicts before continuing" : undefined} onclick={() => { void runOperationControl("continue"); }}>Continue</button>
+          {#if bannerActions?.skipVisible}<button disabled={bannerActions.otherActionsDisabled} onclick={() => { void runOperationControl("skip"); }}>Skip</button>{/if}
+          <button disabled={bannerActions?.otherActionsDisabled} onclick={() => { void runOperationControl("abort"); }}>Abort</button>
+          <button class="vscode-link" disabled={!repository} onclick={() => { void openRepositoryInVSCode(); }}>Open in VSCode</button>
+        </div>
       </div>
     {/if}
     {#if error}
@@ -1018,7 +1157,9 @@
           {/each}
         </div>
         <div class="canvas-position" style:left="156px" style:top="{scrollTop}px">
-          <GraphCanvas rows={visibleRows} start={range.start} {scrollTop} height={viewportHeight} {selected} width={graphWidth} laneWidth={maxLaneWidth} visible={windowVisible} />
+          <GraphCanvas rows={visibleRows} start={range.start} {scrollTop} height={viewportHeight} {selected} width={graphWidth} laneWidth={maxLaneWidth} laneViewportWidth={graphLaneWidth} visible={windowVisible} {stashPlacements}
+            onSelectStash={(oid) => { void selectCommit(oid); }}
+            onContextStash={(event, oid) => { const stash = stashes.find(item => item.oid === oid); if (stash) showStashContextMenu(event, stash); }} />
         </div>
         {#if !initialLoaded}<div class="loading-history">Loading repository history…</div>{/if}
       {/if}
@@ -1064,15 +1205,15 @@
       <label>{inlinePrompt.kind === "rename" ? "Rename local branch" : "Create branch"}<input bind:value={inlinePrompt.name} /></label>
       {#if inlinePrompt.kind === "create"}<label class="prompt-check"><input type="checkbox" bind:checked={inlinePrompt.checkout} /> Check out after creating</label>{/if}
       {#if inlinePrompt.message}<p role="alert">{inlinePrompt.message}</p>{/if}
-      <div><button type="button" onclick={() => { inlinePrompt = null; }}>Cancel</button><button type="submit" disabled={activeRepoRunning}>Save</button></div>
+      <div><button type="button" onclick={() => { inlinePrompt = null; }}>Cancel</button><button type="submit" disabled={activeRepoMutationsDisabled}>Save</button></div>
     </form>
   {/if}
   {#if remoteCheckoutPrompt}
     <div class="branch-prompt remote-checkout-prompt" style:left="{remoteCheckoutPrompt.x}px" style:top="{remoteCheckoutPrompt.y}px" role="dialog" aria-label="Choose remote branch checkout">
       <p>Local {remoteCheckoutPrompt.local.name} is at {remoteCheckoutPrompt.local.target?.slice(0, 7)}, {remoteCheckoutPrompt.remote.name} is at {remoteCheckoutPrompt.remote.target?.slice(0, 7)}.</p>
       <div>
-        <button disabled={activeRepoRunning} onclick={() => { const local = remoteCheckoutPrompt!.local; remoteCheckoutPrompt = null; void enqueueCustom("checkout", `Checkout ${local.name}`, repoId => api.checkoutLocal(repoId, local.name)); }}>Checkout local</button>
-        <button disabled={activeRepoRunning} onclick={() => { const prompt = remoteCheckoutPrompt!; remoteCheckoutPrompt = null; void enqueueCustom("reset-local-to-remote", `Reset ${prompt.local.name} to ${prompt.remote.name}`, repoId => api.resetLocalToRemote(repoId, prompt.local.name, prompt.remote.name, prompt.local.target!)); }}>Reset local to {remoteCheckoutPrompt.remote.name}</button>
+        <button disabled={activeRepoMutationsDisabled} onclick={() => { const local = remoteCheckoutPrompt!.local; remoteCheckoutPrompt = null; void enqueueCustom("checkout", `Checkout ${local.name}`, repoId => api.checkoutLocal(repoId, local.name)); }}>Checkout local</button>
+        <button disabled={activeRepoMutationsDisabled} onclick={() => { const prompt = remoteCheckoutPrompt!; remoteCheckoutPrompt = null; void enqueueCustom("reset-local-to-remote", `Reset ${prompt.local.name} to ${prompt.remote.name}`, repoId => api.resetLocalToRemote(repoId, prompt.local.name, prompt.remote.name, prompt.local.target!)); }}>Reset local to {remoteCheckoutPrompt.remote.name}</button>
         <button onclick={() => { remoteCheckoutPrompt = null; }}>Cancel</button>
       </div>
     </div>

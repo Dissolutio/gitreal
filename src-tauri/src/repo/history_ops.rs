@@ -61,7 +61,10 @@ pub fn reset_current(path: PathBuf, oid: &str, mode: &str, expected_head: &str) 
     validate_oid(oid)?;
     validate_oid(expected_head)?;
     if !matches!(mode, "soft" | "mixed" | "hard") {
-        return Err(BackendError::new("invalid_reset_mode", "Invalid reset mode"));
+        return Err(BackendError::new(
+            "invalid_reset_mode",
+            "Invalid reset mode",
+        ));
     }
     let mut spec = JobSpec::new(
         "reset",
@@ -132,7 +135,14 @@ pub fn skip_operation(path: PathBuf, kind: &str) -> Result<JobSpec> {
 }
 
 pub fn stash_apply(path: PathBuf, index: usize) -> JobSpec {
-    let mut spec = stash_spec(path, "stash-apply", "Apply stash", "apply", index, "Applied stash");
+    let mut spec = stash_spec(
+        path,
+        "stash-apply",
+        "Apply stash",
+        "apply",
+        index,
+        "Applied stash",
+    );
     spec.preconditions.push(JobPrecondition::NoOperation);
     spec
 }
@@ -145,7 +155,14 @@ pub fn stash_pop(path: PathBuf, index: usize) -> JobSpec {
 
 pub fn stash_drop(path: PathBuf, index: usize, expected_oid: &str) -> Result<JobSpec> {
     validate_oid(expected_oid)?;
-    let mut spec = stash_spec(path, "stash-drop", "Drop stash", "drop", index, "Dropped stash");
+    let mut spec = stash_spec(
+        path,
+        "stash-drop",
+        "Drop stash",
+        "drop",
+        index,
+        "Dropped stash",
+    );
     spec.preconditions.push(JobPrecondition::StashOid {
         index,
         expected: expected_oid.into(),
@@ -173,19 +190,21 @@ pub fn open_in_vscode(path: &Path) -> Result<()> {
 pub fn detect_operation(path: &Path) -> Result<Option<&'static str>> {
     let repo = gix::open(path).map_err(BackendError::git)?;
     let git_dir = repo.git_dir();
-    Ok(if git_dir.join("rebase-merge").is_dir() || git_dir.join("rebase-apply").is_dir() {
-        Some("rebase")
-    } else if git_dir.join("CHERRY_PICK_HEAD").is_file() {
-        Some("cherry-pick")
-    } else if git_dir.join("REVERT_HEAD").is_file() {
-        Some("revert")
-    } else if git_dir.join("MERGE_HEAD").is_file() {
-        Some("merge")
-    } else if git_dir.join("BISECT_LOG").is_file() {
-        Some("bisect")
-    } else {
-        None
-    })
+    Ok(
+        if git_dir.join("rebase-merge").is_dir() || git_dir.join("rebase-apply").is_dir() {
+            Some("rebase")
+        } else if git_dir.join("CHERRY_PICK_HEAD").is_file() {
+            Some("cherry-pick")
+        } else if git_dir.join("REVERT_HEAD").is_file() {
+            Some("revert")
+        } else if git_dir.join("MERGE_HEAD").is_file() {
+            Some("merge")
+        } else if git_dir.join("BISECT_LOG").is_file() {
+            Some("bisect")
+        } else {
+            None
+        },
+    )
 }
 
 fn validate_commit(path: &Path, oid: &str, action: &str) -> Result<()> {
@@ -240,7 +259,10 @@ fn operation_args(kind: &str, action: &str) -> Result<Vec<String>> {
 }
 
 fn unknown_operation() -> BackendError {
-    BackendError::new("unknown_operation", "No supported Git operation is in progress")
+    BackendError::new(
+        "unknown_operation",
+        "No supported Git operation is in progress",
+    )
 }
 
 fn stash_spec(

@@ -9,6 +9,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.json",
+    "check:versions": "node scripts/check-tauri-versions.mjs",
     "test": "vitest run",
     "tauri": "tauri"
   },

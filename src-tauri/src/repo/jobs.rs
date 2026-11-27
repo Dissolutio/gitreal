@@ -132,16 +132,17 @@ impl JobQueue {
                                 0
                             };
                             if conflicts > 0 {
-                                let operation = match crate::repo::history_ops::detect_operation(&spec.cwd)
-                                    .ok()
-                                    .flatten()
-                                {
-                                    Some("rebase") => "Rebase",
-                                    Some("merge") => "Merge",
-                                    Some("cherry-pick") => "Cherry-pick",
-                                    Some("revert") => "Revert",
-                                    _ => "Git operation",
-                                };
+                                let operation =
+                                    match crate::repo::history_ops::detect_operation(&spec.cwd)
+                                        .ok()
+                                        .flatten()
+                                    {
+                                        Some("rebase") => "Rebase",
+                                        Some("merge") => "Merge",
+                                        Some("cherry-pick") => "Cherry-pick",
+                                        Some("revert") => "Revert",
+                                        _ => "Git operation",
+                                    };
                                 let noun = if conflicts == 1 {
                                     "conflicted file"
                                 } else {
@@ -280,23 +281,21 @@ fn run_git(spec: &JobSpec) -> Result<GitOutput, String> {
         };
         if !result.success || expected.as_deref() != Some(actual) {
             let message = match precondition {
-                    JobPrecondition::BranchOid { .. } => {
-                        "Local branch changed since the operation was requested".into()
-                    }
-                    JobPrecondition::CurrentBranch { .. } => {
-                        "The checked-out branch changed since the operation was requested".into()
-                    }
-                    JobPrecondition::WorkingTreeClean => "The working tree is not clean".into(),
-                    JobPrecondition::HeadOid { .. } => {
-                        "HEAD changed since the operation was requested".into()
-                    }
-                    JobPrecondition::StashOid { .. } => {
-                        "Stash changed since it was selected".into()
-                    }
-                    JobPrecondition::NoOperation | JobPrecondition::OperationIs { .. } => {
-                        unreachable!()
-                    }
-                };
+                JobPrecondition::BranchOid { .. } => {
+                    "Local branch changed since the operation was requested".into()
+                }
+                JobPrecondition::CurrentBranch { .. } => {
+                    "The checked-out branch changed since the operation was requested".into()
+                }
+                JobPrecondition::WorkingTreeClean => "The working tree is not clean".into(),
+                JobPrecondition::HeadOid { .. } => {
+                    "HEAD changed since the operation was requested".into()
+                }
+                JobPrecondition::StashOid { .. } => "Stash changed since it was selected".into(),
+                JobPrecondition::NoOperation | JobPrecondition::OperationIs { .. } => {
+                    unreachable!()
+                }
+            };
             return Ok(precondition_failure(message, result.exit_code));
         }
     }
@@ -393,18 +392,12 @@ fn precondition_failure(message: String, exit_code: Option<i32>) -> GitOutput {
 fn is_history_operation(kind: &str) -> bool {
     matches!(
         kind,
-        "merge"
-            | "rebase"
-            | "cherry-pick"
-            | "revert"
-            | "continue-operation"
-            | "skip-operation"
+        "merge" | "rebase" | "cherry-pick" | "revert" | "continue-operation" | "skip-operation"
     )
 }
 
 fn conflicted_file_count(spec: &JobSpec) -> usize {
-    let args = ["diff", "--name-only", "--diff-filter=U", "-z"]
-        .map(str::to_owned);
+    let args = ["diff", "--name-only", "--diff-filter=U", "-z"].map(str::to_owned);
     run_git_args(&spec.program, &spec.cwd, &args, spec.timeout, &spec.envs)
         .ok()
         .filter(|output| output.success)

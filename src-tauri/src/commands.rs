@@ -323,11 +323,7 @@ async fn cherry_pick(
 }
 
 #[tauri::command]
-async fn revert(
-    backend: State<'_, Arc<Backend>>,
-    repo_id: String,
-    oid: String,
-) -> Result<JobId> {
+async fn revert(backend: State<'_, Arc<Backend>>, repo_id: String, oid: String) -> Result<JobId> {
     let backend = Arc::clone(&backend);
     blocking(move || backend.revert(&repo_id, &oid)).await
 }
@@ -375,10 +371,7 @@ async fn skip_operation(
 }
 
 #[tauri::command]
-async fn open_in_vscode(
-    backend: State<'_, Arc<Backend>>,
-    repo_id: String,
-) -> Result<()> {
+async fn open_in_vscode(backend: State<'_, Arc<Backend>>, repo_id: String) -> Result<()> {
     let backend = Arc::clone(&backend);
     blocking(move || backend.open_in_vscode(&repo_id)).await
 }

@@ -23,6 +23,7 @@ pub struct JobSpec {
     pub cwd: PathBuf,
     pub args: Vec<String>,
     pub additional_steps: Vec<Vec<String>>,
+    pub rollback_steps: Vec<Vec<String>>,
     pub step_labels: Vec<String>,
     pub preconditions: Vec<JobPrecondition>,
     pub action_on_failure: Option<JobAction>,
@@ -33,6 +34,7 @@ pub struct JobSpec {
 
 pub enum JobPrecondition {
     BranchOid { branch: String, expected: String },
+    CurrentBranch { branch: String },
     WorkingTreeClean,
 }
 
@@ -50,6 +52,7 @@ impl JobSpec {
             cwd,
             args,
             additional_steps: Vec::new(),
+            rollback_steps: Vec::new(),
             step_labels: Vec::new(),
             preconditions: Vec::new(),
             action_on_failure: None,
@@ -193,11 +196,16 @@ fn run_git(spec: &JobSpec) -> Result<GitOutput, String> {
         let (args, expected) = match precondition {
             JobPrecondition::BranchOid { branch, expected } => (
                 vec!["rev-parse".into(), format!("refs/heads/{branch}")],
-                Some(expected.as_str()),
+                Some(expected.clone()),
             ),
-            JobPrecondition::WorkingTreeClean => {
-                (vec!["status".into(), "--porcelain".into()], Some(""))
-            }
+            JobPrecondition::CurrentBranch { branch } => (
+                vec!["symbolic-ref".into(), "--quiet".into(), "HEAD".into()],
+                Some(format!("refs/heads/{branch}")),
+            ),
+            JobPrecondition::WorkingTreeClean => (
+                vec!["status".into(), "--porcelain".into()],
+                Some(String::new()),
+            ),
         };
         let result = run_git_args(&spec.program, &spec.cwd, &args, spec.timeout)?;
         let actual = if matches!(precondition, JobPrecondition::WorkingTreeClean) {
@@ -205,13 +213,16 @@ fn run_git(spec: &JobSpec) -> Result<GitOutput, String> {
         } else {
             result.stdout.trim()
         };
-        if !result.success || expected != Some(actual) {
+        if !result.success || expected.as_deref() != Some(actual) {
             return Ok(GitOutput {
                 success: false,
                 exit_code: result.exit_code,
                 stderr: match precondition {
                     JobPrecondition::BranchOid { .. } => {
                         "Local branch changed since the operation was requested".into()
+                    }
+                    JobPrecondition::CurrentBranch { .. } => {
+                        "The checked-out branch changed since the operation was requested".into()
                     }
                     JobPrecondition::WorkingTreeClean => "The working tree is not clean".into(),
                 },
@@ -230,6 +241,52 @@ fn run_git(spec: &JobSpec) -> Result<GitOutput, String> {
     for (index, args) in steps.iter().enumerate() {
         let output = run_git_args(&spec.program, &spec.cwd, args, spec.timeout)?;
         if !output.success {
+            let mut output = output;
+            if index > 0 {
+                for rollback_args in &spec.rollback_steps {
+                    match run_git_args(&spec.program, &spec.cwd, rollback_args, spec.timeout) {
+                        Ok(rollback) if rollback.success => {}
+                        Ok(rollback) => {
+                            let detail = rollback
+                                .stderr
+                                .lines()
+                                .rev()
+                                .find(|line| !line.trim().is_empty())
+                                .unwrap_or("unknown error");
+                            output.stderr.push_str(&format!(
+                                "\nRollback failed; the remote branch may still be deleted: {detail}"
+                            ));
+                            output.stderr_tail = output
+                                .stderr
+                                .lines()
+                                .rev()
+                                .take(20)
+                                .collect::<Vec<_>>()
+                                .into_iter()
+                                .rev()
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            break;
+                        }
+                        Err(error) => {
+                            output.stderr.push_str(&format!(
+                                "\nRollback failed; the remote branch may still be deleted: {error}"
+                            ));
+                            output.stderr_tail = output
+                                .stderr
+                                .lines()
+                                .rev()
+                                .take(20)
+                                .collect::<Vec<_>>()
+                                .into_iter()
+                                .rev()
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            break;
+                        }
+                    }
+                }
+            }
             return Ok(GitOutput {
                 failed_step: index,
                 ..output
@@ -396,7 +453,13 @@ fn friendly_failure(spec: &JobSpec, stderr: &str, timed_out: bool) -> String {
         return "Git operation timed out".into();
     }
     let text = stderr.to_ascii_lowercase();
-    if text.contains("authentication failed")
+    if matches!(
+        spec.kind.as_str(),
+        "checkout" | "checkout-remote" | "checkout-commit"
+    ) && is_local_changes_failure(stderr)
+    {
+        "Checkout blocked by local changes; stash them to continue".into()
+    } else if text.contains("authentication failed")
         || text.contains("could not read username")
         || text.contains("permission denied (publickey)")
         || text.contains("invalid username or password")

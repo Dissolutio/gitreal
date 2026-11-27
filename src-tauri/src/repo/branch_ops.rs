@@ -106,6 +106,9 @@ pub fn reset_local_to_remote(
         expected: expected_local_oid.into(),
     });
     if current {
+        spec.preconditions.push(JobPrecondition::CurrentBranch {
+            branch: branch.into(),
+        });
         spec.preconditions.push(JobPrecondition::WorkingTreeClean);
     }
     Ok(spec)
@@ -221,20 +224,49 @@ pub fn delete_local_and_remote(
     remote: &str,
     remote_branch: &str,
 ) -> Result<JobSpec> {
-    let mut spec = delete_local(path, branch, false)?;
+    validate_branch(branch)?;
     validate_name(remote, "remote")?;
     validate_branch(remote_branch)?;
-    spec.kind = "delete-local-and-remote".into();
-    spec.label = format!("Delete local and remote branch {branch}");
-    spec.success_message =
-        format!("Deleted local branch {branch} and remote branch {remote}/{remote_branch}");
-    spec.additional_steps = vec![vec![
+    let repo = gix::open(&path).map_err(BackendError::git)?;
+    if repo
+        .head()
+        .ok()
+        .and_then(|head| head.referent_name().map(|name| name.as_bstr().to_string()))
+        .as_deref()
+        == Some(format!("refs/heads/{branch}").as_str())
+    {
+        return Err(BackendError::new(
+            "checked_out_branch",
+            "Cannot delete the checked-out branch",
+        ));
+    }
+    let local_oid = repo
+        .try_find_reference(&format!("refs/heads/{branch}"))
+        .map_err(BackendError::git)?
+        .ok_or_else(|| BackendError::new("unknown_branch", "Local branch not found"))?
+        .peel_to_id()
+        .map_err(BackendError::git)?
+        .to_string();
+    let mut spec = JobSpec::new(
+        "delete-local-and-remote",
+        format!("Delete local and remote branch {branch}"),
+        path,
+        vec![
+            "push".into(),
+            remote.into(),
+            "--delete".into(),
+            remote_branch.into(),
+        ],
+        format!("Deleted local branch {branch} and remote branch {remote}/{remote_branch}"),
+    );
+    spec.additional_steps = vec![vec!["branch".into(), "-d".into(), branch.into()]];
+    spec.rollback_steps = vec![vec![
         "push".into(),
+        format!("--force-with-lease=refs/heads/{remote_branch}:"),
         remote.into(),
-        "--delete".into(),
-        remote_branch.into(),
+        format!("{local_oid}:refs/heads/{remote_branch}"),
     ]];
-    spec.step_labels = vec!["Delete local branch".into(), "Delete remote branch".into()];
+    spec.step_labels = vec!["Delete remote branch".into(), "Delete local branch".into()];
     spec.action_on_failure = Some(JobAction {
         kind: "force_delete".into(),
         label: "Force delete".into(),
@@ -284,7 +316,7 @@ pub fn stash_and_checkout(path: PathBuf, checkout: JobSpec) -> JobSpec {
         "stash-and-checkout",
         format!("Stash and {}", checkout.label.to_lowercase()),
         path,
-        vec!["stash".into(), "push".into()],
+        vec!["stash".into(), "push".into(), "-u".into()],
         "Stashed changes and checked out branch",
     );
     spec.additional_steps.push(checkout.args);
@@ -333,7 +365,7 @@ fn split_remote_branch(remote_branch: &str) -> Result<(&str, &str)> {
 }
 
 fn validate_oid(oid: &str) -> Result<()> {
-    if oid.len() != 40 || !oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if !matches!(oid.len(), 40 | 64) || !oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(BackendError::new("invalid_commit", "Invalid commit ID"));
     }
     Ok(())
@@ -357,5 +389,12 @@ mod tests {
             assert!(validate_branch(invalid).is_err(), "{invalid}");
         }
         assert!(validate_branch("feature/topic").is_ok());
+    }
+
+    #[test]
+    fn accepts_sha1_and_sha256_object_ids() {
+        assert!(validate_oid(&"a".repeat(40)).is_ok());
+        assert!(validate_oid(&"b".repeat(64)).is_ok());
+        assert!(validate_oid(&"g".repeat(40)).is_err());
     }
 }

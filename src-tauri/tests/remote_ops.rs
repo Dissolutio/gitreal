@@ -362,6 +362,10 @@ fn checkout_blocked_by_local_changes_offers_stash_and_retry() {
     let id = backend.checkout_local(&repo_id, "topic").unwrap();
     let result = finished(&events, &id);
     assert!(!result.ok);
+    assert_eq!(
+        result.message,
+        "Checkout blocked by local changes; stash them to continue"
+    );
     let action = result.action.unwrap();
     assert_eq!(action.kind, "stash_and_retry");
     assert_eq!(action.label, "Stash & checkout");
@@ -381,6 +385,36 @@ fn stash_and_checkout_runs_in_one_job() {
         .unwrap();
     assert!(finished(&events, &id).ok);
     assert_eq!(git(&fixture.local, &["branch", "--show-current"]), "topic");
+    assert!(git(&fixture.local, &["stash", "list"]).contains("WIP"));
+}
+
+#[test]
+fn stash_and_checkout_stashes_conflicting_untracked_files() {
+    let fixture = Fixture::new();
+    git(&fixture.local, &["switch", "-c", "topic"]);
+    commit(
+        &fixture.local,
+        "topic adds untracked target",
+        "conflict.txt",
+    );
+    git(&fixture.local, &["switch", "main"]);
+    let (backend, repo_id, events) = fixture.backend();
+    fs::write(fixture.local.join("conflict.txt"), "untracked conflict\n").unwrap();
+
+    let blocked = backend.checkout_local(&repo_id, "topic").unwrap();
+    let blocked = finished(&events, &blocked);
+    assert!(!blocked.ok);
+    assert_eq!(blocked.action.unwrap().kind, "stash_and_retry");
+
+    let retry = backend
+        .stash_and_checkout(&repo_id, "local", "topic")
+        .unwrap();
+    assert!(finished(&events, &retry).ok);
+    assert_eq!(git(&fixture.local, &["branch", "--show-current"]), "topic");
+    assert_eq!(
+        fs::read_to_string(fixture.local.join("conflict.txt")).unwrap(),
+        "topic adds untracked target"
+    );
     assert!(git(&fixture.local, &["stash", "list"]).contains("WIP"));
 }
 
@@ -474,6 +508,43 @@ fn create_rename_and_delete_local_remote_branches() {
     );
     let delete_local = backend.delete_local(&repo_id, "renamed", false).unwrap();
     assert!(finished(&events, &delete_local).ok);
+}
+
+#[test]
+fn combined_delete_rolls_back_remote_if_local_delete_fails() {
+    let fixture = Fixture::new();
+    git(&fixture.local, &["switch", "-c", "unmerged"]);
+    commit(&fixture.local, "unmerged remote branch", "unmerged.txt");
+    git(&fixture.local, &["push", "-u", "origin", "unmerged"]);
+    git(&fixture.local, &["switch", "main"]);
+    let (backend, repo_id, events) = fixture.backend();
+
+    let id = backend
+        .delete_local_and_remote(&repo_id, "unmerged", "origin", "unmerged")
+        .unwrap();
+    let result = finished(&events, &id);
+    assert!(!result.ok);
+    assert_eq!(result.action.unwrap().kind, "force_delete");
+    assert!(
+        !git(
+            &fixture.root,
+            &[
+                "--git-dir",
+                fixture.remote.to_str().unwrap(),
+                "rev-parse",
+                "--verify",
+                "refs/heads/unmerged"
+            ]
+        )
+        .is_empty()
+    );
+    assert!(
+        git(
+            &fixture.local,
+            &["show-ref", "--verify", "refs/heads/unmerged"]
+        )
+        .contains("unmerged")
+    );
 }
 
 #[test]

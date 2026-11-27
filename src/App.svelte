@@ -422,11 +422,15 @@
       pending.clear();
       detailLoading = false;
     }
-    if (!wasVisible && visible && activeTab?.repository && activeTab.staleGeneration > eventGeneration) {
-      void refreshRepository({
-        repo_id: activeTab.repository.repo_id,
-        generation: activeTab.staleGeneration,
-      });
+    if (!wasVisible && visible) {
+      if (activeTab?.repository && activeTab.staleGeneration > eventGeneration) {
+        void refreshRepository({
+          repo_id: activeTab.repository.repo_id,
+          generation: activeTab.staleGeneration,
+        });
+      } else if (repository && selected && !detail && !detailError) {
+        void selectCommit(selected);
+      }
     }
   }
 

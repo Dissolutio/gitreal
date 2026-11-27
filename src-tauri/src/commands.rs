@@ -259,6 +259,8 @@ fn populate_tray_menu(
         menu.append(&item)?;
     }
     menu.append(&PredefinedMenuItem::separator(app)?)?;
+    let toggle = MenuItem::with_id(app, "toggle", "Toggle window", true, None::<&str>)?;
+    menu.append(&toggle)?;
     let show = MenuItem::with_id(app, "show", "Show", true, None::<&str>)?;
     menu.append(&show)?;
     let autostart = CheckMenuItem::with_id(
@@ -315,6 +317,7 @@ fn initialize_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
         .on_menu_event(|app, event| {
             let id = event.id().as_ref();
             match id {
+                "toggle" => toggle_window(app),
                 "show" => show_window(app),
                 "quit" => app.exit(0),
                 "autostart" => {

@@ -46,10 +46,12 @@ provide native repository access.
 
 ### Always-on setup on Pop!_OS (COSMIC)
 
-Install the `.deb` package with `sudo apt install ./gitreal_*.deb`, or make the
-AppImage executable and launch it. Gitreal stays available in the background
-when its window is closed; use the tray menu's **Start at login** checkbox to
-enable or disable autostart.
+Install the `.deb` package with `sudo apt install ./gitreal_*.deb` for the
+`gitreal` terminal command and autostart entry. Alternatively, make the AppImage
+executable and launch it; for CLI and autostart, ensure its executable is
+available on `PATH` as `gitreal`. Gitreal stays available in the background when
+its window is closed; use the tray menu's **Start at login** checkbox to enable
+or disable autostart.
 
 To toggle Gitreal with a COSMIC keyboard shortcut:
 

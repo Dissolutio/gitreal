@@ -6,7 +6,7 @@ use crate::{
     repo::graph::{LaneLayout, assign_lanes, page_edges},
     repo::jobs::{JobQueue, JobSpec},
     repo::remote_ops,
-    repo::watcher::{MetadataWatcher, WatchSignal},
+    repo::watcher::{MetadataWatcher, WatchChanges, WatchSignal},
 };
 use gix::bstr::ByteSlice;
 use std::{
@@ -23,6 +23,7 @@ use std::{
 const MAX_PAGE_SIZE: usize = 500;
 const MAX_OPEN_REPOS: usize = 16;
 const MAX_UPSTREAM_WALK: usize = 10_000;
+type UpstreamCache = HashMap<(gix::ObjectId, gix::ObjectId), (usize, usize, bool)>;
 
 struct Repository {
     path: PathBuf,
@@ -34,6 +35,7 @@ struct Repository {
 
 struct RepositoryState {
     refs: Vec<RefInfo>,
+    upstream_cache: UpstreamCache,
     operation: Option<OperationInfo>,
     conflicted_files: usize,
     snapshot: Option<Arc<Snapshot>>,
@@ -100,12 +102,14 @@ impl Backend {
             .map_err(|error| BackendError::new("invalid_path", error))?;
         // Open exactly the selected repository, not a parent found by discovery.
         let repo = gix::open(&path).map_err(|error| BackendError::new("not_repository", error))?;
-        let refs = read_refs(&repo)?;
+        let mut upstream_cache = UpstreamCache::new();
+        let refs = read_refs_with_cache(&repo, MAX_UPSTREAM_WALK, &mut upstream_cache)?;
         let (operation, conflicted_files) = read_operation(&repo, &refs)?;
         let repository = Arc::new(Repository {
             path: path.clone(),
             state: RwLock::new(RepositoryState {
                 refs,
+                upstream_cache,
                 operation,
                 conflicted_files,
                 snapshot: None,
@@ -121,12 +125,12 @@ impl Backend {
         let event_sink = Arc::clone(&self.event_sink);
         let watcher = MetadataWatcher::start(&repo, move |signal| {
             if let Some(repository) = weak_repository.upgrade() {
-                let (refs_changed, watcher_error) = match signal {
-                    WatchSignal::Changed(refs_changed) => (refs_changed, None),
-                    WatchSignal::Error(message) => (false, Some(message)),
+                let (changes, watcher_error) = match signal {
+                    WatchSignal::Changed(changes) => (changes, None),
+                    WatchSignal::Error(message) => (WatchChanges::ALL, Some(message)),
                 };
                 let mut watcher_error = watcher_error;
-                match repository.refresh(refs_changed) {
+                match repository.refresh(changes) {
                     Ok(Some(generation)) => event_sink.repo_changed(RepoChanged {
                         repo_id: event_repo_id.clone(),
                         generation,
@@ -277,7 +281,7 @@ impl Backend {
         queue
             .enqueue(spec, move || {
                 if let Some(repository) = weak_repository.upgrade() {
-                    match repository.refresh(false) {
+                    match repository.refresh(WatchChanges::ALL) {
                         Ok(Some(generation)) => event_sink.repo_changed(RepoChanged {
                             repo_id: event_repo_id.clone(),
                             generation,
@@ -456,7 +460,7 @@ impl Repository {
         }
     }
 
-    fn refresh(&self, refs_changed: bool) -> Result<Option<u64>> {
+    fn refresh(&self, changes: WatchChanges) -> Result<Option<u64>> {
         if self.closed.load(Ordering::Acquire) {
             return Ok(None);
         }
@@ -468,7 +472,20 @@ impl Repository {
             return Ok(None);
         }
         let repo = gix::open(&self.path).map_err(BackendError::git)?;
-        let refs = read_refs(&repo)?;
+        let (mut refs, mut upstream_cache) = {
+            let state = self
+                .state
+                .read()
+                .map_err(|_| BackendError::new("internal_error", "Repository state unavailable"))?;
+            if changes.refs {
+                (Vec::new(), state.upstream_cache.clone())
+            } else {
+                (state.refs.clone(), state.upstream_cache.clone())
+            }
+        };
+        if changes.refs {
+            refs = read_refs_with_cache(&repo, MAX_UPSTREAM_WALK, &mut upstream_cache)?;
+        }
         let (operation, conflicted_files) = read_operation(&repo, &refs)?;
         let (refs_unchanged, graph_unchanged, status_unchanged) = {
             let state = self
@@ -486,7 +503,7 @@ impl Repository {
                 state.operation == operation && state.conflicted_files == conflicted_files,
             )
         };
-        if refs_unchanged && status_unchanged && !refs_changed {
+        if refs_unchanged && status_unchanged && !changes.force {
             // Index-only changes without repository status changes are ignored.
             return Ok(None);
         }
@@ -501,6 +518,7 @@ impl Repository {
             return Ok(None);
         }
         state.refs = refs;
+        state.upstream_cache = upstream_cache;
         state.operation = operation;
         state.conflicted_files = conflicted_files;
         if let Some(snapshot) = snapshot {
@@ -658,6 +676,14 @@ fn read_refs(repo: &gix::Repository) -> Result<Vec<RefInfo>> {
 }
 
 fn read_refs_with_limit(repo: &gix::Repository, walk_limit: usize) -> Result<Vec<RefInfo>> {
+    read_refs_with_cache(repo, walk_limit, &mut UpstreamCache::new())
+}
+
+fn read_refs_with_cache(
+    repo: &gix::Repository,
+    walk_limit: usize,
+    upstream_cache: &mut UpstreamCache,
+) -> Result<Vec<RefInfo>> {
     let head = repo.head().map_err(BackendError::git)?;
     let head_name = head.referent_name().map(|name| name.as_bstr().to_string());
     let mut refs = Vec::new();
@@ -722,6 +748,12 @@ fn read_refs_with_limit(repo: &gix::Repository, walk_limit: usize) -> Result<Vec
         truncated: false,
     });
     let config = repo.config_snapshot();
+    let ref_indices: HashMap<_, _> = refs
+        .iter()
+        .enumerate()
+        .map(|(index, reference)| (reference.full_name.as_str(), index))
+        .collect();
+    let mut used_cache_keys = HashSet::new();
     for index in 0..refs.len() {
         if refs[index].kind != "local" {
             continue;
@@ -763,27 +795,35 @@ fn read_refs_with_limit(repo: &gix::Repository, walk_limit: usize) -> Result<Vec
         let Some(upstream_ref) = upstream_ref else {
             continue;
         };
-        let upstream = refs
-            .iter()
-            .find(|reference| reference.full_name == upstream_ref);
-        let Some(upstream) = upstream else {
+        let Some(&upstream_index) = ref_indices.get(upstream_ref.as_str()) else {
             refs[index].upstream_gone = true;
             continue;
         };
         let Some(local_target) = refs[index].target.as_deref() else {
             continue;
         };
-        let Some(upstream_target) = upstream.target.as_deref() else {
+        let Some(upstream_target) = refs[upstream_index].target.as_deref() else {
             continue;
         };
         let local = gix::ObjectId::from_hex(local_target.as_bytes()).map_err(BackendError::git)?;
         let upstream =
             gix::ObjectId::from_hex(upstream_target.as_bytes()).map_err(BackendError::git)?;
-        let (ahead, behind, truncated) = ahead_behind(repo, local, upstream, walk_limit)?;
+        let key = (local, upstream);
+        used_cache_keys.insert(key);
+        let counts = match upstream_cache.get(&key) {
+            Some(counts) => *counts,
+            None => {
+                let counts = ahead_behind(repo, local, upstream, walk_limit)?;
+                upstream_cache.insert(key, counts);
+                counts
+            }
+        };
+        let (ahead, behind, truncated) = counts;
         refs[index].ahead = Some(ahead);
         refs[index].behind = Some(behind);
         refs[index].truncated = truncated;
     }
+    upstream_cache.retain(|key, _| used_cache_keys.contains(key));
     refs.sort_by(|a, b| a.full_name.cmp(&b.full_name));
     Ok(refs)
 }

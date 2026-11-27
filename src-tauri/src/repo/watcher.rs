@@ -27,8 +27,29 @@ enum WatchMessage {
 }
 
 pub enum WatchSignal {
-    Changed(bool),
+    Changed(WatchChanges),
     Error(String),
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct WatchChanges {
+    pub refs: bool,
+    pub status: bool,
+    pub force: bool,
+}
+
+impl WatchChanges {
+    pub(super) const ALL: Self = Self {
+        refs: true,
+        status: true,
+        force: false,
+    };
+
+    fn merge(&mut self, other: Self) {
+        self.refs |= other.refs;
+        self.status |= other.status;
+        self.force |= other.force;
+    }
 }
 
 impl MetadataWatcher {
@@ -63,7 +84,7 @@ impl MetadataWatcher {
                     let Some(ref_change) = scopes.relevant_event(&event) else {
                         continue;
                     };
-                    let mut refs_changed = ref_change;
+                    let mut changes = ref_change;
                     let mut last_relevant_event = Instant::now();
                     let mut watcher_error = None;
                     loop {
@@ -71,7 +92,7 @@ impl MetadataWatcher {
                         match events_rx.recv_timeout(remaining) {
                             Ok(WatchMessage::Event(Ok(next))) => {
                                 if let Some(ref_change) = scopes.relevant_event(&next) {
-                                    refs_changed |= ref_change;
+                                    changes.merge(ref_change);
                                     last_relevant_event = Instant::now();
                                 }
                             }
@@ -91,7 +112,7 @@ impl MetadataWatcher {
                     }
                     callback(match watcher_error {
                         Some(error) => WatchSignal::Error(error),
-                        None => WatchSignal::Changed(refs_changed),
+                        None => WatchSignal::Changed(changes),
                     });
                 }
             })
@@ -203,7 +224,7 @@ impl WatchScopes {
         self.register_files(watcher)
     }
 
-    fn relevant_event(&self, event: &Event) -> Option<bool> {
+    fn relevant_event(&self, event: &Event) -> Option<WatchChanges> {
         if matches!(event.kind, EventKind::Access(_)) {
             return None;
         }
@@ -211,32 +232,64 @@ impl WatchScopes {
             .paths
             .iter()
             .filter_map(|path| self.relevant_path(path))
-            .max()
+            .reduce(|mut changes, next| {
+                changes.merge(next);
+                changes
+            })
     }
 
-    fn relevant_path(&self, path: &Path) -> Option<bool> {
+    fn relevant_path(&self, path: &Path) -> Option<WatchChanges> {
         if ignored(path) {
             return None;
         }
         if path == self.git_dir || path == self.common_dir {
-            return Some(false);
+            return Some(WatchChanges::ALL);
         }
         if self.files.contains(path) {
-            return Some(path.file_name().and_then(|name| name.to_str()) == Some("packed-refs"));
+            return Some(match path.file_name().and_then(|name| name.to_str()) {
+                Some("packed-refs") => WatchChanges {
+                    refs: true,
+                    status: false,
+                    force: true,
+                },
+                Some("config" | "config.worktree") => WatchChanges {
+                    refs: true,
+                    status: false,
+                    force: false,
+                },
+                Some("HEAD") => WatchChanges {
+                    refs: true,
+                    status: true,
+                    force: false,
+                },
+                _ => WatchChanges {
+                    refs: false,
+                    status: true,
+                    force: false,
+                },
+            });
         }
         if self
             .ref_dirs
             .iter()
             .any(|directory| path.starts_with(directory))
         {
-            return Some(false);
+            return Some(WatchChanges {
+                refs: true,
+                status: false,
+                force: false,
+            });
         }
         if self
             .rebase_dirs
             .iter()
             .any(|directory| path.starts_with(directory))
         {
-            return Some(false);
+            return Some(WatchChanges {
+                refs: false,
+                status: true,
+                force: false,
+            });
         }
         None
     }

@@ -24,6 +24,9 @@ const MAX_PAGE_SIZE: usize = 500;
 const MAX_OPEN_REPOS: usize = 16;
 const MAX_UPSTREAM_WALK: usize = 10_000;
 type UpstreamCache = HashMap<(gix::ObjectId, gix::ObjectId), (usize, usize, bool)>;
+type RefFingerprintEntry = (PathBuf, u64, Option<std::time::SystemTime>, bool, bool);
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RefFingerprint(Vec<RefFingerprintEntry>);
 
 struct Repository {
     path: PathBuf,
@@ -36,6 +39,7 @@ struct Repository {
 struct RepositoryState {
     refs: Vec<RefInfo>,
     upstream_cache: UpstreamCache,
+    ref_fingerprint: RefFingerprint,
     operation: Option<OperationInfo>,
     conflicted_files: usize,
     snapshot: Option<Arc<Snapshot>>,
@@ -104,12 +108,14 @@ impl Backend {
         let repo = gix::open(&path).map_err(|error| BackendError::new("not_repository", error))?;
         let mut upstream_cache = UpstreamCache::new();
         let refs = read_refs_with_cache(&repo, MAX_UPSTREAM_WALK, &mut upstream_cache)?;
+        let ref_fingerprint = read_ref_fingerprint(&repo)?;
         let (operation, conflicted_files) = read_operation(&repo, &refs)?;
         let repository = Arc::new(Repository {
             path: path.clone(),
             state: RwLock::new(RepositoryState {
                 refs,
                 upstream_cache,
+                ref_fingerprint,
                 operation,
                 conflicted_files,
                 snapshot: None,
@@ -472,21 +478,32 @@ impl Repository {
             return Ok(None);
         }
         let repo = gix::open(&self.path).map_err(BackendError::git)?;
-        let (mut refs, mut upstream_cache) = {
+        let (mut refs, mut upstream_cache, mut ref_fingerprint) = {
             let state = self
                 .state
                 .read()
                 .map_err(|_| BackendError::new("internal_error", "Repository state unavailable"))?;
-            if changes.refs {
-                (Vec::new(), state.upstream_cache.clone())
-            } else {
-                (state.refs.clone(), state.upstream_cache.clone())
-            }
+            (
+                state.refs.clone(),
+                state.upstream_cache.clone(),
+                state.ref_fingerprint.clone(),
+            )
         };
-        if changes.refs {
+        let should_read_refs =
+            changes.refs && (changes.force || read_ref_fingerprint(&repo)? != ref_fingerprint);
+        if should_read_refs {
             refs = read_refs_with_cache(&repo, MAX_UPSTREAM_WALK, &mut upstream_cache)?;
+            ref_fingerprint = read_ref_fingerprint(&repo)?;
         }
-        let (operation, conflicted_files) = read_operation(&repo, &refs)?;
+        let (operation, conflicted_files) = if changes.refs || changes.status {
+            read_operation(&repo, &refs)?
+        } else {
+            let state = self
+                .state
+                .read()
+                .map_err(|_| BackendError::new("internal_error", "Repository state unavailable"))?;
+            (state.operation.clone(), state.conflicted_files)
+        };
         let (refs_unchanged, graph_unchanged, status_unchanged) = {
             let state = self
                 .state
@@ -504,7 +521,14 @@ impl Repository {
             )
         };
         if refs_unchanged && status_unchanged && !changes.force {
-            // Index-only changes without repository status changes are ignored.
+            // Unchanged refs and status do not need a new generation or event.
+            if should_read_refs {
+                let mut state = self.state.write().map_err(|_| {
+                    BackendError::new("internal_error", "Repository state unavailable")
+                })?;
+                state.upstream_cache = upstream_cache;
+                state.ref_fingerprint = ref_fingerprint;
+            }
             return Ok(None);
         }
         let snapshot = (!graph_unchanged)
@@ -519,6 +543,7 @@ impl Repository {
         }
         state.refs = refs;
         state.upstream_cache = upstream_cache;
+        state.ref_fingerprint = ref_fingerprint;
         state.operation = operation;
         state.conflicted_files = conflicted_files;
         if let Some(snapshot) = snapshot {
@@ -669,6 +694,57 @@ impl Snapshot {
                 .map(|checkpoint| checkpoint.lanes.capacity() * size_of::<Option<u32>>())
                 .sum::<usize>()
     }
+}
+
+fn read_ref_fingerprint(repo: &gix::Repository) -> Result<RefFingerprint> {
+    let mut paths: Vec<RefFingerprintEntry> = Vec::new();
+    let mut ref_directories = vec![repo.git_dir().join("refs"), repo.common_dir().join("refs")];
+    ref_directories.sort();
+    ref_directories.dedup();
+    for directory in ref_directories {
+        collect_ref_metadata(&directory, &mut paths)?;
+    }
+    for path in [
+        repo.git_dir().join("HEAD"),
+        repo.git_dir().join("config"),
+        repo.git_dir().join("config.worktree"),
+        repo.git_dir().join("packed-refs"),
+        repo.common_dir().join("config"),
+        repo.common_dir().join("config.worktree"),
+        repo.common_dir().join("packed-refs"),
+    ] {
+        collect_ref_metadata(&path, &mut paths)?;
+    }
+    paths.sort_by(|a, b| a.0.cmp(&b.0));
+    paths.dedup_by(|a, b| a.0 == b.0);
+    Ok(RefFingerprint(paths))
+}
+
+fn collect_ref_metadata(path: &Path, entries: &mut Vec<RefFingerprintEntry>) -> Result<()> {
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(BackendError::new("git_error", error)),
+        };
+        let is_dir = metadata.is_dir();
+        let is_symlink = metadata.file_type().is_symlink();
+        entries.push((
+            path.clone(),
+            metadata.len(),
+            metadata.modified().ok(),
+            is_dir,
+            is_symlink,
+        ));
+        if is_dir {
+            for entry in fs::read_dir(path).map_err(BackendError::git)? {
+                let entry = entry.map_err(BackendError::git)?;
+                pending.push(entry.path());
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1218,6 +1294,7 @@ mod tests {
             state: RwLock::new(RepositoryState {
                 refs: Vec::new(),
                 upstream_cache: UpstreamCache::new(),
+                ref_fingerprint: RefFingerprint(Vec::new()),
                 operation: None,
                 conflicted_files: 0,
                 snapshot: Some(Arc::new(snapshot)),
@@ -1319,7 +1396,14 @@ mod tests {
         git(path, &["commit", "-m", "root"]);
         let root = git(path, &["rev-parse", "HEAD"]);
         let tree = git(path, &["rev-parse", "HEAD^{tree}"]);
-        git(path, &["config", "remote.origin.url", "https://example.invalid/repo"]);
+        git(
+            path,
+            &[
+                "config",
+                "remote.origin.url",
+                "https://example.invalid/repo",
+            ],
+        );
         git(
             path,
             &[
@@ -1341,7 +1425,10 @@ mod tests {
         let mut cache = UpstreamCache::new();
         let repo = gix::open(path).unwrap();
         let initial = read_refs_with_cache(&repo, MAX_UPSTREAM_WALK, &mut cache).unwrap();
-        let main = initial.iter().find(|reference| reference.name == "main").unwrap();
+        let main = initial
+            .iter()
+            .find(|reference| reference.name == "main")
+            .unwrap();
         assert_eq!((main.ahead, main.behind), (Some(1), Some(1)));
         assert_eq!(upstream_walk_count(), 2);
 
@@ -1389,11 +1476,13 @@ mod tests {
         assert_eq!(upstream_walk_count(), 0);
 
         let operation = read_operation(&repo, &renamed_refs).unwrap();
+        let ref_fingerprint = read_ref_fingerprint(&repo).unwrap();
         let repository = Repository {
             path: path.to_path_buf(),
             state: RwLock::new(RepositoryState {
                 refs: renamed_refs,
                 upstream_cache: cache.clone(),
+                ref_fingerprint,
                 operation: operation.0,
                 conflicted_files: operation.1,
                 snapshot: None,
@@ -1443,7 +1532,14 @@ mod tests {
         git(path, &["commit", "-m", "root"]);
         let root = git(path, &["rev-parse", "HEAD"]);
         let tree = git(path, &["rev-parse", "HEAD^{tree}"]);
-        git(path, &["config", "remote.upstream.url", "https://example.invalid/repo"]);
+        git(
+            path,
+            &[
+                "config",
+                "remote.upstream.url",
+                "https://example.invalid/repo",
+            ],
+        );
         git(
             path,
             &[
@@ -1483,23 +1579,27 @@ mod tests {
         for index in 0..35 {
             let branch = format!("bench-{index:03}");
             let tracking = format!("tracked-{index:03}");
+            let (local_target, upstream_target) = match index {
+                0..12 => (&local_chain[265 + index], &root),
+                12..23 => (&root, &upstream_chain[265 + index - 12]),
+                _ => (&local_chain[265 + index], &upstream_chain[100 + index - 23]),
+            };
             git(
                 path,
-                &[
-                    "update-ref",
-                    &format!("refs/heads/{branch}"),
-                    &local_chain[265 + index],
-                ],
+                &["update-ref", &format!("refs/heads/{branch}"), local_target],
             );
             git(
                 path,
                 &[
                     "update-ref",
                     &format!("refs/remotes/upstream/{tracking}"),
-                    &upstream_chain[100 + index],
+                    upstream_target,
                 ],
             );
-            git(path, &["config", &format!("branch.{branch}.remote"), "upstream"]);
+            git(
+                path,
+                &["config", &format!("branch.{branch}.remote"), "upstream"],
+            );
             git(
                 path,
                 &[
@@ -1521,36 +1621,95 @@ mod tests {
         let cold = started.elapsed();
         let cold_walks = upstream_walk_count();
         let cold_profile = read_profile();
-        assert_eq!(cold_refs.iter().filter(|reference| reference.kind == "local").count(), 35);
+        assert_eq!(
+            cold_refs
+                .iter()
+                .filter(|reference| reference.kind == "local")
+                .count(),
+            35
+        );
         assert_eq!(cache.len(), 35);
 
         reset_upstream_walk_count();
-        reset_read_profile();
         let started = Instant::now();
-        let warm_refs = read_refs_with_cache(&repo, MAX_UPSTREAM_WALK, &mut cache).unwrap();
+        let uncached_refs =
+            read_refs_with_cache(&repo, MAX_UPSTREAM_WALK, &mut UpstreamCache::new()).unwrap();
+        let uncached_no_change = started.elapsed();
+        let uncached_walks = upstream_walk_count();
+        assert_eq!(uncached_refs, cold_refs);
+        assert_eq!(uncached_walks, cold_walks);
+
+        let ref_fingerprint = read_ref_fingerprint(&repo).unwrap();
+        let operation = read_operation(&repo, &cold_refs).unwrap();
+        let repository = Repository {
+            path: path.to_path_buf(),
+            state: RwLock::new(RepositoryState {
+                refs: cold_refs.clone(),
+                upstream_cache: cache.clone(),
+                ref_fingerprint,
+                operation: operation.0,
+                conflicted_files: operation.1,
+                snapshot: None,
+                generation: 0,
+            }),
+            refresh_lock: Mutex::new(()),
+            watcher: Mutex::new(None),
+            closed: AtomicBool::new(false),
+        };
+
+        reset_upstream_walk_count();
+        let started = Instant::now();
+        assert_eq!(
+            repository.refresh(WatchChanges::ALL).unwrap(),
+            None,
+            "unchanged repository refresh must not emit"
+        );
         let warm = started.elapsed();
-        let warm_profile = read_profile();
-        assert_eq!(warm_refs, cold_refs);
         assert_eq!(upstream_walk_count(), 0);
 
         git(
             path,
-            &[
-                "update-ref",
-                "refs/heads/bench-000",
-                &local_chain[264],
-            ],
+            &["update-ref", "refs/heads/bench-000", &local_chain[264]],
         );
         reset_upstream_walk_count();
         reset_read_profile();
+        let mut moved_cache = repository.state.read().unwrap().upstream_cache.clone();
         let started = Instant::now();
-        let moved_refs = read_refs_with_cache(&gix::open(path).unwrap(), MAX_UPSTREAM_WALK, &mut cache)
-            .unwrap();
-        let moved = started.elapsed();
-        let moved_walks = upstream_walk_count();
+        let moved_refs = read_refs_with_cache(
+            &gix::open(path).unwrap(),
+            MAX_UPSTREAM_WALK,
+            &mut moved_cache,
+        )
+        .unwrap();
+        let moved_read_refs = started.elapsed();
+        let moved_read_walks = upstream_walk_count();
         let moved_profile = read_profile();
+        assert_eq!(moved_read_walks, 2);
+        let moved_branch = moved_refs
+            .iter()
+            .find(|reference| reference.name == "bench-000")
+            .unwrap();
+        assert_eq!(
+            (moved_branch.ahead, moved_branch.behind),
+            (Some(264), Some(0))
+        );
+
+        reset_upstream_walk_count();
+        let started = Instant::now();
+        assert!(repository.refresh(WatchChanges::ALL).unwrap().is_some());
+        let moved_refresh = started.elapsed();
+        let moved_walks = upstream_walk_count();
+        let moved_refs = repository.state.read().unwrap().refs.clone();
         assert_eq!(moved_walks, 2);
-        assert_eq!(cache.len(), 35);
+        let moved_branch = moved_refs
+            .iter()
+            .find(|reference| reference.name == "bench-000")
+            .unwrap();
+        assert_eq!(
+            (moved_branch.ahead, moved_branch.behind),
+            (Some(264), Some(0))
+        );
+        assert_eq!(repository.state.read().unwrap().upstream_cache.len(), 35);
         assert_ne!(moved_refs, cold_refs);
 
         let cpu = fs::read_to_string("/proc/cpuinfo")
@@ -1563,13 +1722,10 @@ mod tests {
             })
             .unwrap_or_else(|| "unknown".into());
         eprintln!(
-            "Synthetic 250 remote/35 local upstream read_refs ({cpu}): cold {cold:?}, warm {warm:?} (0 walks), one branch moved {moved:?} ({moved_walks} walks); cold phases ref iteration/config resolution/walks {:?}/{:?}/{:?}, warm {:?}/{:?}/{:?}, moved {:?}/{:?}/{:?}; cold bounded walks {cold_walks}",
+            "Synthetic 250 remote/35 local upstream refs ({cpu}): cold read_refs {cold:?}; uncached no-change read_refs {uncached_no_change:?} ({uncached_walks} walks); cached warm no-change refresh {warm:?} (0 walks); one branch moved read_refs {moved_read_refs:?} ({moved_read_walks} walks), full moved refresh {moved_refresh:?} ({moved_walks} walks); cold phases ref iteration/config resolution/walks {:?}/{:?}/{:?}, moved read_refs phases {:?}/{:?}/{:?}",
             cold_profile.0,
             cold_profile.1,
             cold_profile.2,
-            warm_profile.0,
-            warm_profile.1,
-            warm_profile.2,
             moved_profile.0,
             moved_profile.1,
             moved_profile.2,

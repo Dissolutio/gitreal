@@ -8,6 +8,7 @@ export interface PersistedTab { path: string }
 export interface AppConfig {
   version: number;
   active_tab: string | null;
+  start_at_login: boolean;
   repos: KnownRepo[];
   tabs: PersistedTab[];
 }
@@ -86,6 +87,12 @@ export function onRepoChanged(handler: (event: RepoChangedEvent) => void): Promi
 export function onRepoError(handler: (event: RepoErrorEvent) => void): Promise<UnlistenFn> {
   return desktop ? listen<RepoErrorEvent>("repo-error", event => handler(event.payload)) : Promise.resolve(() => {});
 }
+export function onOpenPath(handler: (path: string) => void): Promise<UnlistenFn> {
+  return desktop ? listen<{ path: string }>("open-path", event => handler(event.payload.path)) : Promise.resolve(() => {});
+}
+export function onWindowVisibility(handler: (visible: boolean) => void): Promise<UnlistenFn> {
+  return desktop ? listen<boolean>("window-visibility", event => handler(event.payload)) : Promise.resolve(() => {});
+}
 export function onJobStarted(handler: (event: JobStartedEvent) => void): Promise<UnlistenFn> {
   return desktop ? listen<JobStartedEvent>("job-started", event => handler(event.payload)) : Promise.resolve(() => {});
 }
@@ -110,6 +117,9 @@ export const api = {
   pushRemote: (repoId: string, branch: string) =>
     call<string>("get_push_remote", { repoId, branch }),
   config: () => call<AppConfig>("get_config", {}),
+  frontendReady: () => call<void>("frontend_ready", {}),
+  windowVisible: () => call<boolean>("get_window_visibility", {}),
+  quit: () => call<void>("quit_app", {}),
   setOpenTabs: (paths: string[], active: string | null) =>
     call<void>("set_open_tabs", { paths, active }),
   addKnownRepo: (path: string) => call<void>("add_known_repo", { path }),

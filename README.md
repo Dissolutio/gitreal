@@ -46,6 +46,28 @@ version manager if they are not already available. Run the desktop app in your
 normal graphical session; `pnpm dev` alone serves the frontend but does not
 provide native repository access.
 
+### Always-on setup on Pop!_OS (COSMIC)
+
+Install the `.deb` package with `sudo apt install ./gitreal_*.deb` for the
+`gitreal` terminal command and autostart entry. Alternatively, make the AppImage
+executable and launch it; for CLI and autostart, ensure its executable is
+available on `PATH` as `gitreal`. Gitreal stays available in the background when
+its window is closed; use the tray menu's **Start at login** checkbox to enable
+or disable autostart.
+
+To toggle Gitreal with a COSMIC keyboard shortcut:
+
+1. Open **Settings → Keyboard → Custom shortcuts**.
+2. Add a shortcut named **Toggle Gitreal**.
+3. Set its command to `gitreal --toggle`.
+4. Choose the key combination you want and save it.
+
+Wayland applications cannot register global hotkeys themselves, so the shortcut
+is configured in COSMIC rather than inside Gitreal.
+
+From VSCode, a task or keybinding can open the current workspace with
+`gitreal open ${workspaceFolder}`.
+
 ### Checks
 
 ```sh
@@ -112,5 +134,3 @@ No optimistic updates; force pushes must use `--force-with-lease`.
 
 - Tabs and configuration persistence.
 - Merge/rebase via drag and context menu, with a conflict banner.
-- Tray icon, single instance, `gitreal open <path>`, `gitreal --toggle`, autostart.
-- Linux packaging: `.deb` and AppImage.

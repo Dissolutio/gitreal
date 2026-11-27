@@ -262,6 +262,121 @@ async fn stash_pop(backend: State<'_, Arc<Backend>>, repo_id: String) -> Result<
 }
 
 #[tauri::command]
+async fn stash_apply(
+    backend: State<'_, Arc<Backend>>,
+    repo_id: String,
+    index: usize,
+) -> Result<JobId> {
+    let backend = Arc::clone(&backend);
+    blocking(move || backend.stash_apply(&repo_id, index)).await
+}
+
+#[tauri::command]
+async fn stash_pop_at(
+    backend: State<'_, Arc<Backend>>,
+    repo_id: String,
+    index: usize,
+) -> Result<JobId> {
+    let backend = Arc::clone(&backend);
+    blocking(move || backend.stash_pop_at(&repo_id, index)).await
+}
+
+#[tauri::command]
+async fn stash_drop(
+    backend: State<'_, Arc<Backend>>,
+    repo_id: String,
+    index: usize,
+    expected_oid: String,
+) -> Result<JobId> {
+    let backend = Arc::clone(&backend);
+    blocking(move || backend.stash_drop(&repo_id, index, &expected_oid)).await
+}
+
+#[tauri::command]
+async fn merge_into_current(
+    backend: State<'_, Arc<Backend>>,
+    repo_id: String,
+    source: String,
+) -> Result<JobId> {
+    let backend = Arc::clone(&backend);
+    blocking(move || backend.merge_into_current(&repo_id, &source)).await
+}
+
+#[tauri::command]
+async fn rebase_current_onto(
+    backend: State<'_, Arc<Backend>>,
+    repo_id: String,
+    target: String,
+) -> Result<JobId> {
+    let backend = Arc::clone(&backend);
+    blocking(move || backend.rebase_current_onto(&repo_id, &target)).await
+}
+
+#[tauri::command]
+async fn cherry_pick(
+    backend: State<'_, Arc<Backend>>,
+    repo_id: String,
+    oid: String,
+) -> Result<JobId> {
+    let backend = Arc::clone(&backend);
+    blocking(move || backend.cherry_pick(&repo_id, &oid)).await
+}
+
+#[tauri::command]
+async fn revert(backend: State<'_, Arc<Backend>>, repo_id: String, oid: String) -> Result<JobId> {
+    let backend = Arc::clone(&backend);
+    blocking(move || backend.revert(&repo_id, &oid)).await
+}
+
+#[tauri::command]
+async fn reset_current(
+    backend: State<'_, Arc<Backend>>,
+    repo_id: String,
+    oid: String,
+    mode: String,
+    expected_head: String,
+) -> Result<JobId> {
+    let backend = Arc::clone(&backend);
+    blocking(move || backend.reset_current(&repo_id, &oid, &mode, &expected_head)).await
+}
+
+#[tauri::command]
+async fn continue_operation(
+    backend: State<'_, Arc<Backend>>,
+    repo_id: String,
+    kind: String,
+) -> Result<JobId> {
+    let backend = Arc::clone(&backend);
+    blocking(move || backend.continue_operation(&repo_id, &kind)).await
+}
+
+#[tauri::command]
+async fn abort_operation(
+    backend: State<'_, Arc<Backend>>,
+    repo_id: String,
+    kind: String,
+) -> Result<JobId> {
+    let backend = Arc::clone(&backend);
+    blocking(move || backend.abort_operation(&repo_id, &kind)).await
+}
+
+#[tauri::command]
+async fn skip_operation(
+    backend: State<'_, Arc<Backend>>,
+    repo_id: String,
+    kind: String,
+) -> Result<JobId> {
+    let backend = Arc::clone(&backend);
+    blocking(move || backend.skip_operation(&repo_id, &kind)).await
+}
+
+#[tauri::command]
+async fn open_in_vscode(backend: State<'_, Arc<Backend>>, repo_id: String) -> Result<()> {
+    let backend = Arc::clone(&backend);
+    blocking(move || backend.open_in_vscode(&repo_id)).await
+}
+
+#[tauri::command]
 async fn stash_and_checkout(
     backend: State<'_, Arc<Backend>>,
     repo_id: String,
@@ -625,6 +740,18 @@ pub fn run() {
             delete_local_and_remote,
             stash_push,
             stash_pop,
+            stash_apply,
+            stash_pop_at,
+            stash_drop,
+            merge_into_current,
+            rebase_current_onto,
+            cherry_pick,
+            revert,
+            reset_current,
+            continue_operation,
+            abort_operation,
+            skip_operation,
+            open_in_vscode,
             stash_and_checkout,
             get_config,
             frontend_ready,

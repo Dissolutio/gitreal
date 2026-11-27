@@ -82,9 +82,19 @@ pub struct GraphPage {
 #[derive(Debug, Serialize)]
 pub struct RefsResponse {
     pub refs: Vec<RefInfo>,
+    pub stashes: Vec<StashInfo>,
     pub operation: Option<OperationInfo>,
     pub conflicted_files: usize,
     pub generation: u64,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct StashInfo {
+    pub index: usize,
+    pub oid: String,
+    pub message: String,
+    pub base_oid: String,
+    pub timestamp: i64,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]

@@ -2,6 +2,7 @@ use crate::{
     model::{
         BackendError, ChangedPath, CommitDetail, GraphPage, GraphRow, JobFinished, JobId,
         JobStarted, OpenRepo, OperationInfo, RefInfo, RefsResponse, RepoChanged, RepoError, Result,
+        StashInfo,
     },
     repo::branch_ops,
     repo::graph::{LaneLayout, assign_lanes, page_edges},
@@ -39,6 +40,8 @@ struct Repository {
 
 struct RepositoryState {
     refs: Vec<RefInfo>,
+    stashes: Vec<StashInfo>,
+    stash_signature: Option<StashSignature>,
     upstream_cache: UpstreamCache,
     ref_fingerprint: RefFingerprint,
     operation: Option<OperationInfo>,
@@ -60,6 +63,13 @@ struct SnapshotRow {
     summary: String,
     author: String,
     date: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StashSignature {
+    oid: Option<String>,
+    log_len: Option<u64>,
+    log_modified: Option<std::time::SystemTime>,
 }
 
 pub struct Backend {
@@ -110,11 +120,15 @@ impl Backend {
         let mut upstream_cache = UpstreamCache::new();
         let refs = read_refs_with_cache(&repo, MAX_UPSTREAM_WALK, &mut upstream_cache)?;
         let ref_fingerprint = read_ref_fingerprint(&repo)?;
+        let stash_signature = read_stash_signature(&repo)?;
+        let stashes = read_stashes(&repo)?;
         let (operation, conflicted_files) = read_operation(&repo, &refs)?;
         let repository = Arc::new(Repository {
             path: path.clone(),
             state: RwLock::new(RepositoryState {
                 refs,
+                stashes,
+                stash_signature: Some(stash_signature),
                 upstream_cache,
                 ref_fingerprint,
                 operation,
@@ -351,6 +365,89 @@ impl Backend {
         self.enqueue_job(repo_id, repository, spec)
     }
 
+    pub fn stash_apply(&self, repo_id: &str, index: usize) -> Result<JobId> {
+        let repository = self.repository(repo_id)?;
+        let spec = crate::repo::history_ops::stash_apply(repository.path.clone(), index);
+        self.enqueue_job(repo_id, repository, spec)
+    }
+
+    pub fn stash_pop_at(&self, repo_id: &str, index: usize) -> Result<JobId> {
+        let repository = self.repository(repo_id)?;
+        let spec = crate::repo::history_ops::stash_pop(repository.path.clone(), index);
+        self.enqueue_job(repo_id, repository, spec)
+    }
+
+    pub fn stash_drop(&self, repo_id: &str, index: usize, expected_oid: &str) -> Result<JobId> {
+        let repository = self.repository(repo_id)?;
+        let spec =
+            crate::repo::history_ops::stash_drop(repository.path.clone(), index, expected_oid)?;
+        self.enqueue_job(repo_id, repository, spec)
+    }
+
+    pub fn merge_into_current(&self, repo_id: &str, source: &str) -> Result<JobId> {
+        let repository = self.repository(repo_id)?;
+        let spec = crate::repo::history_ops::merge_into_current(repository.path.clone(), source)?;
+        self.enqueue_job(repo_id, repository, spec)
+    }
+
+    pub fn rebase_current_onto(&self, repo_id: &str, target: &str) -> Result<JobId> {
+        let repository = self.repository(repo_id)?;
+        let spec = crate::repo::history_ops::rebase_current_onto(repository.path.clone(), target)?;
+        self.enqueue_job(repo_id, repository, spec)
+    }
+
+    pub fn cherry_pick(&self, repo_id: &str, oid: &str) -> Result<JobId> {
+        let repository = self.repository(repo_id)?;
+        let spec = crate::repo::history_ops::cherry_pick(repository.path.clone(), oid)?;
+        self.enqueue_job(repo_id, repository, spec)
+    }
+
+    pub fn revert(&self, repo_id: &str, oid: &str) -> Result<JobId> {
+        let repository = self.repository(repo_id)?;
+        let spec = crate::repo::history_ops::revert(repository.path.clone(), oid)?;
+        self.enqueue_job(repo_id, repository, spec)
+    }
+
+    pub fn reset_current(
+        &self,
+        repo_id: &str,
+        oid: &str,
+        mode: &str,
+        expected_head: &str,
+    ) -> Result<JobId> {
+        let repository = self.repository(repo_id)?;
+        let spec = crate::repo::history_ops::reset_current(
+            repository.path.clone(),
+            oid,
+            mode,
+            expected_head,
+        )?;
+        self.enqueue_job(repo_id, repository, spec)
+    }
+
+    pub fn continue_operation(&self, repo_id: &str, kind: &str) -> Result<JobId> {
+        let repository = self.repository(repo_id)?;
+        let spec = crate::repo::history_ops::continue_operation(repository.path.clone(), kind)?;
+        self.enqueue_job(repo_id, repository, spec)
+    }
+
+    pub fn abort_operation(&self, repo_id: &str, kind: &str) -> Result<JobId> {
+        let repository = self.repository(repo_id)?;
+        let spec = crate::repo::history_ops::abort_operation(repository.path.clone(), kind)?;
+        self.enqueue_job(repo_id, repository, spec)
+    }
+
+    pub fn skip_operation(&self, repo_id: &str, kind: &str) -> Result<JobId> {
+        let repository = self.repository(repo_id)?;
+        let spec = crate::repo::history_ops::skip_operation(repository.path.clone(), kind)?;
+        self.enqueue_job(repo_id, repository, spec)
+    }
+
+    pub fn open_in_vscode(&self, repo_id: &str) -> Result<()> {
+        let repository = self.repository(repo_id)?;
+        crate::repo::history_ops::open_in_vscode(&repository.path)
+    }
+
     pub fn stash_and_checkout(
         &self,
         repo_id: &str,
@@ -447,6 +544,7 @@ impl Backend {
             .map_err(|_| BackendError::new("internal_error", "Repository state unavailable"))?;
         Ok(RefsResponse {
             refs: state.refs.clone(),
+            stashes: state.stashes.clone(),
             operation: state.operation.clone(),
             conflicted_files: state.conflicted_files,
             generation: state.generation,
@@ -477,7 +575,14 @@ impl Backend {
         }
         let repository = self.repository(repo_id)?;
         let oid = gix::ObjectId::from_hex(commit_id.as_bytes()).map_err(BackendError::git)?;
-        if !repository.snapshot()?.0.ids.contains(&oid) {
+        let is_stash = repository
+            .state
+            .read()
+            .map_err(|_| BackendError::new("internal_error", "Repository state unavailable"))?
+            .stashes
+            .iter()
+            .any(|stash| stash.oid == commit_id);
+        if !is_stash && !repository.snapshot()?.0.ids.contains(&oid) {
             return Err(BackendError::new(
                 "unknown_commit",
                 "Commit is not in this repository snapshot",
@@ -488,7 +593,8 @@ impl Backend {
         let author = commit.author().map_err(BackendError::git)?;
         let date = author.time().map_err(BackendError::git)?.seconds;
         let message = commit.message_raw().map_err(BackendError::git)?.to_string();
-        let parents: Vec<_> = commit.parent_ids().map(|id| id.to_string()).collect();
+        let parent_ids: Vec<_> = commit.parent_ids().collect();
+        let parents: Vec<_> = parent_ids.iter().map(ToString::to_string).collect();
         let tree = commit.tree().map_err(BackendError::git)?;
         let is_shallow_boundary = repo
             .shallow_commits()
@@ -549,6 +655,34 @@ impl Backend {
                 Ok(std::ops::ControlFlow::Continue(()))
             })
             .map_err(BackendError::git)?;
+        if is_stash && let Some(untracked_id) = parent_ids.get(2) {
+            let untracked_tree = repo
+                .find_commit(*untracked_id)
+                .map_err(BackendError::git)?
+                .tree()
+                .map_err(BackendError::git)?;
+            repo.empty_tree()
+                .changes()
+                .map_err(BackendError::git)?
+                .for_each_to_obtain_tree(&untracked_tree, |change| {
+                    use gix::object::tree::diff::Change;
+                    if let Change::Addition {
+                        location,
+                        entry_mode,
+                        ..
+                    } = change
+                        && !entry_mode.is_tree()
+                    {
+                        changes.push(ChangedPath {
+                            path: location.to_string(),
+                            status: "added",
+                            old_path: None,
+                        });
+                    }
+                    Ok(std::ops::ControlFlow::Continue(()))
+                })
+                .map_err(BackendError::git)?;
+        }
         changes.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(CommitDetail {
             commit_id: oid.to_string(),
@@ -600,7 +734,13 @@ impl Repository {
             return Ok(None);
         }
         let repo = gix::open(&self.path).map_err(BackendError::git)?;
-        let (mut refs, mut upstream_cache, mut ref_fingerprint) = {
+        let (
+            mut refs,
+            mut upstream_cache,
+            mut ref_fingerprint,
+            previous_stashes,
+            previous_stash_signature,
+        ) = {
             let state = self
                 .state
                 .read()
@@ -609,6 +749,8 @@ impl Repository {
                 state.refs.clone(),
                 state.upstream_cache.clone(),
                 state.ref_fingerprint.clone(),
+                state.stashes.clone(),
+                state.stash_signature.clone(),
             )
         };
         let should_read_refs =
@@ -617,6 +759,13 @@ impl Repository {
             refs = read_refs_with_cache(&repo, MAX_UPSTREAM_WALK, &mut upstream_cache)?;
             ref_fingerprint = read_ref_fingerprint(&repo)?;
         }
+        // One ref lookup and one stat; stash commits are re-read only when they changed.
+        let stash_signature = read_stash_signature(&repo)?;
+        let stashes = if previous_stash_signature.as_ref() == Some(&stash_signature) {
+            previous_stashes
+        } else {
+            read_stashes(&repo)?
+        };
         let (operation, conflicted_files) = if changes.refs || changes.status {
             read_operation(&repo, &refs)?
         } else {
@@ -626,7 +775,7 @@ impl Repository {
                 .map_err(|_| BackendError::new("internal_error", "Repository state unavailable"))?;
             (state.operation.clone(), state.conflicted_files)
         };
-        let (refs_unchanged, graph_unchanged, status_unchanged) = {
+        let (refs_unchanged, graph_unchanged, status_unchanged, stashes_unchanged) = {
             let state = self
                 .state
                 .read()
@@ -640,14 +789,17 @@ impl Repository {
                             && old.target == new.target
                     }),
                 state.operation == operation && state.conflicted_files == conflicted_files,
+                state.stashes == stashes,
             )
         };
-        if refs_unchanged && status_unchanged && !changes.force {
-            // Unchanged refs and status do not need a new generation or event.
+        if refs_unchanged && status_unchanged && stashes_unchanged && !changes.force {
+            // Unchanged refs, status and stashes do not need a new generation or event.
+            let mut state = self
+                .state
+                .write()
+                .map_err(|_| BackendError::new("internal_error", "Repository state unavailable"))?;
+            state.stash_signature = Some(stash_signature);
             if should_read_refs {
-                let mut state = self.state.write().map_err(|_| {
-                    BackendError::new("internal_error", "Repository state unavailable")
-                })?;
                 state.upstream_cache = upstream_cache;
                 state.ref_fingerprint = ref_fingerprint;
             }
@@ -664,6 +816,8 @@ impl Repository {
             return Ok(None);
         }
         state.refs = refs;
+        state.stashes = stashes;
+        state.stash_signature = Some(stash_signature);
         state.upstream_cache = upstream_cache;
         state.ref_fingerprint = ref_fingerprint;
         state.operation = operation;
@@ -840,6 +994,53 @@ fn read_ref_fingerprint(repo: &gix::Repository) -> Result<RefFingerprint> {
     paths.sort_by(|a, b| a.0.cmp(&b.0));
     paths.dedup_by(|a, b| a.0 == b.0);
     Ok(RefFingerprint(paths))
+}
+
+fn read_stash_signature(repo: &gix::Repository) -> Result<StashSignature> {
+    let oid = repo
+        .try_find_reference("refs/stash")
+        .map_err(BackendError::git)?
+        .and_then(|reference| reference.try_id())
+        .map(|id| id.to_string());
+    let reflog_path = repo.common_dir().join("logs/refs/stash");
+    let metadata = fs::metadata(reflog_path).ok();
+    Ok(StashSignature {
+        oid,
+        log_len: metadata.as_ref().map(std::fs::Metadata::len),
+        log_modified: metadata.and_then(|metadata| metadata.modified().ok()),
+    })
+}
+
+fn read_stashes(repo: &gix::Repository) -> Result<Vec<StashInfo>> {
+    let Some(reference) = repo
+        .try_find_reference("refs/stash")
+        .map_err(BackendError::git)?
+    else {
+        return Ok(Vec::new());
+    };
+    let mut log = reference.log_iter();
+    let Some(entries) = log.rev().map_err(BackendError::git)? else {
+        return Ok(Vec::new());
+    };
+    entries
+        .enumerate()
+        .map(|(index, entry)| {
+            let entry = entry.map_err(BackendError::git)?;
+            let commit = repo.find_commit(entry.new_oid).map_err(BackendError::git)?;
+            let base_oid = commit
+                .parent_ids()
+                .next()
+                .ok_or_else(|| BackendError::new("invalid_stash", "Stash has no base commit"))?
+                .to_string();
+            Ok(StashInfo {
+                index,
+                oid: entry.new_oid.to_string(),
+                message: entry.message.to_string(),
+                base_oid,
+                timestamp: entry.signature.time.seconds,
+            })
+        })
+        .collect()
 }
 
 fn collect_ref_metadata(path: &Path, entries: &mut Vec<RefFingerprintEntry>) -> Result<()> {
@@ -1415,6 +1616,8 @@ mod tests {
             path: PathBuf::new(),
             state: RwLock::new(RepositoryState {
                 refs: Vec::new(),
+                stashes: Vec::new(),
+                stash_signature: None,
                 upstream_cache: UpstreamCache::new(),
                 ref_fingerprint: RefFingerprint(Vec::new()),
                 operation: None,
@@ -1607,6 +1810,8 @@ mod tests {
                 ref_fingerprint,
                 operation: operation.0,
                 conflicted_files: operation.1,
+                stashes: Vec::new(),
+                stash_signature: None,
                 snapshot: None,
                 generation: 0,
             }),
@@ -1771,6 +1976,8 @@ mod tests {
                 ref_fingerprint,
                 operation: operation.0,
                 conflicted_files: operation.1,
+                stashes: Vec::new(),
+                stash_signature: None,
                 snapshot: None,
                 generation: 0,
             }),

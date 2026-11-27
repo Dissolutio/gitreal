@@ -304,13 +304,15 @@ pub fn stash_push(
 }
 
 pub fn stash_pop(path: PathBuf) -> JobSpec {
-    JobSpec::new(
+    let mut spec = JobSpec::new(
         "stash-pop",
         "Pop stash",
         path,
         vec!["stash".into(), "pop".into()],
         "Popped the latest stash",
-    )
+    );
+    spec.preconditions.push(JobPrecondition::NoOperation);
+    spec
 }
 
 pub fn stash_and_checkout(path: PathBuf, checkout: JobSpec) -> JobSpec {

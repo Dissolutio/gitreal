@@ -34,6 +34,8 @@ pub struct AppConfig {
     pub version: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_tab: Option<String>,
+    #[serde(default)]
+    pub start_at_login: bool,
     pub repos: Vec<KnownRepo>,
     pub tabs: Vec<OpenTab>,
 }
@@ -43,6 +45,7 @@ impl Default for AppConfig {
         Self {
             version: CONFIG_VERSION,
             active_tab: None,
+            start_at_login: false,
             repos: Vec::new(),
             tabs: Vec::new(),
         }
@@ -89,6 +92,16 @@ impl ConfigManager {
         save_config(&config_path, &config)
     }
 
+    pub fn set_start_at_login(&self, enabled: bool) -> Result<()> {
+        let _guard = self.lock()?;
+        let path = config_path()?;
+        let autostart_path = autostart_path()?;
+        let mut config = load_config(&path)?;
+        set_autostart_file(&autostart_path, enabled)?;
+        config.start_at_login = enabled;
+        save_config(&path, &config)
+    }
+
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, ()>> {
         self.gate
             .lock()
@@ -116,6 +129,50 @@ fn config_path_from(xdg_config_home: Option<&Path>, home: Option<&Path>) -> Resu
         )
     })?;
     Ok(home.join(".config").join("gitreal").join("config.toml"))
+}
+
+fn autostart_path() -> Result<PathBuf> {
+    autostart_path_from(
+        std::env::var_os("XDG_CONFIG_HOME")
+            .as_deref()
+            .map(Path::new),
+        std::env::var_os("HOME").as_deref().map(Path::new),
+    )
+}
+
+fn autostart_path_from(xdg_config_home: Option<&Path>, home: Option<&Path>) -> Result<PathBuf> {
+    let config_dir = if let Some(path) = xdg_config_home.filter(|path| path.is_absolute()) {
+        path.to_path_buf()
+    } else {
+        let home = home.ok_or_else(|| {
+            BackendError::new(
+                "config_error",
+                "Neither XDG_CONFIG_HOME nor HOME is available",
+            )
+        })?;
+        home.join(".config")
+    };
+    Ok(config_dir.join("autostart").join("gitreal.desktop"))
+}
+
+fn set_autostart_file(path: &Path, enabled: bool) -> Result<()> {
+    if enabled {
+        let parent = path.parent().ok_or_else(|| {
+            BackendError::new("config_error", "Autostart path has no parent directory")
+        })?;
+        fs::create_dir_all(parent).map_err(|error| BackendError::new("config_error", error))?;
+        fs::write(
+            path,
+            "[Desktop Entry]\nType=Application\nName=Gitreal\nExec=gitreal --hidden\nX-GNOME-Autostart-enabled=true\n",
+        )
+        .map_err(|error| BackendError::new("config_error", error))
+    } else {
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(BackendError::new("config_error", error)),
+        }
+    }
 }
 
 fn load_config(path: &Path) -> Result<AppConfig> {
@@ -281,6 +338,7 @@ mod tests {
         let config = AppConfig {
             version: CONFIG_VERSION,
             active_tab: Some("/repo/one".into()),
+            start_at_login: true,
             repos: vec![KnownRepo {
                 path: "/repo/one".into(),
                 name: "one".into(),
@@ -311,6 +369,12 @@ mod tests {
     }
 
     #[test]
+    fn older_config_defaults_start_at_login_to_false() {
+        let config: AppConfig = toml::from_str("version = 1\nrepos = []\ntabs = []").unwrap();
+        assert!(!config.start_at_login);
+    }
+
+    #[test]
     fn corrupt_config_is_backed_up_and_defaults_are_returned() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.toml");
@@ -335,6 +399,35 @@ mod tests {
         assert_eq!(
             config_path_from(None, Some(&home)).unwrap(),
             home.join(".config/gitreal/config.toml")
+        );
+    }
+
+    #[test]
+    fn autostart_file_is_written_and_removed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("autostart/gitreal.desktop");
+        set_autostart_file(&path, true).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "[Desktop Entry]\nType=Application\nName=Gitreal\nExec=gitreal --hidden\nX-GNOME-Autostart-enabled=true\n"
+        );
+        set_autostart_file(&path, false).unwrap();
+        assert!(!path.exists());
+        set_autostart_file(&path, false).unwrap();
+    }
+
+    #[test]
+    fn autostart_path_respects_xdg_config_home() {
+        let directory = tempfile::tempdir().unwrap();
+        let xdg = directory.path().join("xdg");
+        let home = directory.path().join("home");
+        let autostart = autostart_path_from(Some(&xdg), Some(&home)).unwrap();
+        assert_eq!(autostart, xdg.join("autostart/gitreal.desktop"));
+        set_autostart_file(&autostart, true).unwrap();
+        assert!(autostart.is_file());
+        assert_eq!(
+            autostart_path_from(None, Some(&home)).unwrap(),
+            home.join(".config/autostart/gitreal.desktop")
         );
     }
 

@@ -8,6 +8,7 @@ export interface PersistedTab { path: string }
 export interface AppConfig {
   version: number;
   active_tab: string | null;
+  start_at_login: boolean;
   repos: KnownRepo[];
   tabs: PersistedTab[];
 }
@@ -17,8 +18,25 @@ export interface RefInfo {
   kind: "local" | "remote" | "tag" | "head";
   target: string | null;
   is_head: boolean;
+  upstream: string | null;
+  ahead: number | null;
+  behind: number | null;
+  upstream_gone: boolean;
+  truncated: boolean;
 }
-export interface RefsResponse { refs: RefInfo[]; generation: number }
+export interface OperationInfo {
+  kind: "merge" | "rebase" | "cherry-pick" | "revert" | "bisect";
+  head_name: string | null;
+  onto: string | null;
+  step: number | null;
+  total_steps: number | null;
+}
+export interface RefsResponse {
+  refs: RefInfo[];
+  operation: OperationInfo | null;
+  conflicted_files: number;
+  generation: number;
+}
 export interface RepoChangedEvent { repo_id: string; generation: number }
 export interface RepoErrorEvent { repo_id: string; message: string }
 export interface GraphEdge { from_lane: number; to_lane: number; parent_id: string }
@@ -69,6 +87,12 @@ export function onRepoChanged(handler: (event: RepoChangedEvent) => void): Promi
 export function onRepoError(handler: (event: RepoErrorEvent) => void): Promise<UnlistenFn> {
   return desktop ? listen<RepoErrorEvent>("repo-error", event => handler(event.payload)) : Promise.resolve(() => {});
 }
+export function onOpenPath(handler: (path: string) => void): Promise<UnlistenFn> {
+  return desktop ? listen<{ path: string }>("open-path", event => handler(event.payload.path)) : Promise.resolve(() => {});
+}
+export function onWindowVisibility(handler: (visible: boolean) => void): Promise<UnlistenFn> {
+  return desktop ? listen<boolean>("window-visibility", event => handler(event.payload)) : Promise.resolve(() => {});
+}
 export function onJobStarted(handler: (event: JobStartedEvent) => void): Promise<UnlistenFn> {
   return desktop ? listen<JobStartedEvent>("job-started", event => handler(event.payload)) : Promise.resolve(() => {});
 }
@@ -116,6 +140,9 @@ export const api = {
   pushRemote: (repoId: string, branch: string) =>
     call<string>("get_push_remote", { repoId, branch }),
   config: () => call<AppConfig>("get_config", {}),
+  frontendReady: () => call<void>("frontend_ready", {}),
+  windowVisible: () => call<boolean>("get_window_visibility", {}),
+  quit: () => call<void>("quit_app", {}),
   setOpenTabs: (paths: string[], active: string | null) =>
     call<void>("set_open_tabs", { paths, active }),
   addKnownRepo: (path: string) => call<void>("add_known_repo", { path }),

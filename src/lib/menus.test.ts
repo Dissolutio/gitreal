@@ -12,6 +12,11 @@ const ref = (
   kind,
   target,
   is_head,
+  upstream: null,
+  ahead: null,
+  behind: null,
+  upstream_gone: false,
+  truncated: false,
   full_name: kind === "local"
     ? `refs/heads/${name}`
     : kind === "remote"

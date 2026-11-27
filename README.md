@@ -46,6 +46,28 @@ version manager if they are not already available. Run the desktop app in your
 normal graphical session; `pnpm dev` alone serves the frontend but does not
 provide native repository access.
 
+### Always-on setup on Pop!_OS (COSMIC)
+
+Install the `.deb` package with `sudo apt install ./gitreal_*.deb` for the
+`gitreal` terminal command and autostart entry. Alternatively, make the AppImage
+executable and launch it; for CLI and autostart, ensure its executable is
+available on `PATH` as `gitreal`. Gitreal stays available in the background when
+its window is closed; use the tray menu's **Start at login** checkbox to enable
+or disable autostart.
+
+To toggle Gitreal with a COSMIC keyboard shortcut:
+
+1. Open **Settings → Keyboard → Custom shortcuts**.
+2. Add a shortcut named **Toggle Gitreal**.
+3. Set its command to `gitreal --toggle`.
+4. Choose the key combination you want and save it.
+
+Wayland applications cannot register global hotkeys themselves, so the shortcut
+is configured in COSMIC rather than inside Gitreal.
+
+From VSCode, a task or keybinding can open the current workspace with
+`gitreal open ${workspaceFolder}`.
+
 ### Checks
 
 ```sh
@@ -75,8 +97,14 @@ linear, branched/merged, octopus, multiple-root and criss-cross histories.
 - `open_repo(path)` returns `{ repo_id, path, name }`; subsequent commands use
   the opaque handle. `close_repo(repo_id)` releases it when switching repos.
 - `get_refs(repo_id)` returns local/remote/tag/HEAD entries. Annotated tags are
-  peeled; unborn HEAD and non-commit tags have a null target. The response also
-  includes the repository generation.
+  peeled; unborn HEAD and non-commit tags have a null target. Local branches
+  include `upstream` (for example, `origin/main`), `ahead`, and `behind`; absent
+  tracking data is null, a deleted upstream sets `upstream_gone`, and counts
+  stop at 10,000 commits per side with `truncated` set when the bound is hit.
+  The response also includes `operation` (null or merge/rebase/cherry-pick/
+  revert/bisect state), `conflicted_files`, and the repository generation.
+  Merge, cherry-pick, revert, and bisect markers are read from their Git metadata
+  files; rebase state is read from `rebase-merge/` or `rebase-apply/`.
 - `get_graph_page(repo_id, offset, limit)` returns
   `{ rows, total, max_lane, generation }`, with page sizes 1–500. `max_lane` is
   the widest lane index in the snapshot. Each row has commit metadata, labels, a
@@ -106,5 +134,3 @@ No optimistic updates; force pushes must use `--force-with-lease`.
 
 - Tabs and configuration persistence.
 - Merge/rebase via drag and context menu, with a conflict banner.
-- Tray icon, single instance, `gitreal open <path>`, `gitreal --toggle`, autostart.
-- Linux packaging: `.deb` and AppImage.

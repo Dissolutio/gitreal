@@ -2,7 +2,7 @@ use crate::cli::{self, CliAction};
 use crate::config::{AppConfig, ConfigManager};
 use crate::model::{
     BackendError, CommitDetail, GraphPage, JobFinished, JobId, JobStarted, OpenRepo, RefsResponse,
-    RepoChanged, RepoError, Result,
+    RepoChanged, RepoError, Result, WorktreeChanged, WorktreeStatus,
 };
 use crate::repo::reader::{Backend, EventSink};
 use crate::updater::{self, UpdateInfo, UpdateProgress};
@@ -55,6 +55,10 @@ impl EventSink for TauriEventSink {
     fn job_finished(&self, event: JobFinished) {
         let _ = self.0.emit("job-finished", event);
     }
+
+    fn worktree_changed(&self, event: WorktreeChanged) {
+        let _ = self.0.emit("worktree-changed", event);
+    }
 }
 
 async fn blocking<T: Send + 'static>(
@@ -81,6 +85,61 @@ async fn close_repo(backend: State<'_, Arc<Backend>>, repo_id: String) -> Result
 async fn get_refs(backend: State<'_, Arc<Backend>>, repo_id: String) -> Result<RefsResponse> {
     let backend = Arc::clone(&backend);
     blocking(move || backend.get_refs(&repo_id)).await
+}
+
+#[tauri::command]
+async fn get_worktree_status(
+    backend: State<'_, Arc<Backend>>,
+    repo_id: String,
+) -> Result<WorktreeStatus> {
+    let backend = Arc::clone(&backend);
+    blocking(move || backend.get_worktree_status(&repo_id)).await
+}
+
+#[tauri::command]
+async fn stage_paths(
+    backend: State<'_, Arc<Backend>>,
+    repo_id: String,
+    paths: Vec<String>,
+) -> Result<JobId> {
+    let backend = Arc::clone(&backend);
+    blocking(move || backend.stage_paths(&repo_id, &paths)).await
+}
+
+#[tauri::command]
+async fn stage_all(backend: State<'_, Arc<Backend>>, repo_id: String) -> Result<JobId> {
+    let backend = Arc::clone(&backend);
+    blocking(move || backend.stage_all(&repo_id)).await
+}
+
+#[tauri::command]
+async fn unstage_paths(
+    backend: State<'_, Arc<Backend>>,
+    repo_id: String,
+    paths: Vec<String>,
+) -> Result<JobId> {
+    let backend = Arc::clone(&backend);
+    blocking(move || backend.unstage_paths(&repo_id, &paths)).await
+}
+
+#[tauri::command]
+async fn unstage_all(backend: State<'_, Arc<Backend>>, repo_id: String) -> Result<JobId> {
+    let backend = Arc::clone(&backend);
+    blocking(move || backend.unstage_all(&repo_id)).await
+}
+
+#[tauri::command]
+async fn commit_changes(
+    backend: State<'_, Arc<Backend>>,
+    repo_id: String,
+    summary: String,
+    description: String,
+    amend: bool,
+    allow_amend_pushed: bool,
+) -> Result<JobId> {
+    let backend = Arc::clone(&backend);
+    blocking(move || backend.commit(&repo_id, &summary, &description, amend, allow_amend_pushed))
+        .await
 }
 
 #[tauri::command]
@@ -909,6 +968,12 @@ pub fn run() {
             open_repo,
             close_repo,
             get_refs,
+            get_worktree_status,
+            stage_paths,
+            stage_all,
+            unstage_paths,
+            unstage_all,
+            commit_changes,
             get_graph_page,
             get_commit_detail,
             fetch,

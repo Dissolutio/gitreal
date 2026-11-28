@@ -8,14 +8,16 @@ Pop!_OS 24.04 with COSMIC/Wayland, with low idle RAM and CPU as a priority.
 
 Open a repository with the native folder picker, browse local branches, remote
 branches and tags, scroll a virtualized commit graph, and select a commit for its
-message, author, date, parents and changed paths. Git reads use gix, not libgit2.
-Fetch, fast-forward-only pull, push, and lease-protected force push run through a
-per-repository serialized Git CLI queue. The UI refreshes from confirmed Git
-state after each operation; it never updates optimistically. A metadata-only
-watcher keeps references and history current after external Git activity; it
-never watches the working tree. It watches Git metadata in the resolved worktree
-and common directories, debounces events for 150 ms, and ignores lock and
-transient files.
+message, author, date, parents and changed paths. History and reference reads
+use gix, not libgit2. Working-tree status uses
+`git -c core.fsmonitor=false status --porcelain=v2 -z --untracked-files=all`
+so repository-configured fsmonitor programs are not run. Fetch, fast-forward-only
+pull, push, force push, staging and commits run through a per-repository
+serialized Git CLI queue. The UI refreshes from confirmed Git state after each
+operation; it never updates optimistically. A metadata-only watcher keeps
+references and history current after external Git activity; it never watches
+the working tree. It watches Git metadata in the resolved worktree and common
+directories, debounces events for 150 ms, and ignores lock and transient files.
 
 History is cached as a compact, topologically ordered snapshot (lane assignments
 plus lane-occupancy checkpoints; edges are reconstructed per page) and atomically
@@ -111,9 +113,9 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 ```
 
-Rust integration tests create temporary repositories using the Git CLI; the
-application reads repositories through gix and uses the CLI only for queued
-Git operations. Graph tests cover
+Rust integration tests create temporary repositories using the Git CLI; history
+and reference reads use gix, status uses Git porcelain with fsmonitor disabled,
+and mutations use the CLI through the job queue. Graph tests cover
 linear, branched/merged, octopus, multiple-root and criss-cross histories.
 
 ### Layout
@@ -125,8 +127,14 @@ linear, branched/merged, octopus, multiple-root and criss-cross histories.
 
 ### Native API
 
-- `open_repo(path)` returns `{ repo_id, path, name }`; subsequent commands use
-  the opaque handle. `close_repo(repo_id)` releases it when switching repos.
+- `open_repo(path)` returns `{ repo_id, path, name, worktree_status }`;
+  subsequent commands use the opaque handle. `close_repo(repo_id)` releases it
+  when switching repos.
+- `get_worktree_status(repo_id)` returns staged, unstaged, untracked and
+  conflicted paths, capped at 5,000 entries. Status is refreshed on open,
+  activation/focus, WIP selection, metadata changes and after queued jobs; it
+  is never computed while paging history. `worktree-changed` reports status
+  generations only when the status changes.
 - `get_refs(repo_id)` returns local/remote/tag/HEAD entries. Annotated tags are
   peeled; unborn HEAD and non-commit tags have a null target. Local branches
   include `upstream` (for example, `origin/main`), `ahead`, and `behind`; absent
@@ -151,6 +159,10 @@ linear, branched/merged, octopus, multiple-root and criss-cross histories.
   Pull uses `--ff-only`; force push always uses `--force-with-lease` against the
   remote-tracking object ID currently known to Gitreal. `get_push_remote`
   resolves the configured push target for the force-push confirmation.
+- `stage_paths`, `stage_all`, `unstage_paths`, `unstage_all` and `commit_changes`
+  enqueue staging and commit jobs. Commits accept a summary, optional
+  description, and amend flag; hooks run normally while `GIT_EDITOR=true`
+  prevents Git from opening an editor.
 - Errors serialize as `{ code, message }`. Blocking git work runs off the
   async runtime. At most 16 repository handles may remain open.
 

@@ -1,7 +1,9 @@
 pub mod branch_ops;
+pub mod commit_ops;
 pub mod graph;
 pub mod history_ops;
 pub mod jobs;
 pub mod reader;
 pub mod remote_ops;
 pub mod watcher;
+pub mod worktree;

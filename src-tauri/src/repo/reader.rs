@@ -2,13 +2,14 @@ use crate::{
     model::{
         BackendError, ChangedPath, CommitDetail, GraphPage, GraphRow, JobFinished, JobId,
         JobStarted, OpenRepo, OperationInfo, RefInfo, RefsResponse, RepoChanged, RepoError, Result,
-        StashInfo,
+        StashInfo, WorktreeChanged, WorktreeStatus,
     },
     repo::branch_ops,
     repo::graph::{LaneLayout, assign_lanes, page_edges},
     repo::jobs::{JobQueue, JobSpec},
     repo::remote_ops,
     repo::watcher::{MetadataWatcher, WatchChanges, WatchSignal},
+    repo::worktree::read_worktree_status,
 };
 use gix::bstr::ByteSlice;
 use std::{
@@ -46,6 +47,7 @@ struct RepositoryState {
     ref_fingerprint: RefFingerprint,
     operation: Option<OperationInfo>,
     conflicted_files: usize,
+    worktree_status: WorktreeStatus,
     snapshot: Option<Arc<Snapshot>>,
     generation: u64,
 }
@@ -86,6 +88,7 @@ pub trait EventSink: Send + Sync + 'static {
     fn repo_error(&self, event: RepoError);
     fn job_started(&self, event: JobStarted);
     fn job_finished(&self, event: JobFinished);
+    fn worktree_changed(&self, _: WorktreeChanged) {}
 }
 
 struct NullEventSink;
@@ -127,6 +130,7 @@ impl Backend {
         let stash_signature = read_stash_signature(&repo)?;
         let stashes = read_stashes(&repo)?;
         let (operation, conflicted_files) = read_operation(&repo, &refs)?;
+        let worktree_status = read_worktree_status(&path)?;
         let repository = Arc::new(Repository {
             path: path.clone(),
             state: RwLock::new(RepositoryState {
@@ -137,6 +141,7 @@ impl Backend {
                 ref_fingerprint,
                 operation,
                 conflicted_files,
+                worktree_status,
                 snapshot: None,
                 generation: 0,
             }),
@@ -144,6 +149,12 @@ impl Backend {
             watcher: Mutex::new(None),
             closed: AtomicBool::new(false),
         });
+        let worktree_status = repository
+            .state
+            .read()
+            .map_err(|_| BackendError::new("internal_error", "Repository state unavailable"))?
+            .worktree_status
+            .clone();
         let repo_id = format!("repo-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
         let event_repo_id = repo_id.clone();
         let weak_repository = Arc::downgrade(&repository);
@@ -162,6 +173,16 @@ impl Backend {
                     }),
                     Ok(None) => {}
                     Err(error) => watcher_error = Some(error.message),
+                }
+                if changes.status {
+                    match repository.refresh_worktree_status() {
+                        Ok(Some(generation)) => event_sink.worktree_changed(WorktreeChanged {
+                            repo_id: event_repo_id.clone(),
+                            generation,
+                        }),
+                        Ok(None) => {}
+                        Err(error) => watcher_error = Some(error.message),
+                    }
                 }
                 if let Some(message) = watcher_error {
                     event_sink.repo_error(RepoError {
@@ -196,6 +217,7 @@ impl Backend {
                 .to_string_lossy()
                 .into(),
             path: path.to_string_lossy().into(),
+            worktree_status,
         })
     }
 
@@ -369,6 +391,98 @@ impl Backend {
         self.enqueue_job(repo_id, repository, spec)
     }
 
+    pub fn stage_paths(&self, repo_id: &str, paths: &[String]) -> Result<JobId> {
+        let repository = self.repository(repo_id)?;
+        let spec = crate::repo::commit_ops::stage_paths(repository.path.clone(), paths)?;
+        self.enqueue_job(repo_id, repository, spec)
+    }
+
+    pub fn stage_all(&self, repo_id: &str) -> Result<JobId> {
+        let repository = self.repository(repo_id)?;
+        let spec = crate::repo::commit_ops::stage_all(repository.path.clone());
+        self.enqueue_job(repo_id, repository, spec)
+    }
+
+    pub fn unstage_paths(&self, repo_id: &str, paths: &[String]) -> Result<JobId> {
+        let repository = self.repository(repo_id)?;
+        let has_head = !gix::open(&repository.path)
+            .map_err(BackendError::git)?
+            .head()
+            .map_err(BackendError::git)?
+            .is_unborn();
+        let spec =
+            crate::repo::commit_ops::unstage_paths(repository.path.clone(), paths, has_head)?;
+        self.enqueue_job(repo_id, repository, spec)
+    }
+
+    pub fn unstage_all(&self, repo_id: &str) -> Result<JobId> {
+        let repository = self.repository(repo_id)?;
+        let has_head = !gix::open(&repository.path)
+            .map_err(BackendError::git)?
+            .head()
+            .map_err(BackendError::git)?
+            .is_unborn();
+        let spec = crate::repo::commit_ops::unstage_all(repository.path.clone(), has_head);
+        self.enqueue_job(repo_id, repository, spec)
+    }
+
+    pub fn commit(
+        &self,
+        repo_id: &str,
+        summary: &str,
+        description: &str,
+        amend: bool,
+        allow_amend_pushed: bool,
+    ) -> Result<JobId> {
+        let repository = self.repository(repo_id)?;
+        let state = repository
+            .state
+            .read()
+            .map_err(|_| BackendError::new("internal_error", "Repository state unavailable"))?;
+        let current_branch = state
+            .refs
+            .iter()
+            .find(|reference| reference.is_head && reference.kind == "local");
+        let amend_pushed = if amend && !allow_amend_pushed {
+            state
+                .refs
+                .iter()
+                .find(|reference| reference.is_head && reference.kind == "local")
+                .and_then(|branch| branch.upstream.as_ref())
+                .and_then(|upstream| {
+                    state
+                        .refs
+                        .iter()
+                        .find(|reference| reference.name == *upstream)
+                        .map(|reference| reference.full_name.clone())
+                })
+        } else {
+            None
+        };
+        let branch_name = current_branch.map(|branch| branch.name.clone());
+        drop(state);
+        let mut spec = crate::repo::commit_ops::commit(
+            repository.path.clone(),
+            summary,
+            description,
+            amend,
+            amend_pushed,
+        )?;
+        if let Some(branch) = branch_name {
+            spec.success_message = format!("on {branch}");
+            spec.action_on_success = Some(crate::model::JobAction {
+                kind: "push".into(),
+                label: "Push".into(),
+                payload: serde_json::json!({ "branch": branch }),
+            });
+        } else {
+            spec.success_message = "changes".into();
+        }
+        spec.additional_steps
+            .push(vec!["rev-parse".into(), "--short".into(), "HEAD".into()]);
+        self.enqueue_job(repo_id, repository, spec)
+    }
+
     pub fn stash_apply(&self, repo_id: &str, index: usize) -> Result<JobId> {
         let repository = self.repository(repo_id)?;
         let spec = crate::repo::history_ops::stash_apply(repository.path.clone(), index);
@@ -532,6 +646,17 @@ impl Backend {
                             message: error.message,
                         }),
                     }
+                    match repository.refresh_worktree_status() {
+                        Ok(Some(generation)) => event_sink.worktree_changed(WorktreeChanged {
+                            repo_id: event_repo_id.clone(),
+                            generation,
+                        }),
+                        Ok(None) => {}
+                        Err(error) => event_sink.repo_error(RepoError {
+                            repo_id: event_repo_id.clone(),
+                            message: error.message,
+                        }),
+                    }
                 }
             })
             .map_err(|error| BackendError::new("internal_error", error))
@@ -586,6 +711,21 @@ impl Backend {
             conflicted_files: state.conflicted_files,
             generation: state.generation,
         })
+    }
+
+    pub fn get_worktree_status(&self, repo_id: &str) -> Result<WorktreeStatus> {
+        let repository = self.repository(repo_id)?;
+        if let Some(generation) = repository.refresh_worktree_status()? {
+            self.event_sink.worktree_changed(WorktreeChanged {
+                repo_id: repo_id.to_owned(),
+                generation,
+            });
+        }
+        repository
+            .state
+            .read()
+            .map(|state| state.worktree_status.clone())
+            .map_err(|_| BackendError::new("internal_error", "Repository state unavailable"))
     }
 
     pub fn get_graph_page(&self, repo_id: &str, offset: usize, limit: usize) -> Result<GraphPage> {
@@ -735,6 +875,32 @@ impl Backend {
 }
 
 impl Repository {
+    fn refresh_worktree_status(&self) -> Result<Option<u64>> {
+        if self.closed.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let _refresh = self
+            .refresh_lock
+            .lock()
+            .map_err(|_| BackendError::new("internal_error", "Repository refresh unavailable"))?;
+        if self.closed.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let mut status = read_worktree_status(&self.path)?;
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| BackendError::new("internal_error", "Repository state unavailable"))?;
+        let previous = &state.worktree_status;
+        if previous.fingerprint == status.fingerprint && previous.truncated == status.truncated {
+            return Ok(None);
+        }
+        status.generation = previous.generation.saturating_add(1);
+        let generation = status.generation;
+        state.worktree_status = status;
+        Ok(Some(generation))
+    }
+
     fn snapshot(&self) -> Result<(Arc<Snapshot>, u64)> {
         loop {
             let (refs, generation, snapshot) = {
@@ -1473,6 +1639,22 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).trim().to_owned()
     }
 
+    #[test]
+    fn graph_paging_never_recomputes_worktree_status() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("repo");
+        fs::create_dir(&path).unwrap();
+        git(&path, &["init", "-b", "main"]);
+        let backend = Backend::default();
+        let opened = backend.open_repo(path.to_string_lossy().into()).unwrap();
+        crate::repo::worktree::reset_status_read_count();
+
+        backend.get_graph_page(&opened.repo_id, 0, 20).unwrap();
+        assert_eq!(crate::repo::worktree::status_read_count(), 0);
+
+        backend.close_repo(&opened.repo_id).unwrap();
+    }
+
     fn commit_tree(path: &Path, tree: &str, parent: &str, message: &str) -> String {
         git(path, &["commit-tree", tree, "-p", parent, "-m", message])
     }
@@ -1659,6 +1841,7 @@ mod tests {
                 ref_fingerprint: RefFingerprint(Vec::new()),
                 operation: None,
                 conflicted_files: 0,
+                worktree_status: WorktreeStatus::default(),
                 snapshot: Some(Arc::new(snapshot)),
                 generation: 0,
             }),
@@ -1847,6 +2030,7 @@ mod tests {
                 ref_fingerprint,
                 operation: operation.0,
                 conflicted_files: operation.1,
+                worktree_status: WorktreeStatus::default(),
                 stashes: Vec::new(),
                 stash_signature: None,
                 snapshot: None,
@@ -2013,6 +2197,7 @@ mod tests {
                 ref_fingerprint,
                 operation: operation.0,
                 conflicted_files: operation.1,
+                worktree_status: WorktreeStatus::default(),
                 stashes: Vec::new(),
                 stash_signature: None,
                 snapshot: None,

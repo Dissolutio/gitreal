@@ -6,7 +6,7 @@
   import VirtualList from "./VirtualList.svelte";
   import Snackbar from "./Snackbar.svelte";
   import ContextMenu from "./ContextMenu.svelte";
-  import { api, desktop, nativeError, onJobFinished, onJobStarted, onOpenPath, onRepoChanged, onRepoError, onUpdateError, onUpdateFound, onUpdateProgress, onWindowVisibility, type CommitDetail, type GraphRow, type KnownRepo, type NativeError, type OperationInfo, type RefInfo, type Repository, type StashInfo } from "./lib/api";
+  import { api, desktop, nativeError, onJobFinished, onJobStarted, onOpenPath, onRepoChanged, onRepoError, onUpdateError, onUpdateFound, onUpdateProgress, onWindowVisibility, onWorktreeChanged, type CommitDetail, type FileChange, type GraphRow, type KnownRepo, type NativeError, type OperationInfo, type RefInfo, type Repository, type StashInfo, type WorktreeStatus } from "./lib/api";
   import { closeTab, createTab, cycleTabs, MAX_TABS, openTab, restoreTabs, type RepoTab } from "./lib/tabs";
   import { PageCache, PAGE_SIZE, ROW_HEIGHT, pageOffsets, visibleRange } from "./lib/virtual";
   import { formatAheadBehind, formatOperationBanner, operationBannerActions } from "./lib/status";
@@ -16,9 +16,11 @@
   import { validateBranchName } from "./lib/refnames";
   import { formatRelativeDate, indexStashes, placeVisibleStashes } from "./lib/stashes";
   import { updateStore, type UpdateSnackbarEntry } from "./lib/update";
+  import { canCommit, hasWorktreeChanges, selectFile, selectedPaths, sortedFiles, summaryTone, worktreeFileCount } from "./lib/worktree";
 
-  type MenuTarget = { kind: "ref"; ref: RefInfo } | { kind: "commit"; oid: string } | { kind: "stash"; stash: StashInfo };
+  type MenuTarget = { kind: "ref"; ref: RefInfo } | { kind: "commit"; oid: string } | { kind: "stash"; stash: StashInfo } | { kind: "worktree"; file: FileChange; staged: boolean };
   type PromptState = { kind: "create" | "rename"; x: number; y: number; ref?: RefInfo; oid: string; name: string; checkout: boolean; message: string };
+  const WIP_SELECTION = "__worktree__";
 
   let tabs = $state<RepoTab[]>([]);
   let activePath = $state<string | null>(null);
@@ -27,6 +29,11 @@
   let repository = $state<Repository | null>(null);
   let refs = $state<RefInfo[]>([]);
   let stashes = $state<StashInfo[]>([]);
+  let worktreeStatus = $state<WorktreeStatus | null>(null);
+  let draftSummary = $state("");
+  let draftDescription = $state("");
+  let amend = $state(false);
+  let selectedWorktreeFiles = $state<string[]>([]);
   let operation = $state<OperationInfo | null>(null);
   let conflictedFiles = $state(0);
   let filter = $state("");
@@ -75,9 +82,26 @@
   ));
   const activeRepoMutationsDisabled = $derived(activeRepoRunning || operation !== null);
   const currentBranch = $derived(refs.find(ref => ref.kind === "local" && ref.is_head)?.name ?? null);
+  const wipSelected = $derived(selected === WIP_SELECTION);
+  const changedFileCount = $derived(worktreeFileCount(worktreeStatus));
+  const summaryCounterTone = $derived(summaryTone(draftSummary.length));
+  const commitEnabled = $derived(canCommit(worktreeStatus, draftSummary));
+  const unstagedFiles = $derived(sortedFiles([
+    ...(worktreeStatus?.unstaged ?? []),
+    ...(worktreeStatus?.untracked ?? []),
+    ...(worktreeStatus?.conflicted ?? []),
+  ]));
+  const stagedFiles = $derived(sortedFiles(worktreeStatus?.staged ?? []));
   const contextItems = $derived.by(() => {
     if (!contextMenu) return [];
     if (contextMenu.target.kind === "stash") return stashMenuItems(activeRepoRunning, operation !== null);
+    if (contextMenu.target.kind === "worktree") {
+      return [
+        { id: contextMenu.target.staged ? "unstage-file" : "stage-file", label: contextMenu.target.staged ? "Unstage" : "Stage", disabled: activeRepoMutationsDisabled },
+        { id: "copy-path", label: "Copy path" },
+        { id: "open-file-in-vscode", label: "Open in VSCode" },
+      ];
+    }
     if (contextMenu.target.kind === "commit") {
       return commitMenuItems({
         running: activeRepoRunning,
@@ -104,6 +128,7 @@
     ? operationBannerActions(operation, conflictedFiles, activeRepoRunning)
     : null);
   let persistTimer: ReturnType<typeof setTimeout> | undefined;
+  let worktreeRefreshTimer: ReturnType<typeof setTimeout> | undefined;
   const range = $derived(visibleRange(scrollTop, viewportHeight, total));
   const visibleRows = $derived.by(() => {
     void revision;
@@ -134,6 +159,10 @@
     tab.selected = selected;
     tab.detail = detail;
     tab.stashes = stashes;
+    tab.worktreeStatus = worktreeStatus;
+    tab.draftSummary = draftSummary;
+    tab.draftDescription = draftDescription;
+    tab.amend = amend;
     tab.total = total;
     tab.initialLoaded = initialLoaded;
     tab.maxLane = maxLane;
@@ -152,6 +181,11 @@
     repository = tab?.repository ?? null;
     refs = tab?.refs ?? [];
     stashes = tab?.stashes ?? [];
+    worktreeStatus = tab?.worktreeStatus ?? tab?.repository?.worktree_status ?? null;
+    draftSummary = tab?.draftSummary ?? "";
+    draftDescription = tab?.draftDescription ?? "";
+    amend = tab?.amend ?? false;
+    selectedWorktreeFiles = [];
     const status = tab ? operationStates.get(tab.path) : undefined;
     operation = status?.operation ?? null;
     conflictedFiles = status?.conflictedFiles ?? 0;
@@ -207,6 +241,7 @@
     opening = openingTabs.has(tab.tabId);
     schedulePersist();
     if (!tab.repository && !tab.error) void openRepositoryTab(tab, false);
+    else scheduleWorktreeRefresh();
   }
 
   async function openRepositoryTab(tab: RepoTab, remember: boolean) {
@@ -241,6 +276,7 @@
       tab.error = null;
       if (activePath === oldPath) activePath = next.path;
       const loaded = await api.refs(next.repo_id);
+      tab.worktreeStatus = next.worktree_status;
       if (disposed || !tabs.some(item => item.tabId === tab.tabId)) {
         void api.close(next.repo_id).catch(() => {});
         opened = null;
@@ -256,6 +292,7 @@
         conflictedFiles: loaded.conflicted_files,
       });
       if (activePath === next.path) activateView(tab);
+      if (activePath === next.path) scheduleWorktreeRefresh();
       if (remember) {
         try {
           await api.addKnownRepo(next.path);
@@ -410,7 +447,7 @@
     const repoId = repository.repo_id;
     const token = ++selectionEpoch;
     const repoToken = epoch;
-    selected = commitId; detail = null; detailError = null; detailLoading = true;
+    selected = commitId; selectedWorktreeFiles = []; detail = null; detailError = null; detailLoading = true;
     saveActiveTab();
     try {
       const result = await api.detail(repoId, commitId);
@@ -420,6 +457,121 @@
     } finally {
       if (token === selectionEpoch && repoToken === epoch) detailLoading = false;
     }
+  }
+
+  async function refreshWorktree() {
+    if (!repository) return;
+    const repoId = repository.repo_id;
+    try {
+      const status = await api.worktreeStatus(repoId);
+      if (repository?.repo_id !== repoId) return;
+      worktreeStatus = status;
+      const tab = tabs.find(item => item.repository?.repo_id === repoId);
+      if (tab) tab.worktreeStatus = status;
+      if (!hasWorktreeChanges(status) && selected === WIP_SELECTION) {
+        selected = null;
+        selectedWorktreeFiles = [];
+      }
+      saveActiveTab();
+    } catch (failure) {
+      if (repository?.repo_id === repoId) error = nativeError(failure);
+    }
+  }
+
+  function scheduleWorktreeRefresh() {
+    clearTimeout(worktreeRefreshTimer);
+    worktreeRefreshTimer = setTimeout(() => { void refreshWorktree(); }, 150);
+  }
+
+  function selectWip() {
+    if (!repository) return;
+    selected = WIP_SELECTION;
+    selectedWorktreeFiles = [];
+    detail = null;
+    detailError = null;
+    detailLoading = false;
+    saveActiveTab();
+    void refreshWorktree();
+  }
+
+  async function runStage(paths?: string[]) {
+    if (!worktreeStatus) return;
+    const selectedPaths = paths ?? [
+      ...worktreeStatus.unstaged.map(file => file.path),
+      ...worktreeStatus.untracked.map(file => file.path),
+      ...worktreeStatus.conflicted.map(file => file.path),
+    ];
+    if (!selectedPaths.length) return;
+    await enqueueCustom("stage", `Stage ${selectedPaths.length} file${selectedPaths.length === 1 ? "" : "s"}`, repoId =>
+      api.stagePaths(repoId, selectedPaths),
+    );
+  }
+
+  async function runStageAll() {
+    await enqueueCustom("stage", "Stage all changes", repoId => api.stageAll(repoId));
+  }
+
+  async function runUnstage(paths?: string[]) {
+    const selectedPaths = paths ?? worktreeStatus?.staged.map(file => file.path) ?? [];
+    if (!selectedPaths.length) return;
+    await enqueueCustom("unstage", `Unstage ${selectedPaths.length} file${selectedPaths.length === 1 ? "" : "s"}`, repoId =>
+      api.unstagePaths(repoId, selectedPaths),
+    );
+  }
+
+  async function runUnstageAll() {
+    await enqueueCustom("unstage", "Unstage all changes", repoId => api.unstageAll(repoId));
+  }
+
+  function chooseWorktreeFile(files: FileChange[], event: MouseEvent, file: FileChange) {
+    selectedWorktreeFiles = selectFile(
+      files,
+      selectedWorktreeFiles,
+      file.path,
+      event.shiftKey,
+      event.ctrlKey || event.metaKey,
+    );
+    saveActiveTab();
+  }
+
+  async function toggleAmend(enabled: boolean) {
+    amend = enabled;
+    if (!enabled) {
+      saveActiveTab();
+      return;
+    }
+    const headOid = refs.find(ref => ref.is_head && ref.target)?.target;
+    if (!headOid) {
+      amend = false;
+      return;
+    }
+    try {
+      const detail = await api.detail(repository!.repo_id, headOid);
+      const [summary, ...description] = detail.message.trimEnd().split("\n");
+      draftSummary = summary;
+      draftDescription = description.join("\n").replace(/^\n/, "");
+      saveActiveTab();
+    } catch (failure) {
+      amend = false;
+      showOperationError(repository!, "commit", "Amend previous commit", failure);
+    }
+  }
+
+  async function runCommit() {
+    if (!repository || !commitEnabled) return;
+    const branch = refs.find(ref => ref.kind === "local" && ref.is_head);
+    let allowAmendPushed = false;
+    if (amend && branch?.upstream && branch.ahead === 0) {
+      if (!window.confirm(
+        `This commit is already on ${safeRefLabel(branch.upstream)}; amending will require a force push. Continue?`,
+      )) return;
+      allowAmendPushed = true;
+    }
+    const summary = draftSummary;
+    const description = draftDescription;
+    await enqueueCustom("commit", "Commit staged changes", repoId =>
+      api.commit(repoId, summary, description, amend, allowAmendPushed),
+    );
   }
 
   async function refreshRepository(event: { repo_id: string; generation: number }) {
@@ -447,7 +599,7 @@
     error = null;
     detail = null;
     detailError = null;
-    detailLoading = !!selectedAtRefresh;
+    detailLoading = !!selectedAtRefresh && selectedAtRefresh !== WIP_SELECTION;
     try {
       const result = await api.refs(repoId);
       if (token !== epoch || repository?.repo_id !== repoId) return;
@@ -468,7 +620,7 @@
       }
       saveActiveTab();
       opening = false;
-      if (selectedAtRefresh && selectionToken === selectionEpoch) {
+      if (selectedAtRefresh && selectedAtRefresh !== WIP_SELECTION && selectionToken === selectionEpoch) {
         try {
           const nextDetail = await api.detail(repoId, selectedAtRefresh);
           if (token !== epoch || selectionToken !== selectionEpoch) return;
@@ -524,6 +676,7 @@
       detailLoading = false;
     }
     if (!wasVisible && visible) {
+      scheduleWorktreeRefresh();
       if (activeTab?.repository && activeTab.staleGeneration > eventGeneration) {
         void refreshRepository({
           repo_id: activeTab.repository.repo_id,
@@ -536,6 +689,11 @@
   }
 
   function handleShortcut(event: KeyboardEvent) {
+    if ((event.ctrlKey || event.metaKey) && event.key === "Enter" && wipSelected) {
+      event.preventDefault();
+      void runCommit();
+      return;
+    }
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "q") {
       event.preventDefault();
       void api.quit().catch(failure => { error = nativeError(failure); });
@@ -558,6 +716,20 @@
     runningJobs.delete(event.job_id);
     runningRepoIds = [...new Set(runningJobs.values())];
     snackbarStore.jobFinished(event, repositoryNameFor(event.repo_id));
+    if (event.kind === "commit" && event.ok) {
+      const tab = tabs.find(item => item.repository?.repo_id === event.repo_id);
+      if (tab) {
+        tab.draftSummary = "";
+        tab.draftDescription = "";
+        tab.amend = false;
+        if (tab.path === activePath) {
+          draftSummary = "";
+          draftDescription = "";
+          amend = false;
+          saveActiveTab();
+        }
+      }
+    }
   }
 
   function showOperationError(repo: Repository, kind: string, label: string, failure: unknown) {
@@ -751,6 +923,15 @@
     const target = contextMenu?.target;
     contextMenu = null;
     if (!target || !repository) return;
+    if (target.kind === "worktree") {
+      if (id === "stage-file") await runStage([target.file.path]);
+      else if (id === "unstage-file") await runUnstage([target.file.path]);
+      else if (id === "copy-path") await navigator.clipboard.writeText(target.file.path).catch(() => {});
+      else if (id === "open-file-in-vscode") await api.openInVSCode(repository.repo_id).catch(failure => {
+        showOperationError(repository!, "open-in-vscode", "Open in VSCode", failure);
+      });
+      return;
+    }
     if (target.kind === "stash") {
       const { stash } = target;
       if (id === "stash-apply") {
@@ -849,7 +1030,12 @@
   }
 
   async function followUpAction(action: JobAction, entry: SnackbarEntry) {
-    if (action.kind === "open_in_vscode") {
+    if (action.kind === "push") {
+      const branch = String(action.payload?.branch ?? "");
+      if (branch && repository?.repo_id === entry.repo_id) {
+        await enqueueCustom("push", `Push ${safeRefLabel(branch)}`, repoId => api.push(repoId, branch));
+      }
+    } else if (action.kind === "open_in_vscode") {
       try {
         await api.openInVSCode(entry.repo_id);
       } catch (failure) {
@@ -936,9 +1122,12 @@
     let unlistenError: (() => void) | undefined;
     let unlistenOpenPath: (() => void) | undefined;
     let unlistenVisibility: (() => void) | undefined;
+    let unlistenWorktree: (() => void) | undefined;
     windowVisible = document.visibilityState === "visible";
     const onDocumentVisibility = () => updateWindowVisibility(document.visibilityState === "visible");
+    const onWindowFocus = () => scheduleWorktreeRefresh();
     document.addEventListener("visibilitychange", onDocumentVisibility);
+    window.addEventListener("focus", onWindowFocus);
     let unlistenJobStarted: (() => void) | undefined;
     let unlistenJobFinished: (() => void) | undefined;
     let unlistenUpdateFound: (() => void) | undefined;
@@ -947,6 +1136,14 @@
     void onRepoChanged(event => { void refreshRepository(event); }).then(unlisten => {
       if (disposed) unlisten();
       else unlistenChanged = unlisten;
+    }).catch(failure => { error = nativeError(failure); });
+    void onWorktreeChanged(event => {
+      const owner = tabs.find(tab => tab.repository?.repo_id === event.repo_id);
+      if (owner && owner.repository?.repo_id === repository?.repo_id && windowVisible) scheduleWorktreeRefresh();
+      else if (owner) owner.worktreeStatus = null;
+    }).then(unlisten => {
+      if (disposed) unlisten();
+      else unlistenWorktree = unlisten;
     }).catch(failure => { error = nativeError(failure); });
     void onJobStarted(startJob).then(unlisten => {
       if (disposed) unlisten();
@@ -999,7 +1196,10 @@
       unlistenError?.();
       unlistenOpenPath?.();
       unlistenVisibility?.();
+      unlistenWorktree?.();
       document.removeEventListener("visibilitychange", onDocumentVisibility);
+      window.removeEventListener("focus", onWindowFocus);
+      clearTimeout(worktreeRefreshTimer);
       unlistenJobStarted?.();
       unlistenJobFinished?.();
       unlistenUpdateFound?.();
@@ -1151,6 +1351,14 @@
       <div class="error-banner" role="alert"><div><strong>{error.code}</strong> {safeRefLabel(error.message)}</div><button onclick={retry}>Retry pages</button>{#if repository}<button onclick={reopenActiveTab}>Reopen</button>{/if}<button aria-label="Dismiss error" onclick={() => { error = null; }}>×</button></div>
     {/if}
     <div class="column-clip"><div class="column-head" style:--graph-width="{graphWidth}px" style:transform="translateX(-{scrollLeft}px)"><span>REFERENCES</span><span>GRAPH</span><span>COMMIT MESSAGE</span><span>AUTHOR</span><span>DATE</span></div></div>
+    {#if repository && hasWorktreeChanges(worktreeStatus)}
+      <button class="wip-row" class:selected={wipSelected} style:--graph-width="{graphWidth}px" onclick={selectWip}>
+        <span class="row-refs"><span class="wip-label">// WIP</span></span>
+        <span class="wip-graph" aria-hidden="true"><span class="wip-dots"></span>●</span>
+        <span class="commit-message">✎ &nbsp; {changedFileCount} changed file{changedFileCount === 1 ? "" : "s"}</span>
+        <span class="commit-author"></span><span class="commit-date"></span>
+      </button>
+    {/if}
     <div class="history-scroll" bind:this={viewport} onscroll={onScroll} aria-label="Commit history" aria-busy={opening || (!!repository && !initialLoaded)}>
       {#if !repository}
         <div class="empty-state">
@@ -1206,8 +1414,70 @@
   </main>
 
   <aside class="details" aria-label="Commit details" aria-busy={detailLoading}>
-    <div class="details-heading"><span>COMMIT DETAILS</span><span class="detail-symbol">⌘</span></div>
-    {#if detailLoading}
+    <div class="details-heading"><span>{wipSelected ? "WORKTREE CHANGES" : "COMMIT DETAILS"}</span><span class="detail-symbol">{wipSelected ? "✎" : "⌘"}</span></div>
+    {#if wipSelected}
+      <div class="worktree-panel">
+        <section>
+          <div class="paths-heading"><span class="eyebrow">Unstaged Files ({unstagedFiles.length})</span><button disabled={!unstagedFiles.length || activeRepoMutationsDisabled} onclick={() => runStageAll()}>Stage All Changes</button></div>
+          {#if unstagedFiles.length}
+            <VirtualList items={unstagedFiles} maxHeight={220}>
+              {#snippet children(file)}
+                <div class="worktree-file" class:selected={selectedWorktreeFiles.includes(file.path)}
+                  role="button" tabindex="0"
+                  title={safeRefLabel(file.path)}
+                  onclick={(event) => chooseWorktreeFile(unstagedFiles, event, file)}
+                  ondblclick={(event) => { event.preventDefault(); void runStage([file.path]); }}
+                  onkeydown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      void runStage(selectedPaths(unstagedFiles, selectedWorktreeFiles.length ? selectedWorktreeFiles : [file.path]));
+                    }
+                  }}
+                  oncontextmenu={(event) => showContextMenu(event, { kind: "worktree", file, staged: false })}>
+                  <span class="file-status" class:added={file.kind === "added" || file.kind === "untracked"} class:deleted={file.kind === "deleted"}>{file.kind.slice(0, 1).toUpperCase()}</span>
+                  <span class="truncate">{safeRefLabel(file.path)}</span><button class="file-action" disabled={activeRepoMutationsDisabled} onclick={(event) => { event.stopPropagation(); void runStage([file.path]); }}>Stage</button>
+                </div>
+              {/snippet}
+            </VirtualList>
+          {:else}<p class="root-label">No unstaged files</p>{/if}
+        </section>
+        <section>
+          <div class="paths-heading"><span class="eyebrow">Staged Files ({stagedFiles.length})</span><button disabled={!stagedFiles.length || activeRepoMutationsDisabled} onclick={() => runUnstageAll()}>Unstage All</button></div>
+          {#if stagedFiles.length}
+            <VirtualList items={stagedFiles} maxHeight={220}>
+              {#snippet children(file)}
+                <div class="worktree-file" class:selected={selectedWorktreeFiles.includes(file.path)}
+                  role="button" tabindex="0"
+                  title={safeRefLabel(file.path)}
+                  onclick={(event) => chooseWorktreeFile(stagedFiles, event, file)}
+                  ondblclick={(event) => { event.preventDefault(); void runUnstage([file.path]); }}
+                  onkeydown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      void runUnstage(selectedPaths(stagedFiles, selectedWorktreeFiles.length ? selectedWorktreeFiles : [file.path]));
+                    }
+                  }}
+                  oncontextmenu={(event) => showContextMenu(event, { kind: "worktree", file, staged: true })}>
+                  <span class="file-status" class:added={file.kind === "added"} class:deleted={file.kind === "deleted"}>{file.kind.slice(0, 1).toUpperCase()}</span>
+                  <span class="truncate">{safeRefLabel(file.path)}</span><button class="file-action" disabled={activeRepoMutationsDisabled} onclick={(event) => { event.stopPropagation(); void runUnstage([file.path]); }}>Unstage</button>
+                </div>
+              {/snippet}
+            </VirtualList>
+          {:else}<p class="root-label">No staged files</p>{/if}
+        </section>
+        {#if worktreeStatus?.truncated}<p class="worktree-truncated">Showing the first 5,000 changed entries.</p>{/if}
+        <section class="commit-form">
+          <label class="eyebrow" for="commit-summary">Commit summary</label>
+          <input id="commit-summary" class:warning={summaryCounterTone === "warning"} class:error={summaryCounterTone === "error"}
+            bind:value={draftSummary} oninput={saveActiveTab} placeholder="Commit summary" />
+          <small class:warning={summaryCounterTone === "warning"} class:error={summaryCounterTone === "error"}>{draftSummary.length}/72</small>
+          <label class="eyebrow" for="commit-description">Description</label>
+          <textarea id="commit-description" bind:value={draftDescription} oninput={saveActiveTab} placeholder="Description (optional)"></textarea>
+          <label class="amend-option"><input type="checkbox" checked={amend} disabled={!refs.some(ref => ref.is_head && ref.target) || activeRepoMutationsDisabled} onchange={(event) => { void toggleAmend(event.currentTarget.checked); }} /> Amend previous commit</label>
+          <button class="commit-button" disabled={!commitEnabled || activeRepoMutationsDisabled} onclick={() => runCommit()}>Commit {stagedFiles.length} file{stagedFiles.length === 1 ? "" : "s"}</button>
+        </section>
+      </div>
+    {:else if detailLoading}
       <div class="details-empty"><span class="details-icon">◷</span><h3>Loading commit…</h3></div>
     {:else if detailError}
       <div class="detail-error" role="alert"><strong>{detailError.code}</strong><p>{safeRefLabel(detailError.message)}</p><button onclick={() => { if (selected) void selectCommit(selected); }}>Try again</button></div>

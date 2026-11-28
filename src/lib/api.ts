@@ -3,7 +3,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { JobFinishedEvent, JobStartedEvent } from "./snackbar";
 import type { UpdateInfo, UpdateProgress } from "./update";
 
-export interface Repository { repo_id: string; path: string; name: string }
+export interface Repository { repo_id: string; path: string; name: string; worktree_status: WorktreeStatus }
 export interface KnownRepo { path: string; name: string; last_opened: number }
 export interface PersistedTab { path: string }
 export interface AppConfig {
@@ -47,7 +47,21 @@ export interface RefsResponse {
   conflicted_files: number;
   generation: number;
 }
+export interface FileChange {
+  path: string;
+  old_path: string | null;
+  kind: "added" | "modified" | "deleted" | "renamed" | "typechange" | "untracked" | "conflicted";
+}
+export interface WorktreeStatus {
+  staged: FileChange[];
+  unstaged: FileChange[];
+  untracked: FileChange[];
+  conflicted: FileChange[];
+  truncated: boolean;
+  generation: number;
+}
 export interface RepoChangedEvent { repo_id: string; generation: number }
+export interface WorktreeChangedEvent { repo_id: string; generation: number }
 export interface RepoErrorEvent { repo_id: string; message: string }
 export interface GraphEdge { from_lane: number; to_lane: number; parent_id: string }
 export interface GraphRow {
@@ -94,6 +108,9 @@ export const desktop = isTauri();
 export function onRepoChanged(handler: (event: RepoChangedEvent) => void): Promise<UnlistenFn> {
   return desktop ? listen<RepoChangedEvent>("repo-changed", event => handler(event.payload)) : Promise.resolve(() => {});
 }
+export function onWorktreeChanged(handler: (event: WorktreeChangedEvent) => void): Promise<UnlistenFn> {
+  return desktop ? listen<WorktreeChangedEvent>("worktree-changed", event => handler(event.payload)) : Promise.resolve(() => {});
+}
 export function onRepoError(handler: (event: RepoErrorEvent) => void): Promise<UnlistenFn> {
   return desktop ? listen<RepoErrorEvent>("repo-error", event => handler(event.payload)) : Promise.resolve(() => {});
 }
@@ -122,6 +139,21 @@ export const api = {
   open: (path: string) => call<Repository>("open_repo", { path }),
   close: (repoId: string) => call<null>("close_repo", { repoId }),
   refs: (repoId: string) => call<RefsResponse>("get_refs", { repoId }),
+  worktreeStatus: (repoId: string) => call<WorktreeStatus>("get_worktree_status", { repoId }),
+  stagePaths: (repoId: string, paths: string[]) =>
+    call<string>("stage_paths", { repoId, paths }),
+  stageAll: (repoId: string) => call<string>("stage_all", { repoId }),
+  unstagePaths: (repoId: string, paths: string[]) =>
+    call<string>("unstage_paths", { repoId, paths }),
+  unstageAll: (repoId: string) => call<string>("unstage_all", { repoId }),
+  commit: (repoId: string, summary: string, description: string, amend: boolean, allowAmendPushed: boolean) =>
+    call<string>("commit_changes", {
+      repoId,
+      summary,
+      description,
+      amend,
+      allowAmendPushed,
+    }),
   page: (repoId: string, offset: number, limit: number) =>
     call<GraphPage>("get_graph_page", { repoId, offset, limit }),
   detail: (repoId: string, commitId: string) =>

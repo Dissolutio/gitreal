@@ -367,9 +367,11 @@ mod tests {
         permissions.set_mode(0o755);
         std::fs::set_permissions(&code, permissions).unwrap();
 
+        // Other tests run in parallel in this process and may briefly leave their own
+        // exited-but-not-yet-waited children; only zombies of the fake `code` count.
         assert!(
             zombie_child_pids().is_empty(),
-            "test started with zombie children"
+            "test started with zombie code launchers"
         );
         for _ in 0..5 {
             open_in_vscode_with_search_path(&marker, Some(bin.as_os_str())).unwrap();
@@ -398,6 +400,7 @@ mod tests {
         );
     }
 
+    /// Zombie children of this test process whose command name is `code`.
     #[cfg(target_os = "linux")]
     fn zombie_child_pids() -> Vec<u32> {
         let mut zombies = Vec::new();
@@ -413,9 +416,12 @@ mod tests {
                 let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
                     continue;
                 };
-                let Some((_, fields)) = stat.rsplit_once(") ") else {
+                let Some((head, fields)) = stat.rsplit_once(") ") else {
                     continue;
                 };
+                if head.rsplit_once(" (").map(|(_, name)| name) != Some("code") {
+                    continue;
+                }
                 let mut fields = fields.split_whitespace();
                 let state = fields.next();
                 let parent_pid = fields.next().and_then(|pid| pid.parse::<u32>().ok());

@@ -101,6 +101,10 @@ generated public key into `plugins.updater.pubkey` in `src-tauri/tauri.conf.json
 push to `main` then publishes a signed release with an AppImage, `.deb`, and
 updater metadata.
 
+Pull requests that change release or bundle configuration run the Bundle check.
+It builds the AppImage and `.deb` with a temporary signing key and uploads both
+artifacts for three days.
+
 ### Checks
 
 ```sh

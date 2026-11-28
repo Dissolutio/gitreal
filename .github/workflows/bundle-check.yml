@@ -107,15 +107,15 @@ jobs:
           echo "::group::.deb contents"
           printf '%s\n' "$deb_contents"
           echo "::endgroup::"
-          if ! grep -Eq '[[:space:]]\./usr/bin/gitreal([[:space:]]|$)' <<<"$deb_contents"; then
+          if ! grep -Eq '[[:space:]](\./)?usr/bin/gitreal([[:space:]]|$)' <<<"$deb_contents"; then
             echo "::error::.deb is missing usr/bin/gitreal."
             exit 1
           fi
-          if ! grep -Eq '[[:space:]]\./usr/share/applications/[^[:space:]]+\.desktop([[:space:]]|$)' <<<"$deb_contents"; then
+          if ! grep -Eq '[[:space:]](\./)?usr/share/applications/[^[:space:]]+\.desktop([[:space:]]|$)' <<<"$deb_contents"; then
             echo "::error::.deb is missing usr/share/applications/*.desktop."
             exit 1
           fi
-          if ! grep -Eq '[[:space:]]\./usr/share/(icons|pixmaps)/' <<<"$deb_contents"; then
+          if ! grep -Eq '[[:space:]](\./)?usr/share/(icons|pixmaps)/' <<<"$deb_contents"; then
             echo "::error::.deb is missing application icons."
             exit 1
           fi

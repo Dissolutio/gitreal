@@ -1,5 +1,5 @@
 use gitreal_lib::{
-    model::{JobFinished, JobStarted, RefsResponse, RepoChanged, RepoError},
+    model::{FileDiffSource, JobFinished, JobStarted, RefsResponse, RepoChanged, RepoError},
     repo::reader::{Backend, EventSink},
 };
 use std::{
@@ -417,6 +417,62 @@ fn refs_paging_details_and_live_refresh() {
     assert_eq!(
         backend.get_refs(&id).unwrap_err().code,
         "unknown_repository"
+    );
+}
+
+#[test]
+fn commit_file_diff_reads_old_path_for_renamed_content() {
+    let fixture = Fixture::new();
+    fixture.commit_file(
+        "old.txt",
+        "initial file",
+        "shared one\nshared two\nshared three\noriginal\n",
+    );
+    fs::rename(fixture.path.join("old.txt"), fixture.path.join("new.txt")).unwrap();
+    fs::write(
+        fixture.path.join("new.txt"),
+        "shared one\nshared two\nshared three\nupdated\n",
+    )
+    .unwrap();
+    git(&fixture.path, &["add", "-A"]);
+    git(&fixture.path, &["commit", "-m", "rename and modify"]);
+    let commit_id = git(&fixture.path, &["rev-parse", "HEAD"]);
+    let backend = Backend::default();
+    let repo_id = fixture.open(&backend);
+
+    let detail = backend.get_commit_detail(&repo_id, &commit_id).unwrap();
+    assert!(
+        detail
+            .changed_paths
+            .iter()
+            .any(|change| change.path == "new.txt" && change.status == "added")
+    );
+    assert!(
+        detail
+            .changed_paths
+            .iter()
+            .any(|change| change.path == "old.txt" && change.status == "deleted")
+    );
+    let diff = backend
+        .get_file_diff(
+            &repo_id,
+            FileDiffSource::Commit { oid: commit_id },
+            "new.txt",
+            Some("old.txt"),
+            false,
+        )
+        .unwrap();
+    assert!(
+        diff.lines
+            .iter()
+            .any(|line| line.kind == "removed" && line.text == "original"),
+        "diff lines: {:?}",
+        diff.lines
+    );
+    assert!(
+        diff.lines
+            .iter()
+            .any(|line| line.kind == "added" && line.text == "updated")
     );
 }
 

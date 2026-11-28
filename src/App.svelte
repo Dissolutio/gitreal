@@ -4,9 +4,10 @@
   import Tabs from "./Tabs.svelte";
   import GraphCanvas from "./GraphCanvas.svelte";
   import VirtualList from "./VirtualList.svelte";
+  import FileDiffView from "./FileDiffView.svelte";
   import Snackbar from "./Snackbar.svelte";
   import ContextMenu from "./ContextMenu.svelte";
-  import { api, desktop, nativeError, onJobFinished, onJobStarted, onOpenPath, onRepoChanged, onRepoError, onUpdateError, onUpdateFound, onUpdateProgress, onWindowVisibility, onWorktreeChanged, type CommitDetail, type FileChange, type GraphRow, type KnownRepo, type NativeError, type OperationInfo, type RefInfo, type Repository, type StashInfo, type WorktreeStatus } from "./lib/api";
+  import { api, desktop, nativeError, onJobFinished, onJobStarted, onOpenPath, onRepoChanged, onRepoError, onUpdateError, onUpdateFound, onUpdateProgress, onWindowVisibility, onWorktreeChanged, type CommitDetail, type FileChange, type FileDiff, type FileDiffSource, type GraphRow, type KnownRepo, type NativeError, type OperationInfo, type RefInfo, type Repository, type StashInfo, type WorktreeStatus } from "./lib/api";
   import { closeTab, createTab, cycleTabs, MAX_TABS, openTab, restoreTabs, type RepoTab } from "./lib/tabs";
   import { PageCache, PAGE_SIZE, ROW_HEIGHT, pageOffsets, visibleRange } from "./lib/virtual";
   import { formatAheadBehind, formatOperationBanner, operationBannerActions } from "./lib/status";
@@ -16,7 +17,7 @@
   import { validateBranchName } from "./lib/refnames";
   import { formatRelativeDate, indexStashes, placeVisibleStashes } from "./lib/stashes";
   import { updateStore, type UpdateSnackbarEntry } from "./lib/update";
-  import { canCommit, groupWorktreeFiles, hasWorktreeChanges, selectFile, selectedPaths, summaryTone, worktreeFileCount } from "./lib/worktree";
+  import { canCommit, groupWorktreeFiles, hasWorktreeChanges, selectFile, summaryTone, worktreeFileCount } from "./lib/worktree";
 
   type MenuTarget = { kind: "ref"; ref: RefInfo } | { kind: "commit"; oid: string } | { kind: "stash"; stash: StashInfo } | { kind: "worktree"; file: FileChange; staged: boolean };
   type PromptState = { kind: "create" | "rename"; x: number; y: number; ref?: RefInfo; oid: string; name: string; checkout: boolean; message: string };
@@ -54,6 +55,11 @@
   let selected = $state<string | null>(null);
   let detail = $state<CommitDetail | null>(null);
   let detailLoading = $state(false);
+  let fileDiff = $state<FileDiff | null>(null);
+  let fileDiffSource = $state<FileDiffSource | null>(null);
+  let fileDiffLoading = $state(false);
+  let fileDiffError = $state<string | null>(null);
+  let fileDiffRequest = 0;
   let total = $state(0);
   let maxLane = $state(0);
   let initialLoaded = $state(false);
@@ -176,6 +182,7 @@
   }
 
   function activateView(tab: RepoTab | undefined) {
+    closeFileDiff();
     amendRequest += 1;
     repository = tab?.repository ?? null;
     refs = tab?.refs ?? [];
@@ -443,6 +450,7 @@
 
   async function selectCommit(commitId: string) {
     if (!repository) return;
+    closeFileDiff();
     const repoId = repository.repo_id;
     const token = ++selectionEpoch;
     const repoToken = epoch;
@@ -484,6 +492,7 @@
 
   function selectWip() {
     if (!repository) return;
+    closeFileDiff();
     selected = WIP_SELECTION;
     selectedWorktreeFiles = [];
     detail = null;
@@ -531,6 +540,39 @@
       event.ctrlKey || event.metaKey,
     );
     saveActiveTab();
+  }
+
+  function closeFileDiff() {
+    fileDiffRequest++;
+    fileDiff = null;
+    fileDiffSource = null;
+    fileDiffLoading = false;
+    fileDiffError = null;
+  }
+
+  async function openFileDiff(
+    path: string,
+    source: FileDiffSource,
+    oldPath: string | null = null,
+    force = false,
+  ) {
+    if (!repository) return;
+    const repoId = repository.repo_id;
+    const request = ++fileDiffRequest;
+    fileDiff = null;
+    fileDiffSource = source;
+    fileDiffLoading = true;
+    fileDiffError = null;
+    try {
+      const result = await api.fileDiff(repoId, source, path, oldPath, force);
+      if (request === fileDiffRequest && repository?.repo_id === repoId) fileDiff = result;
+    } catch (failure) {
+      if (request === fileDiffRequest && repository?.repo_id === repoId) {
+        fileDiffError = nativeError(failure).message;
+      }
+    } finally {
+      if (request === fileDiffRequest && repository?.repo_id === repoId) fileDiffLoading = false;
+    }
   }
 
   async function toggleAmend(enabled: boolean) {
@@ -1230,7 +1272,7 @@
 <svelte:window onkeydown={handleShortcut} />
 <svelte:head><title>{repository ? `${repository.name} · Gitreal` : "Gitreal — Repository explorer"}</title></svelte:head>
 
-<div class="workspace">
+<div class="workspace" class:diff-open={fileDiffSource !== null}>
   <header class="topbar">
     <div class="brand"><span class="brand-mark">⑂</span> gitreal<span class="brand-caption">REPOSITORY EXPLORER</span></div>
     {#if activeRepoRunning}<div class="job-indicator"><span class="snackbar-spinner"></span> Git operation running</div>{/if}
@@ -1429,7 +1471,17 @@
   <aside class="details" aria-label="Commit details" aria-busy={detailLoading}>
     <div class="details-heading"><span>{wipSelected ? "WORKTREE CHANGES" : "COMMIT DETAILS"}</span><span class="detail-symbol">{wipSelected ? "✎" : "⌘"}</span></div>
     {#if wipSelected}
-      <div class="worktree-panel">
+      <div class="worktree-panel" class:showing-file-diff={fileDiffSource !== null && fileDiffSource.kind !== "commit"}>
+        {#if fileDiffSource !== null && fileDiffSource.kind !== "commit"}
+          <FileDiffView diff={fileDiff} loading={fileDiffLoading} error={fileDiffError}
+            onClose={closeFileDiff}
+            onShowAnyway={() => {
+              if (fileDiff && fileDiffSource && fileDiffSource.kind !== "commit") {
+                void openFileDiff(fileDiff.path, fileDiffSource, fileDiff.old_path, true);
+              }
+            }} />
+        {:else}
+          <div class="worktree-files">
         <section>
           <div class="paths-heading"><span class="eyebrow">Unstaged Files ({unstagedFiles.length})</span><button disabled={!unstagedFiles.length || activeRepoMutationsDisabled} onclick={() => runStageAll()}>Stage All Changes</button></div>
           {#if unstagedFiles.length}
@@ -1438,12 +1490,12 @@
                 <div class="worktree-file" class:selected={selectedWorktreeFiles.includes(file.path)}
                   role="button" tabindex="0"
                   title={safeRefLabel(file.path)}
-                  onclick={(event) => chooseWorktreeFile(unstagedFiles, event, file)}
+                  onclick={(event) => { chooseWorktreeFile(unstagedFiles, event, file); void openFileDiff(file.path, { kind: "worktree_unstaged" }, file.old_path); }}
                   ondblclick={(event) => { event.preventDefault(); void runStage([file.path]); }}
                   onkeydown={(event) => {
                     if (event.key === "Enter" || event.key === " ") {
                       event.preventDefault();
-                      void runStage(selectedPaths(unstagedFiles, selectedWorktreeFiles.length ? selectedWorktreeFiles : [file.path]));
+                      void openFileDiff(file.path, { kind: "worktree_unstaged" }, file.old_path);
                     }
                   }}
                   oncontextmenu={(event) => showContextMenu(event, { kind: "worktree", file, staged: false })}>
@@ -1462,12 +1514,12 @@
                 <div class="worktree-file" class:selected={selectedWorktreeFiles.includes(file.path)}
                   role="button" tabindex="0"
                   title={safeRefLabel(file.path)}
-                  onclick={(event) => chooseWorktreeFile(stagedFiles, event, file)}
+                  onclick={(event) => { chooseWorktreeFile(stagedFiles, event, file); void openFileDiff(file.path, { kind: "worktree_staged" }, file.old_path); }}
                   ondblclick={(event) => { event.preventDefault(); void runUnstage([file.path]); }}
                   onkeydown={(event) => {
                     if (event.key === "Enter" || event.key === " ") {
                       event.preventDefault();
-                      void runUnstage(selectedPaths(stagedFiles, selectedWorktreeFiles.length ? selectedWorktreeFiles : [file.path]));
+                      void openFileDiff(file.path, { kind: "worktree_staged" }, file.old_path);
                     }
                   }}
                   oncontextmenu={(event) => showContextMenu(event, { kind: "worktree", file, staged: true })}>
@@ -1479,6 +1531,8 @@
           {:else}<p class="root-label">No staged files</p>{/if}
         </section>
         {#if worktreeStatus?.truncated}<p class="worktree-truncated">Showing the first 5,000 changed entries.</p>{/if}
+          </div>
+        {/if}
         <section class="commit-form">
           <label class="eyebrow" for="commit-summary">Commit summary</label>
           <input id="commit-summary" class:warning={summaryCounterTone === "warning"} class:error={summaryCounterTone === "error"}
@@ -1489,6 +1543,16 @@
           <label class="amend-option"><input type="checkbox" checked={amend} disabled={!refs.some(ref => ref.is_head && ref.target) || activeRepoMutationsDisabled} onchange={(event) => { void toggleAmend(event.currentTarget.checked); }} /> Amend previous commit</label>
           <button class="commit-button" disabled={!commitEnabled || activeRepoMutationsDisabled} onclick={() => runCommit()}>Commit {stagedFiles.length} file{stagedFiles.length === 1 ? "" : "s"}</button>
         </section>
+      </div>
+    {:else if fileDiffSource?.kind === "commit"}
+      <div class="commit-file-diff">
+        <FileDiffView diff={fileDiff} loading={fileDiffLoading} error={fileDiffError}
+          onClose={closeFileDiff}
+          onShowAnyway={() => {
+            if (fileDiff && fileDiffSource?.kind === "commit") {
+              void openFileDiff(fileDiff.path, fileDiffSource, fileDiff.old_path, true);
+            }
+          }} />
       </div>
     {:else if detailLoading}
       <div class="details-empty"><span class="details-icon">◷</span><h3>Loading commit…</h3></div>
@@ -1509,7 +1573,10 @@
         </div>
         <div class="paths-heading"><span class="eyebrow">CHANGED FILES</span><span class="count">{detail.changed_paths.length}</span></div>
         <VirtualList items={detail.changed_paths} maxHeight={360}>
-          {#snippet children(change)}<div class="changed-path" title={safeRefLabel(change.old_path ? `${change.old_path} → ${change.path}` : change.path)}><span class="file-status" class:added={change.status === "added"} class:deleted={change.status === "deleted"}>{change.status.slice(0, 1).toUpperCase()}</span><span class="truncate">{safeRefLabel(change.path)}</span></div>{/snippet}
+          {#snippet children(change)}<button class="changed-path" title={safeRefLabel(change.old_path ? `${change.old_path} → ${change.path}` : change.path)}
+            onclick={() => { void openFileDiff(change.path, { kind: "commit", oid: detail!.commit_id }, change.old_path); }}>
+            <span class="file-status" class:added={change.status === "added"} class:deleted={change.status === "deleted"}>{change.status.slice(0, 1).toUpperCase()}</span><span class="truncate">{safeRefLabel(change.path)}</span>
+          </button>{/snippet}
         </VirtualList>
         {#if !detail.changed_paths.length}<p class="root-label">No changed files</p>{/if}
       </div>

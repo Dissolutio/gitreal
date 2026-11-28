@@ -1,8 +1,8 @@
 use crate::{
     model::{
-        BackendError, ChangedPath, CommitDetail, GraphPage, GraphRow, JobFinished, JobId,
-        JobStarted, OpenRepo, OperationInfo, RefInfo, RefsResponse, RepoChanged, RepoError, Result,
-        StashInfo, WorktreeChanged, WorktreeStatus,
+        BackendError, ChangedPath, CommitDetail, FileDiff, FileDiffSource, GraphPage, GraphRow,
+        JobFinished, JobId, JobStarted, OpenRepo, OperationInfo, RefInfo, RefsResponse,
+        RepoChanged, RepoError, Result, StashInfo, WorktreeChanged, WorktreeStatus,
     },
     repo::branch_ops,
     repo::graph::{LaneLayout, assign_lanes, page_edges},
@@ -729,6 +729,40 @@ impl Backend {
             .read()
             .map(|state| state.worktree_status.clone())
             .map_err(|_| BackendError::new("internal_error", "Repository state unavailable"))
+    }
+
+    pub fn get_file_diff(
+        &self,
+        repo_id: &str,
+        source: FileDiffSource,
+        path: &str,
+        old_path: Option<&str>,
+        force: bool,
+    ) -> Result<FileDiff> {
+        let repository = self.repository(repo_id)?;
+        if let FileDiffSource::Commit { oid } = &source {
+            if !matches!(oid.len(), 40 | 64) || !oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(BackendError::new(
+                    "invalid_commit_id",
+                    "Expected a full hexadecimal object ID",
+                ));
+            }
+            let id = gix::ObjectId::from_hex(oid.as_bytes()).map_err(BackendError::git)?;
+            let is_stash = repository
+                .state
+                .read()
+                .map_err(|_| BackendError::new("internal_error", "Repository state unavailable"))?
+                .stashes
+                .iter()
+                .any(|stash| stash.oid == *oid);
+            if !is_stash && !repository.snapshot()?.0.ids.contains(&id) {
+                return Err(BackendError::new(
+                    "unknown_commit",
+                    "Commit is not in this repository snapshot",
+                ));
+            }
+        }
+        crate::repo::file_diff::read_file_diff(&repository.path, source, path, old_path, force)
     }
 
     pub fn get_graph_page(&self, repo_id: &str, offset: usize, limit: usize) -> Result<GraphPage> {

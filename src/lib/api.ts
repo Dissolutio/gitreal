@@ -90,6 +90,27 @@ export interface CommitDetail {
   parents: string[];
   changed_paths: ChangedPath[];
 }
+export type FileDiffSource =
+  | { kind: "worktree_unstaged" }
+  | { kind: "worktree_staged" }
+  | { kind: "commit"; oid: string };
+export interface FileDiffLine {
+  kind: "context" | "added" | "removed";
+  old_no: number | null;
+  new_no: number | null;
+  text: string;
+}
+export interface FileDiff {
+  path: string;
+  old_path: string | null;
+  binary: boolean;
+  too_large: boolean;
+  old_no_newline: boolean;
+  new_no_newline: boolean;
+  lines: FileDiffLine[];
+  hunks: { start_index: number; end_index: number }[];
+  stats: { added: number; removed: number };
+}
 export interface NativeError { code: string; message: string }
 
 export function nativeError(error: unknown): NativeError {
@@ -158,6 +179,8 @@ export const api = {
     call<GraphPage>("get_graph_page", { repoId, offset, limit }),
   detail: (repoId: string, commitId: string) =>
     call<CommitDetail>("get_commit_detail", { repoId, commitId }),
+  fileDiff: (repoId: string, source: FileDiffSource, path: string, oldPath?: string | null, force = false) =>
+    call<FileDiff>("get_file_diff", { repoId, source, path, oldPath, force }),
   fetch: (repoId: string, remote?: string) =>
     call<string>("fetch", { repoId, remote }),
   pull: (repoId: string) => call<string>("pull", { repoId }),

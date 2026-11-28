@@ -1,8 +1,9 @@
 use crate::cli::{self, CliAction};
 use crate::config::{AppConfig, ConfigManager};
 use crate::model::{
-    BackendError, CommitDetail, GraphPage, JobFinished, JobId, JobStarted, OpenRepo, RefsResponse,
-    RepoChanged, RepoError, Result, WorktreeChanged, WorktreeStatus,
+    BackendError, CommitDetail, FileDiff, FileDiffSource, GraphPage, JobFinished, JobId,
+    JobStarted, OpenRepo, RefsResponse, RepoChanged, RepoError, Result, WorktreeChanged,
+    WorktreeStatus,
 };
 use crate::repo::reader::{Backend, EventSink};
 use crate::updater::{self, UpdateInfo, UpdateProgress};
@@ -161,6 +162,20 @@ async fn get_commit_detail(
 ) -> Result<CommitDetail> {
     let backend = Arc::clone(&backend);
     blocking(move || backend.get_commit_detail(&repo_id, &commit_id)).await
+}
+
+#[tauri::command]
+async fn get_file_diff(
+    backend: State<'_, Arc<Backend>>,
+    repo_id: String,
+    source: FileDiffSource,
+    path: String,
+    old_path: Option<String>,
+    force: bool,
+) -> Result<FileDiff> {
+    let backend = Arc::clone(&backend);
+    blocking(move || backend.get_file_diff(&repo_id, source, &path, old_path.as_deref(), force))
+        .await
 }
 
 #[tauri::command]
@@ -976,6 +991,7 @@ pub fn run() {
             commit_changes,
             get_graph_page,
             get_commit_detail,
+            get_file_diff,
             fetch,
             pull,
             push,

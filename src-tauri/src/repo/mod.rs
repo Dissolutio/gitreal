@@ -1,5 +1,6 @@
 pub mod branch_ops;
 pub mod commit_ops;
+pub mod file_diff;
 pub mod graph;
 pub mod history_ops;
 pub mod jobs;

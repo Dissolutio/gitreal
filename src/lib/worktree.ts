@@ -18,6 +18,17 @@ export function sortedFiles(files: FileChange[]): FileChange[] {
   return [...files].sort((a, b) => a.path.localeCompare(b.path));
 }
 
+export function groupWorktreeFiles(status: WorktreeStatus | null) {
+  return {
+    unstaged: sortedFiles([
+      ...(status?.unstaged ?? []),
+      ...(status?.untracked ?? []),
+      ...(status?.conflicted ?? []),
+    ]),
+    staged: sortedFiles(status?.staged ?? []),
+  };
+}
+
 export function summaryTone(length: number): "normal" | "warning" | "error" {
   return length > 72 ? "error" : length > 50 ? "warning" : "normal";
 }

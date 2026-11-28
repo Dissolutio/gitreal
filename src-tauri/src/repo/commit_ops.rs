@@ -6,7 +6,7 @@ use std::path::{Component, Path, PathBuf};
 
 pub fn stage_paths(path: PathBuf, paths: &[String]) -> Result<JobSpec> {
     let paths = validate_paths(paths)?;
-    let mut args = vec!["add".into(), "--".into()];
+    let mut args = vec!["--literal-pathspecs".into(), "add".into(), "--".into()];
     args.extend(paths);
     Ok(JobSpec::new(
         "stage",
@@ -34,9 +34,19 @@ pub fn stage_all(path: PathBuf) -> JobSpec {
 pub fn unstage_paths(path: PathBuf, paths: &[String], has_head: bool) -> Result<JobSpec> {
     let paths = validate_paths(paths)?;
     let mut args = if has_head {
-        vec!["restore".into(), "--staged".into(), "--".into()]
+        vec![
+            "--literal-pathspecs".into(),
+            "restore".into(),
+            "--staged".into(),
+            "--".into(),
+        ]
     } else {
-        vec!["rm".into(), "--cached".into(), "--".into()]
+        vec![
+            "--literal-pathspecs".into(),
+            "rm".into(),
+            "--cached".into(),
+            "--".into(),
+        ]
     };
     args.extend(paths);
     Ok(JobSpec::new(
@@ -54,9 +64,16 @@ pub fn unstage_paths(path: PathBuf, paths: &[String], has_head: bool) -> Result<
 
 pub fn unstage_all(path: PathBuf, has_head: bool) -> JobSpec {
     let args = if has_head {
-        vec!["restore".into(), "--staged".into(), "--".into(), ".".into()]
+        vec![
+            "--literal-pathspecs".into(),
+            "restore".into(),
+            "--staged".into(),
+            "--".into(),
+            ".".into(),
+        ]
     } else {
-        vec!["rm".into(), "--cached".into(), "--".into(), ".".into()]
+        vec![
+            "--literal-pathspecs".into(),"rm".into(), "--cached".into(), "--".into(), ".".into()]
     };
     JobSpec::new(
         "unstage",
@@ -196,11 +213,27 @@ mod tests {
     fn stage_and_unstage_paths_use_separator_and_reject_escape() {
         let paths = vec!["a file.txt".into(), "unicodé.txt".into()];
         let staged = stage_paths(PathBuf::from("."), &paths).unwrap();
-        assert_eq!(staged.args, ["add", "--", "a file.txt", "unicodé.txt"]);
+        assert_eq!(
+            staged.args,
+            [
+                "--literal-pathspecs",
+                "add",
+                "--",
+                "a file.txt",
+                "unicodé.txt"
+            ]
+        );
         let unstaged = unstage_paths(PathBuf::from("."), &paths, true).unwrap();
         assert_eq!(
             unstaged.args,
-            ["restore", "--staged", "--", "a file.txt", "unicodé.txt"]
+            [
+                "--literal-pathspecs",
+                "restore",
+                "--staged",
+                "--",
+                "a file.txt",
+                "unicodé.txt"
+            ]
         );
         assert!(stage_paths(PathBuf::from("."), &["../outside".into()]).is_err());
         assert!(unstage_paths(PathBuf::from("."), &["/outside".into()], true).is_err());
@@ -209,10 +242,13 @@ mod tests {
     #[test]
     fn unborn_unstage_uses_cached_remove_and_commit_rejects_empty_summary() {
         let spec = unstage_paths(PathBuf::from("."), &["new.txt".into()], false).unwrap();
-        assert_eq!(spec.args, ["rm", "--cached", "--", "new.txt"]);
+        assert_eq!(
+            spec.args,
+            ["--literal-pathspecs", "rm", "--cached", "--", "new.txt"]
+        );
         assert_eq!(
             unstage_all(PathBuf::from("."), false).args,
-            ["rm", "--cached", "--", "."]
+            ["--literal-pathspecs", "rm", "--cached", "--", "."]
         );
         assert_eq!(
             commit(PathBuf::from("."), "  ", "", false, None)
@@ -260,11 +296,7 @@ mod tests {
             )
             .ok
         );
-        assert_eq!(
-            path.join(".git/index").is_file(),
-            true,
-            "staging should create the index"
-        );
+        assert!(path.join(".git/index").is_file(), "staging should create the index");
         assert!(
             run(
                 &path,
@@ -303,7 +335,14 @@ mod tests {
         );
 
         fs::write(path.join("another.txt"), "another").unwrap();
+        fs::write(path.join("second.txt"), "second").unwrap();
         assert!(run(&path, stage_all(path.clone())).ok);
+        let staged = Command::new("git")
+            .args(["diff", "--cached", "--name-only"])
+            .current_dir(&path)
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&staged.stdout).lines().count(), 2);
         assert!(run(&path, unstage_all(path.clone(), true)).ok);
         let nothing_staged = run(
             &path,
@@ -334,6 +373,24 @@ mod tests {
             String::from_utf8_lossy(&log.stdout).trim(),
             "Amended summary"
         );
+    }
+
+    #[test]
+    fn pathspec_magic_names_are_staged_literally() {
+        let (_directory, path) = repository();
+        let filename = ":(top,glob)**.txt";
+        fs::write(path.join(filename), "literal").unwrap();
+        let finished = run(
+            &path,
+            stage_paths(path.clone(), &[filename.into()]).unwrap(),
+        );
+        assert!(finished.ok, "{}", finished.message);
+        let staged = Command::new("git")
+            .args(["diff", "--cached", "--name-only"])
+            .current_dir(&path)
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&staged.stdout).trim(), filename);
     }
 
     #[test]

@@ -1655,6 +1655,26 @@ mod tests {
         backend.close_repo(&opened.repo_id).unwrap();
     }
 
+    #[test]
+    fn worktree_generation_advances_only_when_status_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("repo");
+        fs::create_dir(&path).unwrap();
+        git(&path, &["init", "-b", "main"]);
+        let backend = Backend::default();
+        let opened = backend.open_repo(path.to_string_lossy().into()).unwrap();
+        assert_eq!(opened.worktree_status.generation, 0);
+
+        fs::write(path.join("new file.txt"), "new").unwrap();
+        let changed = backend.get_worktree_status(&opened.repo_id).unwrap();
+        assert_eq!(changed.generation, 1);
+        assert_eq!(changed.untracked[0].path, "new file.txt");
+        let unchanged = backend.get_worktree_status(&opened.repo_id).unwrap();
+        assert_eq!(unchanged.generation, 1);
+
+        backend.close_repo(&opened.repo_id).unwrap();
+    }
+
     fn commit_tree(path: &Path, tree: &str, parent: &str, message: &str) -> String {
         git(path, &["commit-tree", tree, "-p", parent, "-m", message])
     }

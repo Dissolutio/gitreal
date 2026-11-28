@@ -212,6 +212,7 @@ mod tests {
     fn parses_staged_unstaged_conflicted_and_untracked_paths() {
         let mut bytes = b"1 A. N... 100644 100644 100644 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000 staged file\0\
 1 .D N... 100644 100644 000000 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000 deleted\0\
+1 MT N... 100644 100644 100644 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000 type changed\0\
 2 R. N... 100644 100644 100644 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000 R100 new name\0old name\0\
 u UU N... 100644 100644 100644 100644 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000 conflict\0\
 "
@@ -222,8 +223,10 @@ u UU N... 100644 100644 100644 100644 0000000000000000000000000000000000000000 0
         assert_eq!(status.staged[0].path, "staged file");
         assert_eq!(status.staged[0].kind, "added");
         assert_eq!(status.unstaged[0].kind, "deleted");
-        assert_eq!(status.staged[1].old_path.as_deref(), Some("old name"));
-        assert_eq!(status.staged[1].kind, "renamed");
+        assert_eq!(status.staged[1].kind, "modified");
+        assert_eq!(status.unstaged[1].kind, "typechange");
+        assert_eq!(status.staged[2].old_path.as_deref(), Some("old name"));
+        assert_eq!(status.staged[2].kind, "renamed");
         assert_eq!(status.conflicted[0].kind, "conflicted");
         assert_eq!(status.untracked[0].path, "untracked unicode ✓");
         assert!(!status.truncated);
@@ -261,7 +264,13 @@ u UU N... 100644 100644 100644 100644 0000000000000000000000000000000000000000 0
         fs::write(path.join("tracked file.txt"), "after").unwrap();
         fs::write(path.join("untracked unicode ✓.txt"), "new").unwrap();
         fs::create_dir_all(path.join("node_modules/pkg")).unwrap();
-        fs::write(path.join("node_modules/pkg/ignored.js"), "ignored").unwrap();
+        for index in 0..100 {
+            fs::write(
+                path.join(format!("node_modules/pkg/ignored-{index}.js")),
+                "ignored",
+            )
+            .unwrap();
+        }
         let marker = path.join("fsmonitor-ran");
         #[cfg(unix)]
         {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { FileChange, WorktreeStatus } from "./api";
-import { canCommit, hasWorktreeChanges, selectFile, sortedFiles, summaryTone, worktreeFileCount } from "./worktree";
+import { canCommit, groupWorktreeFiles, hasWorktreeChanges, selectFile, selectedPaths, sortedFiles, summaryTone, worktreeFileCount } from "./worktree";
 import { createTab } from "./tabs";
 
 const file = (path: string): FileChange => ({ path, old_path: null, kind: "modified" });
@@ -22,9 +22,12 @@ describe("worktree helpers", () => {
 
   it("sorts file lists and supports additive and range selection", () => {
     expect(sortedFiles([file("z"), file("a")]).map(item => item.path)).toEqual(["a", "z"]);
+    expect(groupWorktreeFiles(status).unstaged.map(item => item.path)).toEqual(["a.txt", "shared.txt"]);
+    expect(groupWorktreeFiles(status).staged.map(item => item.path)).toEqual(["shared.txt", "z.txt"]);
     const files = [file("a"), file("b"), file("c")];
     expect(selectFile(files, ["a"], "c", true, false)).toEqual(["a", "b", "c"]);
     expect(selectFile(files, ["a"], "c", false, true)).toEqual(["a", "c"]);
+    expect(selectedPaths(files, ["a", "c"])).toEqual(["a", "c"]);
   });
 
   it("enforces summary thresholds and commit prerequisites", () => {

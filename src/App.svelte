@@ -16,7 +16,7 @@
   import { validateBranchName } from "./lib/refnames";
   import { formatRelativeDate, indexStashes, placeVisibleStashes } from "./lib/stashes";
   import { updateStore, type UpdateSnackbarEntry } from "./lib/update";
-  import { canCommit, hasWorktreeChanges, selectFile, selectedPaths, sortedFiles, summaryTone, worktreeFileCount } from "./lib/worktree";
+  import { canCommit, groupWorktreeFiles, hasWorktreeChanges, selectFile, selectedPaths, summaryTone, worktreeFileCount } from "./lib/worktree";
 
   type MenuTarget = { kind: "ref"; ref: RefInfo } | { kind: "commit"; oid: string } | { kind: "stash"; stash: StashInfo } | { kind: "worktree"; file: FileChange; staged: boolean };
   type PromptState = { kind: "create" | "rename"; x: number; y: number; ref?: RefInfo; oid: string; name: string; checkout: boolean; message: string };
@@ -86,12 +86,9 @@
   const changedFileCount = $derived(worktreeFileCount(worktreeStatus));
   const summaryCounterTone = $derived(summaryTone(draftSummary.length));
   const commitEnabled = $derived(canCommit(worktreeStatus, draftSummary));
-  const unstagedFiles = $derived(sortedFiles([
-    ...(worktreeStatus?.unstaged ?? []),
-    ...(worktreeStatus?.untracked ?? []),
-    ...(worktreeStatus?.conflicted ?? []),
-  ]));
-  const stagedFiles = $derived(sortedFiles(worktreeStatus?.staged ?? []));
+  const worktreeGroups = $derived(groupWorktreeFiles(worktreeStatus));
+  const unstagedFiles = $derived(worktreeGroups.unstaged);
+  const stagedFiles = $derived(worktreeGroups.staged);
   const contextItems = $derived.by(() => {
     if (!contextMenu) return [];
     if (contextMenu.target.kind === "stash") return stashMenuItems(activeRepoRunning, operation !== null);
@@ -535,6 +532,9 @@
   }
 
   async function toggleAmend(enabled: boolean) {
+    const repo = repository;
+    const tabId = activeTab?.tabId;
+    if (!repo) return;
     amend = enabled;
     if (!enabled) {
       saveActiveTab();
@@ -546,14 +546,16 @@
       return;
     }
     try {
-      const detail = await api.detail(repository!.repo_id, headOid);
+      const detail = await api.detail(repo.repo_id, headOid);
+      if (repository?.repo_id !== repo.repo_id || activeTab?.tabId !== tabId) return;
       const [summary, ...description] = detail.message.trimEnd().split("\n");
       draftSummary = summary;
       draftDescription = description.join("\n").replace(/^\n/, "");
       saveActiveTab();
     } catch (failure) {
+      if (repository?.repo_id !== repo.repo_id || activeTab?.tabId !== tabId) return;
       amend = false;
-      showOperationError(repository!, "commit", "Amend previous commit", failure);
+      showOperationError(repo, "commit", "Amend previous commit", failure);
     }
   }
 
@@ -1032,8 +1034,16 @@
   async function followUpAction(action: JobAction, entry: SnackbarEntry) {
     if (action.kind === "push") {
       const branch = String(action.payload?.branch ?? "");
-      if (branch && repository?.repo_id === entry.repo_id) {
-        await enqueueCustom("push", `Push ${safeRefLabel(branch)}`, repoId => api.push(repoId, branch));
+      const target = tabs.find(tab => tab.repository?.repo_id === entry.repo_id)?.repository;
+      if (branch && target) {
+        requestingRepoIds = [...new Set([...requestingRepoIds, target.repo_id])];
+        try {
+          await api.push(target.repo_id, branch);
+        } catch (failure) {
+          showOperationError(target, "push", `Push ${safeRefLabel(branch)}`, failure);
+        } finally {
+          requestingRepoIds = requestingRepoIds.filter(repoId => repoId !== target.repo_id);
+        }
       }
     } else if (action.kind === "open_in_vscode") {
       try {

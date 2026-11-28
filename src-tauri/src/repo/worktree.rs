@@ -7,9 +7,12 @@ use std::{
 
 const MAX_ENTRIES: usize = 5_000;
 
-pub fn read_worktree_status(path: &Path) -> Result<WorktreeStatus> {
+pub fn read_worktree_status(path: &Path, is_bare: bool) -> Result<WorktreeStatus> {
     #[cfg(test)]
     STATUS_READ_COUNT.with(|count| count.set(count.get() + 1));
+    if is_bare {
+        return parse_status(&[]);
+    }
     let output = Command::new("git")
         .args([
             "-c",
@@ -291,7 +294,7 @@ u UU N... 100644 100644 100644 100644 0000000000000000000000000000000000000000 0
             );
         }
 
-        let status = read_worktree_status(&path).unwrap();
+        let status = read_worktree_status(&path, false).unwrap();
         assert!(
             status
                 .unstaged
@@ -322,7 +325,7 @@ u UU N... 100644 100644 100644 100644 0000000000000000000000000000000000000000 0
     fn reads_untracked_files_before_the_first_commit() {
         let (_directory, path) = repository();
         fs::write(path.join("first.txt"), "first").unwrap();
-        let status = read_worktree_status(&path).unwrap();
+        let status = read_worktree_status(&path, false).unwrap();
         assert_eq!(status.untracked[0].path, "first.txt");
     }
 }

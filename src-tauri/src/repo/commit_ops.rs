@@ -6,15 +6,12 @@ use std::path::{Component, Path, PathBuf};
 
 pub fn stage_paths(path: PathBuf, paths: &[String]) -> Result<JobSpec> {
     let paths = validate_paths(paths)?;
+    let count = paths.len();
     let mut args = vec!["--literal-pathspecs".into(), "add".into(), "--".into()];
     args.extend(paths);
     Ok(JobSpec::new(
         "stage",
-        format!(
-            "Stage {} file{}",
-            args.len() - 2,
-            if args.len() == 3 { "" } else { "s" }
-        ),
+        format!("Stage {count} file{}", if count == 1 { "" } else { "s" }),
         path,
         args,
         "Staged changes",
@@ -33,6 +30,7 @@ pub fn stage_all(path: PathBuf) -> JobSpec {
 
 pub fn unstage_paths(path: PathBuf, paths: &[String], has_head: bool) -> Result<JobSpec> {
     let paths = validate_paths(paths)?;
+    let count = paths.len();
     let mut args = if has_head {
         vec![
             "--literal-pathspecs".into(),
@@ -51,11 +49,7 @@ pub fn unstage_paths(path: PathBuf, paths: &[String], has_head: bool) -> Result<
     args.extend(paths);
     Ok(JobSpec::new(
         "unstage",
-        format!(
-            "Unstage {} file{}",
-            args.len() - if has_head { 3 } else { 3 },
-            if args.len() == 4 { "" } else { "s" }
-        ),
+        format!("Unstage {count} file{}", if count == 1 { "" } else { "s" }),
         path,
         args,
         "Unstaged changes",
@@ -73,7 +67,12 @@ pub fn unstage_all(path: PathBuf, has_head: bool) -> JobSpec {
         ]
     } else {
         vec![
-            "--literal-pathspecs".into(),"rm".into(), "--cached".into(), "--".into(), ".".into()]
+            "--literal-pathspecs".into(),
+            "rm".into(),
+            "--cached".into(),
+            "--".into(),
+            ".".into(),
+        ]
     };
     JobSpec::new(
         "unstage",
@@ -296,7 +295,10 @@ mod tests {
             )
             .ok
         );
-        assert!(path.join(".git/index").is_file(), "staging should create the index");
+        assert!(
+            path.join(".git/index").is_file(),
+            "staging should create the index"
+        );
         assert!(
             run(
                 &path,
@@ -380,6 +382,7 @@ mod tests {
         let (_directory, path) = repository();
         let filename = ":(top,glob)**.txt";
         fs::write(path.join(filename), "literal").unwrap();
+        fs::write(path.join("safe.txt"), "safe").unwrap();
         let finished = run(
             &path,
             stage_paths(path.clone(), &[filename.into()]).unwrap(),
@@ -391,6 +394,26 @@ mod tests {
             .output()
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&staged.stdout).trim(), filename);
+        assert!(
+            run(
+                &path,
+                stage_paths(path.clone(), &["safe.txt".into()]).unwrap()
+            )
+            .ok
+        );
+        assert!(
+            run(
+                &path,
+                unstage_paths(path.clone(), &[filename.into()], false).unwrap()
+            )
+            .ok
+        );
+        let staged = Command::new("git")
+            .args(["diff", "--cached", "--name-only"])
+            .current_dir(&path)
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&staged.stdout).trim(), "safe.txt");
     }
 
     #[test]

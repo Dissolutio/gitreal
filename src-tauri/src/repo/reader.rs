@@ -33,6 +33,7 @@ struct RefFingerprint(Vec<RefFingerprintEntry>);
 
 struct Repository {
     path: PathBuf,
+    is_bare: bool,
     state: RwLock<RepositoryState>,
     refresh_lock: Mutex<()>,
     watcher: Mutex<Option<MetadataWatcher>>,
@@ -130,9 +131,11 @@ impl Backend {
         let stash_signature = read_stash_signature(&repo)?;
         let stashes = read_stashes(&repo)?;
         let (operation, conflicted_files) = read_operation(&repo, &refs)?;
-        let worktree_status = read_worktree_status(&path)?;
+        let is_bare = repo.is_bare();
+        let worktree_status = read_worktree_status(&path, is_bare)?;
         let repository = Arc::new(Repository {
             path: path.clone(),
+            is_bare,
             state: RwLock::new(RepositoryState {
                 refs,
                 stashes,
@@ -886,7 +889,7 @@ impl Repository {
         if self.closed.load(Ordering::Acquire) {
             return Ok(None);
         }
-        let mut status = read_worktree_status(&self.path)?;
+        let mut status = read_worktree_status(&self.path, self.is_bare)?;
         let mut state = self
             .state
             .write()
@@ -1853,6 +1856,7 @@ mod tests {
 
         let repository = Arc::new(Repository {
             path: PathBuf::new(),
+            is_bare: false,
             state: RwLock::new(RepositoryState {
                 refs: Vec::new(),
                 stashes: Vec::new(),
@@ -2044,6 +2048,7 @@ mod tests {
         let ref_fingerprint = read_ref_fingerprint(&repo).unwrap();
         let repository = Repository {
             path: path.to_path_buf(),
+            is_bare: repo.is_bare(),
             state: RwLock::new(RepositoryState {
                 refs: renamed_refs,
                 upstream_cache: cache.clone(),
@@ -2211,6 +2216,7 @@ mod tests {
         let operation = read_operation(&repo, &cold_refs).unwrap();
         let repository = Repository {
             path: path.to_path_buf(),
+            is_bare: repo.is_bare(),
             state: RwLock::new(RepositoryState {
                 refs: cold_refs.clone(),
                 upstream_cache: cache.clone(),

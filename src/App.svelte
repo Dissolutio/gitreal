@@ -67,6 +67,7 @@
   let eventGeneration = 0;
   let epoch = 0;
   let selectionEpoch = 0;
+  let amendRequest = 0;
   let cache = new PageCache<GraphRow>();
   const caches = new Map<string, PageCache<GraphRow>>();
   const operationStates = new Map<string, { operation: OperationInfo | null; conflictedFiles: number }>();
@@ -175,6 +176,7 @@
   }
 
   function activateView(tab: RepoTab | undefined) {
+    amendRequest += 1;
     repository = tab?.repository ?? null;
     refs = tab?.refs ?? [];
     stashes = tab?.stashes ?? [];
@@ -532,6 +534,7 @@
   }
 
   async function toggleAmend(enabled: boolean) {
+    const request = ++amendRequest;
     const repo = repository;
     const tabId = activeTab?.tabId;
     if (!repo) return;
@@ -547,13 +550,13 @@
     }
     try {
       const detail = await api.detail(repo.repo_id, headOid);
-      if (repository?.repo_id !== repo.repo_id || activeTab?.tabId !== tabId) return;
+      if (request !== amendRequest || !amend || repository?.repo_id !== repo.repo_id || activeTab?.tabId !== tabId) return;
       const [summary, ...description] = detail.message.trimEnd().split("\n");
       draftSummary = summary;
       draftDescription = description.join("\n").replace(/^\n/, "");
       saveActiveTab();
     } catch (failure) {
-      if (repository?.repo_id !== repo.repo_id || activeTab?.tabId !== tabId) return;
+      if (request !== amendRequest || !amend || repository?.repo_id !== repo.repo_id || activeTab?.tabId !== tabId) return;
       amend = false;
       showOperationError(repo, "commit", "Amend previous commit", failure);
     }
@@ -1479,10 +1482,10 @@
         <section class="commit-form">
           <label class="eyebrow" for="commit-summary">Commit summary</label>
           <input id="commit-summary" class:warning={summaryCounterTone === "warning"} class:error={summaryCounterTone === "error"}
-            bind:value={draftSummary} oninput={saveActiveTab} placeholder="Commit summary" />
+            bind:value={draftSummary} oninput={saveActiveTab} placeholder="Commit summary" disabled={activeRepoMutationsDisabled} />
           <small class:warning={summaryCounterTone === "warning"} class:error={summaryCounterTone === "error"}>{draftSummary.length}/72</small>
           <label class="eyebrow" for="commit-description">Description</label>
-          <textarea id="commit-description" bind:value={draftDescription} oninput={saveActiveTab} placeholder="Description (optional)"></textarea>
+          <textarea id="commit-description" bind:value={draftDescription} oninput={saveActiveTab} placeholder="Description (optional)" disabled={activeRepoMutationsDisabled}></textarea>
           <label class="amend-option"><input type="checkbox" checked={amend} disabled={!refs.some(ref => ref.is_head && ref.target) || activeRepoMutationsDisabled} onchange={(event) => { void toggleAmend(event.currentTarget.checked); }} /> Amend previous commit</label>
           <button class="commit-button" disabled={!commitEnabled || activeRepoMutationsDisabled} onclick={() => runCommit()}>Commit {stagedFiles.length} file{stagedFiles.length === 1 ? "" : "s"}</button>
         </section>

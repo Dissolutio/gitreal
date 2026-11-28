@@ -1,7 +1,7 @@
 use crate::model::{BackendError, Result};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -42,6 +42,10 @@ pub struct AppConfig {
     pub start_at_login: bool,
     #[serde(default = "default_check_for_updates")]
     pub check_for_updates: bool,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub launch_commands: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_terminal: Option<String>,
     pub repos: Vec<KnownRepo>,
     pub tabs: Vec<OpenTab>,
 }
@@ -53,6 +57,8 @@ impl Default for AppConfig {
             active_tab: None,
             start_at_login: false,
             check_for_updates: true,
+            launch_commands: HashMap::new(),
+            launch_terminal: None,
             repos: Vec::new(),
             tabs: Vec::new(),
         }
@@ -97,6 +103,30 @@ impl ConfigManager {
         let path = canonicalize_or_preserve(&path)?;
         config.repos.retain(|repo| repo.path != path);
         save_config(&config_path, &config)
+    }
+
+    pub fn set_launch_command(&self, repo_path: String, command: String) -> Result<()> {
+        if command.trim().is_empty() || command.contains('\0') {
+            return Err(BackendError::new(
+                "launch_error",
+                "Enter a non-empty launch command",
+            ));
+        }
+        let _guard = self.lock()?;
+        let path = config_path()?;
+        let mut config = load_config(&path)?;
+        config
+            .launch_commands
+            .insert(canonicalize_or_preserve(&repo_path)?, command);
+        save_config(&path, &config)
+    }
+
+    pub fn reset_launch_command(&self, repo_path: String) -> Result<()> {
+        let _guard = self.lock()?;
+        let path = config_path()?;
+        let mut config = load_config(&path)?;
+        remove_launch_command(&mut config, &repo_path)?;
+        save_config(&path, &config)
     }
 
     pub fn set_start_at_login(&self, enabled: bool) -> Result<()> {
@@ -368,6 +398,13 @@ fn normalize_loaded_tabs(config: &mut AppConfig) {
     }
 }
 
+fn remove_launch_command(config: &mut AppConfig, repo_path: &str) -> Result<()> {
+    config
+        .launch_commands
+        .remove(&canonicalize_or_preserve(repo_path)?);
+    Ok(())
+}
+
 fn unix_time() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -411,6 +448,8 @@ mod tests {
             active_tab: Some("/repo/one".into()),
             start_at_login: true,
             check_for_updates: true,
+            launch_commands: HashMap::from([("/repo/one".into(), "pnpm tauri dev".into())]),
+            launch_terminal: Some("cosmic-term".into()),
             repos: vec![KnownRepo {
                 path: "/repo/one".into(),
                 name: "one".into(),
@@ -445,6 +484,32 @@ mod tests {
         let config: AppConfig = toml::from_str("version = 1\nrepos = []\ntabs = []").unwrap();
         assert!(!config.start_at_login);
         assert!(config.check_for_updates);
+        assert!(config.launch_commands.is_empty());
+        assert_eq!(config.launch_terminal, None);
+    }
+
+    #[test]
+    fn resetting_launch_command_removes_only_that_repository_command() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let first = directory.path().join("first");
+        let second = directory.path().join("second");
+        let mut config = AppConfig::default();
+        config
+            .launch_commands
+            .insert(first.to_string_lossy().into_owned(), "npm run dev".into());
+        config
+            .launch_commands
+            .insert(second.to_string_lossy().into_owned(), "cargo run".into());
+        save_config(&path, &config).unwrap();
+        let mut loaded = load_config(&path).unwrap();
+        remove_launch_command(&mut loaded, &first.to_string_lossy()).unwrap();
+        save_config(&path, &loaded).unwrap();
+
+        assert_eq!(
+            load_config(&path).unwrap().launch_commands,
+            HashMap::from([(second.to_string_lossy().into_owned(), "cargo run".into())])
+        );
     }
 
     #[test]

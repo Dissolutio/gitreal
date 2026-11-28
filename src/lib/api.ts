@@ -11,6 +11,8 @@ export interface AppConfig {
   active_tab: string | null;
   start_at_login: boolean;
   check_for_updates: boolean;
+  launch_commands?: Record<string, string>;
+  launch_terminal?: string | null;
   repos: KnownRepo[];
   tabs: PersistedTab[];
 }
@@ -77,6 +79,7 @@ export interface CommitDetail {
   changed_paths: ChangedPath[];
 }
 export interface NativeError { code: string; message: string }
+export interface LaunchSuggestion { command: string; reason: string }
 
 export function nativeError(error: unknown): NativeError {
   if (typeof error === "object" && error !== null && "code" in error && "message" in error) {
@@ -182,6 +185,13 @@ export const api = {
   pushRemote: (repoId: string, branch: string) =>
     call<string>("get_push_remote", { repoId, branch }),
   config: () => call<AppConfig>("get_config", {}),
+  launchSuggestion: (repoId: string) =>
+    call<LaunchSuggestion | null>("get_launch_suggestion", { repoId }),
+  setLaunchCommand: (repoId: string, command: string) =>
+    call<void>("set_launch_command", { repoId, command }),
+  resetLaunchCommand: (repoId: string) =>
+    call<void>("reset_launch_command", { repoId }),
+  launchRepo: (repoId: string) => call<string>("launch_repo", { repoId }),
   installUpdate: () => call<void>("install_update_and_restart", {}),
   openReleasePage: () => call<void>("open_release_page", {}),
   frontendReady: () => call<void>("frontend_ready", {}),

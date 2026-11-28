@@ -399,6 +399,76 @@ async fn get_config(config: State<'_, Arc<ConfigManager>>) -> Result<AppConfig> 
 }
 
 #[tauri::command]
+async fn get_launch_suggestion(
+    backend: State<'_, Arc<Backend>>,
+    repo_id: String,
+) -> Result<Option<crate::launch::LaunchSuggestion>> {
+    let backend = Arc::clone(&backend);
+    blocking(move || {
+        let path = backend.repo_path(&repo_id)?;
+        crate::launch::detect_at(&path)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn set_launch_command(
+    backend: State<'_, Arc<Backend>>,
+    config: State<'_, Arc<ConfigManager>>,
+    repo_id: String,
+    command: String,
+) -> Result<()> {
+    let backend = Arc::clone(&backend);
+    let config = Arc::clone(&config);
+    blocking(move || {
+        let path = backend.repo_path(&repo_id)?;
+        config.set_launch_command(path.to_string_lossy().into_owned(), command)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn reset_launch_command(
+    backend: State<'_, Arc<Backend>>,
+    config: State<'_, Arc<ConfigManager>>,
+    repo_id: String,
+) -> Result<()> {
+    let backend = Arc::clone(&backend);
+    let config = Arc::clone(&config);
+    blocking(move || {
+        let path = backend.repo_path(&repo_id)?;
+        config.reset_launch_command(path.to_string_lossy().into_owned())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn launch_repo(
+    backend: State<'_, Arc<Backend>>,
+    config: State<'_, Arc<ConfigManager>>,
+    repo_id: String,
+) -> Result<String> {
+    let backend = Arc::clone(&backend);
+    let config = Arc::clone(&config);
+    blocking(move || {
+        let path = backend.repo_path(&repo_id)?;
+        let app_config = config.get_config()?;
+        let key = path.to_string_lossy();
+        let command = app_config
+            .launch_commands
+            .get(key.as_ref())
+            .ok_or_else(|| {
+                BackendError::new(
+                    "launch_not_configured",
+                    "Set up a launch command before launching this repository",
+                )
+            })?;
+        crate::launch::launch_terminal(&path, command, app_config.launch_terminal.as_deref())
+    })
+    .await
+}
+
+#[tauri::command]
 async fn check_for_update(app: AppHandle) -> Result<Option<UpdateInfo>> {
     updater::check_and_emit(&app).await
 }
@@ -941,6 +1011,10 @@ pub fn run() {
             open_in_vscode,
             stash_and_checkout,
             get_config,
+            get_launch_suggestion,
+            set_launch_command,
+            reset_launch_command,
+            launch_repo,
             check_for_update,
             install_update_and_restart,
             open_release_page,

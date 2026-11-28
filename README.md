@@ -17,6 +17,26 @@ never watches the working tree. It watches Git metadata in the resolved worktree
 and common directories, debounces events for 150 ms, and ignores lock and
 transient files.
 
+The **Launch** button can suggest a development command from root-level project
+metadata. Suggestions are never run or saved until confirmed; each approved
+command is stored in Gitreal's config by repository path and runs in a terminal
+with the repository as its working directory. Terminal preference is the
+`launch_terminal` config setting, then `cosmic-term`, `x-terminal-emulator`,
+`gnome-terminal`, `konsole`, `kitty`, `alacritty`, and `xterm`.
+
+| Root metadata | Suggested command |
+| --- | --- |
+| `package.json` with `tauri` script or `@tauri-apps/cli` dependency | `<package manager> tauri dev` |
+| `package.json` with `dev`, `start`, or `serve` script | `<package manager> run <script>` |
+| `Cargo.toml` | `cargo run` |
+| `Makefile` with `dev` or `run` target | `make dev` or `make run` |
+| `docker-compose.yml` or `compose.yaml` | `docker compose up` |
+
+The package manager comes from `package.json`'s `packageManager` field first,
+then `pnpm-lock.yaml`, `yarn.lock`, `bun.lockb`/`bun.lock`, or
+`package-lock.json`; it defaults to npm. Project files only inform the
+suggestion—the command actually launched is the one the owner approved.
+
 History is cached as a compact, topologically ordered snapshot (lane assignments
 plus lane-occupancy checkpoints; edges are reconstructed per page) and atomically
 rebuilt when references change; subsequent pages share the same generation. The

@@ -6,7 +6,8 @@
   import VirtualList from "./VirtualList.svelte";
   import Snackbar from "./Snackbar.svelte";
   import ContextMenu from "./ContextMenu.svelte";
-  import { api, desktop, nativeError, onJobFinished, onJobStarted, onOpenPath, onRepoChanged, onRepoError, onUpdateError, onUpdateFound, onUpdateProgress, onWindowVisibility, type CommitDetail, type GraphRow, type KnownRepo, type NativeError, type OperationInfo, type RefInfo, type Repository, type StashInfo } from "./lib/api";
+  import { api, desktop, nativeError, onJobFinished, onJobStarted, onOpenPath, onRepoChanged, onRepoError, onUpdateError, onUpdateFound, onUpdateProgress, onWindowVisibility, type AppConfig, type CommitDetail, type GraphRow, type KnownRepo, type NativeError, type OperationInfo, type RefInfo, type Repository, type StashInfo } from "./lib/api";
+  import { editLaunch, launchClick, resetLaunch, type LaunchPopover } from "./lib/launch";
   import { closeTab, createTab, cycleTabs, MAX_TABS, openTab, restoreTabs, type RepoTab } from "./lib/tabs";
   import { PageCache, PAGE_SIZE, ROW_HEIGHT, pageOffsets, visibleRange } from "./lib/virtual";
   import { formatAheadBehind, formatOperationBanner, operationBannerActions } from "./lib/status";
@@ -23,6 +24,7 @@
   let tabs = $state<RepoTab[]>([]);
   let activePath = $state<string | null>(null);
   let knownRepos = $state<KnownRepo[]>([]);
+  let launchCommands = $state<Record<string, string>>({});
   let activeTab = $derived(tabs.find(tab => tab.path === activePath) ?? null);
   let repository = $state<Repository | null>(null);
   let refs = $state<RefInfo[]>([]);
@@ -34,6 +36,9 @@
   let opening = $state(false);
   let choosing = $state(false);
   let pushMenuOpen = $state(false);
+  let launchMenuOpen = $state(false);
+  let launchPopover = $state<(LaunchPopover & { repoId: string }) | null>(null);
+  let launchBusy = $state(false);
   let forceConfirmation = $state<{ repoId: string; branch: string; remote: string } | null>(null);
   let contextMenu = $state<{ x: number; y: number; target: MenuTarget } | null>(null);
   let inlinePrompt = $state<PromptState | null>(null);
@@ -198,6 +203,8 @@
     ++epoch;
     ++selectionEpoch;
     pushMenuOpen = false;
+    launchMenuOpen = false;
+    launchPopover = null;
     forceConfirmation = null;
     contextMenu = null;
     inlinePrompt = null;
@@ -259,7 +266,7 @@
       if (remember) {
         try {
           await api.addKnownRepo(next.path);
-          knownRepos = (await api.config()).repos;
+          applyConfig(await api.config());
         } catch (failure) { error = nativeError(failure); }
       }
       schedulePersist();
@@ -288,7 +295,7 @@
       if (remember) {
         try {
           await api.addKnownRepo(existing.path);
-          knownRepos = (await api.config()).repos;
+          applyConfig(await api.config());
         } catch (failure) { error = nativeError(failure); }
       }
       return;
@@ -348,7 +355,7 @@
   async function restoreConfig() {
     try {
       const config = await api.config();
-      knownRepos = config.repos;
+      applyConfig(config);
       const restored = restoreTabs(config.tabs, config.active_tab);
       const currentTabs = tabs;
       const currentActivePath = activePath;
@@ -370,6 +377,11 @@
       initialized = true;
       error = nativeError(failure);
     }
+  }
+
+  function applyConfig(config: AppConfig) {
+    knownRepos = config.repos;
+    launchCommands = config.launch_commands ?? {};
   }
 
   async function loadPage(repoId: string, offset: number, token: number) {
@@ -572,6 +584,89 @@
       stderr_tail: "",
     };
     snackbarStore.failed(event, repo.name);
+  }
+
+  function showLaunchSuccess(repo: Repository, command: string, terminal: string) {
+    snackbarStore.jobFinished({
+      job_id: `launch-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      repo_id: repo.repo_id,
+      kind: "launch",
+      label: command,
+      ok: true,
+      message: `Launched \`${command}\` in ${terminal}`,
+      stderr_tail: "",
+    }, repo.name);
+  }
+
+  async function launchSavedCommand(repo: Repository, command: string) {
+    launchBusy = true;
+    launchPopover = null;
+    try {
+      const terminal = await api.launchRepo(repo.repo_id);
+      showLaunchSuccess(repo, command, terminal);
+    } catch (failure) {
+      showOperationError(repo, "launch", command, failure);
+    } finally {
+      launchBusy = false;
+    }
+  }
+
+  async function requestLaunch(action: "click" | "edit" | "reset" = "click") {
+    if (!repository || launchBusy) return;
+    const repo = repository;
+    launchMenuOpen = false;
+    const savedCommand = launchCommands[repo.path];
+    if (action === "click" && savedCommand) {
+      await launchSavedCommand(repo, savedCommand);
+      return;
+    }
+
+    launchBusy = true;
+    try {
+      const suggestion = await api.launchSuggestion(repo.repo_id);
+      if (repository?.repo_id !== repo.repo_id) return;
+      if (action === "reset") {
+        await api.resetLaunchCommand(repo.repo_id);
+        const commands = { ...launchCommands };
+        delete commands[repo.path];
+        launchCommands = commands;
+        if (repository?.repo_id === repo.repo_id) {
+          launchPopover = { repoId: repo.repo_id, ...resetLaunch(suggestion) };
+        }
+      } else if (action === "edit") {
+        launchPopover = { repoId: repo.repo_id, ...editLaunch(savedCommand, suggestion) };
+      } else {
+        const choice = launchClick(savedCommand, suggestion);
+        if (choice.kind === "configure") {
+          launchPopover = { repoId: repo.repo_id, ...choice.popover };
+        }
+      }
+    } catch (failure) {
+      showOperationError(repo, "launch", "Launch", failure);
+    } finally {
+      launchBusy = false;
+    }
+  }
+
+  async function saveLaunchCommand(event: SubmitEvent) {
+    event.preventDefault();
+    const popover = launchPopover;
+    const repo = tabs.find(tab => tab.repository?.repo_id === popover?.repoId)?.repository;
+    if (!popover || !repo || !popover.command.trim() || launchBusy) return;
+    const command = popover.command;
+    launchBusy = true;
+    try {
+      await api.setLaunchCommand(repo.repo_id, command);
+      launchCommands = { ...launchCommands, [repo.path]: command };
+      if (!tabs.some(tab => tab.repository?.repo_id === repo.repo_id)) return;
+      launchPopover = null;
+      const terminal = await api.launchRepo(repo.repo_id);
+      showLaunchSuccess(repo, command, terminal);
+    } catch (failure) {
+      showOperationError(repo, "launch", command, failure);
+    } finally {
+      launchBusy = false;
+    }
   }
 
   async function confirmForcePush() {
@@ -1116,6 +1211,31 @@
             {/if}
           </div>
           <button disabled={!repository || activeRepoMutationsDisabled} onclick={() => { void runStashPop(); }}>Pop</button>
+          <div class="launch-control">
+            <div class="launch-button-group">
+              <button class="launch-button" title={repository ? launchCommands[repository.path] ?? "Set up launch command" : "Set up launch command"}
+                disabled={!repository || launchBusy} onclick={() => { void requestLaunch(); }}>🚀 Launch</button>
+              <button class="push-menu-toggle" aria-label="Launch options" aria-expanded={launchMenuOpen}
+                disabled={!repository || launchBusy} onclick={() => { launchMenuOpen = !launchMenuOpen; }}>⌄</button>
+            </div>
+            {#if launchMenuOpen}
+              <div class="push-menu-panel launch-menu-panel">
+                <button onclick={() => { void requestLaunch("edit"); }}>Edit launch command…</button>
+                <button onclick={() => { void requestLaunch("reset"); }}>Reset to detected</button>
+              </div>
+            {/if}
+            {#if launchPopover && repository?.repo_id === launchPopover.repoId}
+              <form class="launch-popover" aria-label="Set launch command" onsubmit={saveLaunchCommand}>
+                <strong>{launchPopover.mode === "edit" ? "Edit launch command" : "Launch command"}</strong>
+                <p>{launchPopover.reason}</p>
+                <input aria-label="Launch command" bind:value={launchPopover.command} required />
+                <div>
+                  <button type="button" onclick={() => { launchPopover = null; }}>Cancel</button>
+                  <button type="submit" disabled={!launchPopover.command.trim() || launchBusy}>Launch</button>
+                </div>
+              </form>
+            {/if}
+          </div>
           <button disabled={!repository || activeRepoMutationsDisabled} onclick={() => runOperation("fetch")}>Fetch</button>
           <button disabled={!repository || !currentBranch || activeRepoMutationsDisabled} onclick={() => runOperation("pull")}>Pull</button>
           <button disabled={!repository || !currentBranch || activeRepoMutationsDisabled} onclick={() => runOperation("push")}>Push</button>

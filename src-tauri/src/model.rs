@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 #[derive(Clone, Debug, Serialize)]
@@ -169,6 +169,47 @@ pub struct ChangedPath {
     pub path: String,
     pub status: &'static str,
     pub old_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FileDiffSource {
+    WorktreeUnstaged,
+    WorktreeStaged,
+    Commit { oid: String },
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct FileDiffLine {
+    pub kind: &'static str,
+    pub old_no: Option<usize>,
+    pub new_no: Option<usize>,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct FileDiffHunk {
+    pub start_index: usize,
+    pub end_index: usize,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct FileDiffStats {
+    pub added: usize,
+    pub removed: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct FileDiff {
+    pub path: String,
+    pub old_path: Option<String>,
+    pub binary: bool,
+    pub too_large: bool,
+    pub old_no_newline: bool,
+    pub new_no_newline: bool,
+    pub lines: Vec<FileDiffLine>,
+    pub hunks: Vec<FileDiffHunk>,
+    pub stats: FileDiffStats,
 }
 
 #[derive(Debug, Serialize)]

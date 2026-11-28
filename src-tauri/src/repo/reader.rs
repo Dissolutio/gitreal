@@ -223,6 +223,10 @@ impl Backend {
         Ok(())
     }
 
+    pub fn repo_path(&self, repo_id: &str) -> Result<PathBuf> {
+        Ok(self.repository(repo_id)?.path.clone())
+    }
+
     pub fn fetch(&self, repo_id: &str, remote: Option<&str>) -> Result<JobId> {
         let repository = self.repository(repo_id)?;
         let spec = remote_ops::fetch(repository.path.clone(), remote)?;

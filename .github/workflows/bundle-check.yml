@@ -104,6 +104,9 @@ jobs:
           fi
 
           deb_contents="$(dpkg-deb -c "${debs[0]}")"
+          echo "::group::.deb contents"
+          printf '%s\n' "$deb_contents"
+          echo "::endgroup::"
           if ! grep -Eq '[[:space:]]\./usr/bin/gitreal([[:space:]]|$)' <<<"$deb_contents"; then
             echo "::error::.deb is missing usr/bin/gitreal."
             exit 1

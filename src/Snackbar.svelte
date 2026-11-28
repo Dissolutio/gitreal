@@ -71,6 +71,9 @@
       <div class="snackbar-content">
         <strong>{safeRefLabel(toast.message)}</strong>
         <small>{toast.repo_name} · {safeRefLabel(toast.label)}</small>
+        {#if toast.ok === true && toast.action}
+          <div class="snackbar-actions"><button onclick={() => onAction?.(toast.action!, toast)}>{safeRefLabel(toast.action.label)}</button></div>
+        {/if}
         {#if toast.ok === false}
           <div class="snackbar-actions">
             {#if toast.action}<button onclick={() => onAction?.(toast.action!, toast)}>{safeRefLabel(toast.action.label)}</button>{/if}

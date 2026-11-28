@@ -27,6 +27,7 @@ pub struct JobSpec {
     pub step_labels: Vec<String>,
     pub preconditions: Vec<JobPrecondition>,
     pub action_on_failure: Option<JobAction>,
+    pub action_on_success: Option<JobAction>,
     pub envs: Vec<(OsString, OsString)>,
     pub success_message: String,
     pub timeout: Duration,
@@ -41,6 +42,7 @@ pub enum JobPrecondition {
     NoOperation,
     OperationIs { kind: String },
     StashOid { index: usize, expected: String },
+    HeadNotPushed { upstream: String },
 }
 
 impl JobSpec {
@@ -61,6 +63,7 @@ impl JobSpec {
             step_labels: Vec::new(),
             preconditions: Vec::new(),
             action_on_failure: None,
+            action_on_success: None,
             envs: Vec::new(),
             success_message: success_message.into(),
             timeout: JOB_TIMEOUT,
@@ -154,11 +157,26 @@ impl JobQueue {
                     after_job();
                     let (ok, message, stderr_tail, action) = match result {
                         Ok(output) if output.success => {
-                            let _captured_output = (&output.stdout, output.exit_code);
-                            (true, spec.success_message, output.stderr_tail, None)
+                            let message = if spec.kind == "commit" {
+                                let hash = output.stdout.trim();
+                                if hash.is_empty() {
+                                    "Committed changes".to_owned()
+                                } else {
+                                    format!("Committed {hash} {}", spec.success_message)
+                                }
+                            } else {
+                                spec.success_message
+                            };
+                            (
+                                true,
+                                message,
+                                output.stderr_tail,
+                                spec.action_on_success.clone(),
+                            )
                         }
                         Ok(output) => {
-                            let _captured_output = (&output.stdout, output.exit_code);
+                            let diagnostic = format!("{}\n{}", output.stdout, output.stderr);
+                            let stderr_tail = output_tail(&diagnostic);
                             let conflicts = if is_history_operation(&spec.kind) {
                                 conflicted_file_count(&spec)
                             } else {
@@ -189,7 +207,7 @@ impl JobQueue {
                                 (
                                     false,
                                     format!("{operation} stopped: {conflicts} {noun}"),
-                                    output.stderr_tail,
+                                    stderr_tail,
                                     Some(action),
                                 )
                             } else {
@@ -199,7 +217,7 @@ impl JobQueue {
                                     .cloned()
                                     .unwrap_or_else(|| spec.label.clone());
                                 let message =
-                                    friendly_failure(&spec, &output.stderr, output.timed_out);
+                                    friendly_failure(&spec, &diagnostic, output.timed_out);
                                 let message = if spec.step_labels.len() > 1 {
                                     format!("{step} failed: {message}")
                                 } else {
@@ -207,14 +225,13 @@ impl JobQueue {
                                 };
                                 let action = spec.action_on_failure.clone().filter(|action| {
                                     (action.kind == "stash_and_retry"
-                                        && is_local_changes_failure(&output.stderr))
+                                        && is_local_changes_failure(&diagnostic))
                                         || (action.kind == "force_delete"
-                                            && output
-                                                .stderr
+                                            && diagnostic
                                                 .to_ascii_lowercase()
                                                 .contains("not fully merged"))
                                 });
-                                (false, message, output.stderr_tail, action)
+                                (false, message, stderr_tail, action)
                             }
                         }
                         Err(error) => (false, error, String::new(), None),
@@ -300,6 +317,31 @@ fn run_git(spec: &JobSpec) -> Result<GitOutput, String> {
         if let Some(message) = metadata_failure {
             return Ok(precondition_failure(message, None));
         }
+        if let JobPrecondition::HeadNotPushed { upstream } = precondition {
+            let args = vec![
+                "merge-base".into(),
+                "--is-ancestor".into(),
+                "HEAD".into(),
+                upstream.clone(),
+            ];
+            let result = run_git_args(&spec.program, &spec.cwd, &args, spec.timeout, &spec.envs)?;
+            if result.success {
+                return Ok(precondition_failure(
+                    format!(
+                        "This commit is already on {}; amending will require a force push",
+                        upstream.strip_prefix("refs/remotes/").unwrap_or(upstream)
+                    ),
+                    result.exit_code,
+                ));
+            }
+            if result.exit_code != Some(1) {
+                return Ok(precondition_failure(
+                    "Could not verify whether this commit is already pushed".into(),
+                    result.exit_code,
+                ));
+            }
+            continue;
+        }
         let (args, expected) = match precondition {
             JobPrecondition::BranchOid { branch, expected } => (
                 vec!["rev-parse".into(), format!("refs/heads/{branch}")],
@@ -310,7 +352,12 @@ fn run_git(spec: &JobSpec) -> Result<GitOutput, String> {
                 Some(format!("refs/heads/{branch}")),
             ),
             JobPrecondition::WorkingTreeClean => (
-                vec!["status".into(), "--porcelain".into()],
+                vec![
+                    "-c".into(),
+                    "core.fsmonitor=false".into(),
+                    "status".into(),
+                    "--porcelain".into(),
+                ],
                 Some(String::new()),
             ),
             JobPrecondition::HeadOid { expected } => (
@@ -321,7 +368,9 @@ fn run_git(spec: &JobSpec) -> Result<GitOutput, String> {
                 vec!["rev-parse".into(), format!("stash@{{{index}}}")],
                 Some(expected.clone()),
             ),
-            JobPrecondition::NoOperation | JobPrecondition::OperationIs { .. } => continue,
+            JobPrecondition::NoOperation
+            | JobPrecondition::OperationIs { .. }
+            | JobPrecondition::HeadNotPushed { .. } => continue,
         };
         let result = run_git_args(&spec.program, &spec.cwd, &args, spec.timeout, &spec.envs)?;
         let actual = if matches!(precondition, JobPrecondition::WorkingTreeClean) {
@@ -342,7 +391,9 @@ fn run_git(spec: &JobSpec) -> Result<GitOutput, String> {
                     "HEAD changed since the operation was requested".into()
                 }
                 JobPrecondition::StashOid { .. } => "Stash changed since it was selected".into(),
-                JobPrecondition::NoOperation | JobPrecondition::OperationIs { .. } => {
+                JobPrecondition::NoOperation
+                | JobPrecondition::OperationIs { .. }
+                | JobPrecondition::HeadNotPushed { .. } => {
                     unreachable!()
                 }
             };
@@ -437,6 +488,18 @@ fn precondition_failure(message: String, exit_code: Option<i32>) -> GitOutput {
         timed_out: false,
         failed_step: 0,
     }
+}
+
+fn output_tail(output: &str) -> String {
+    output
+        .lines()
+        .rev()
+        .take(20)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn is_history_operation(kind: &str) -> bool {
@@ -664,7 +727,32 @@ fn friendly_failure(spec: &JobSpec, stderr: &str, timed_out: bool) -> String {
         return "Git operation timed out".into();
     }
     let text = stderr.to_ascii_lowercase();
-    if matches!(
+    if spec.kind == "commit"
+        && (text.contains("nothing to commit") || text.contains("nothing added to commit"))
+    {
+        "Nothing staged to commit".into()
+    } else if spec.kind == "commit"
+        && (text.contains("please tell me who you are")
+            || text.contains("unable to auto-detect email address")
+            || text.contains("user.name")
+            || text.contains("user.email"))
+    {
+        "Git author identity is not configured; set user.name and user.email".into()
+    } else if spec.kind == "commit"
+        && (text.contains("hook declined")
+            || text.contains("hook rejected")
+            || text.contains("pre-commit hook")
+            || text.contains("hook"))
+    {
+        "Commit hook rejected the commit; see details for hook output".into()
+    } else if spec.kind == "commit"
+        && (text.contains("gpg failed")
+            || text.contains("signing failed")
+            || text.contains("failed to sign")
+            || text.contains("ssh signing"))
+    {
+        "Commit signing failed; check your signing configuration".into()
+    } else if matches!(
         spec.kind.as_str(),
         "checkout" | "checkout-remote" | "checkout-commit"
     ) && is_local_changes_failure(stderr)

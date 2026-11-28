@@ -36,6 +36,7 @@ pub struct OpenRepo {
     pub repo_id: String,
     pub path: String,
     pub name: String,
+    pub worktree_status: WorktreeStatus,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -85,6 +86,31 @@ pub struct RefsResponse {
     pub stashes: Vec<StashInfo>,
     pub operation: Option<OperationInfo>,
     pub conflicted_files: usize,
+    pub generation: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct WorktreeStatus {
+    pub staged: Vec<FileChange>,
+    pub unstaged: Vec<FileChange>,
+    pub untracked: Vec<FileChange>,
+    pub conflicted: Vec<FileChange>,
+    pub truncated: bool,
+    pub generation: u64,
+    #[serde(skip)]
+    pub fingerprint: u64,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq, Hash)]
+pub struct FileChange {
+    pub path: String,
+    pub old_path: Option<String>,
+    pub kind: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct WorktreeChanged {
+    pub repo_id: String,
     pub generation: u64,
 }
 

@@ -33,24 +33,30 @@ struct LaunchFiles {
 
 impl LaunchFiles {
     fn read(root: &Path) -> Result<Self> {
+        fn is_root_file(root: &Path, name: &str) -> bool {
+            fs::symlink_metadata(root.join(name))
+                .is_ok_and(|metadata| metadata.file_type().is_file())
+        }
+
         fn optional(root: &Path, name: &str) -> Result<Option<String>> {
+            if !is_root_file(root, name) {
+                return Ok(None);
+            }
             match fs::read_to_string(root.join(name)) {
                 Ok(contents) => Ok(Some(contents)),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
                 Err(error) => Err(BackendError::new("launch_error", error)),
             }
         }
 
         Ok(Self {
             package_json: optional(root, "package.json")?,
-            pnpm_lock: root.join("pnpm-lock.yaml").is_file(),
-            yarn_lock: root.join("yarn.lock").is_file(),
-            bun_lock: root.join("bun.lockb").is_file() || root.join("bun.lock").is_file(),
-            package_lock: root.join("package-lock.json").is_file(),
-            cargo_toml: root.join("Cargo.toml").is_file(),
+            pnpm_lock: is_root_file(root, "pnpm-lock.yaml"),
+            yarn_lock: is_root_file(root, "yarn.lock"),
+            bun_lock: is_root_file(root, "bun.lockb") || is_root_file(root, "bun.lock"),
+            package_lock: is_root_file(root, "package-lock.json"),
+            cargo_toml: is_root_file(root, "Cargo.toml"),
             makefile: optional(root, "Makefile")?,
-            compose: root.join("docker-compose.yml").is_file()
-                || root.join("compose.yaml").is_file(),
+            compose: is_root_file(root, "docker-compose.yml") || is_root_file(root, "compose.yaml"),
         })
     }
 }
@@ -228,19 +234,23 @@ fn resolve_executable(name: &str, search_path: Option<&OsStr>) -> Option<PathBuf
 }
 
 fn select_terminal(configured: Option<&str>, search_path: Option<&OsStr>) -> Result<Terminal> {
-    let candidates: Vec<&str> = configured.map_or_else(
-        || {
-            vec![
-                "cosmic-term",
-                "x-terminal-emulator",
-                "gnome-terminal",
-                "konsole",
-                "kitty",
-                "alacritty",
-                "xterm",
-            ]
-        },
-        |configured| vec![configured],
+    let defaults = [
+        "cosmic-term",
+        "x-terminal-emulator",
+        "gnome-terminal",
+        "konsole",
+        "kitty",
+        "alacritty",
+        "xterm",
+    ];
+    let mut candidates = Vec::with_capacity(defaults.len() + usize::from(configured.is_some()));
+    if let Some(configured) = configured {
+        candidates.push(configured);
+    }
+    candidates.extend(
+        defaults
+            .into_iter()
+            .filter(|candidate| Some(*candidate) != configured),
     );
     for candidate in candidates {
         if let Some(executable) = resolve_executable(candidate, search_path) {
@@ -255,7 +265,7 @@ fn select_terminal(configured: Option<&str>, search_path: Option<&OsStr>) -> Res
     Err(BackendError::new("no_terminal", NO_TERMINAL))
 }
 
-fn start_terminal(
+pub fn launch_repo(
     cwd: &Path,
     command: &str,
     configured_terminal: Option<&str>,
@@ -303,8 +313,11 @@ pub fn launch_terminal(
     configured_terminal: Option<&str>,
 ) -> Result<String> {
     let path = env::var_os("PATH");
-    let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-    start_terminal(cwd, command, configured_terminal, path.as_deref(), &shell).map(|(name, _)| name)
+    let shell = env::var("SHELL")
+        .ok()
+        .filter(|shell| !shell.trim().is_empty())
+        .unwrap_or_else(|| "/bin/bash".into());
+    launch_repo(cwd, command, configured_terminal, path.as_deref(), &shell).map(|(name, _)| name)
 }
 
 #[cfg(test)]
@@ -361,7 +374,7 @@ mod tests {
         assert_eq!(
             suggestion(&[
                 ("package.json", r#"{"scripts":{"serve":"vite"}}"#),
-                ("bun.lock", "")
+                ("bun.lockb", "")
             ])
             .unwrap()
             .command,
@@ -418,27 +431,105 @@ mod tests {
     #[test]
     fn builds_argv_for_each_supported_terminal_and_quotes_shell_script() {
         let cwd = Path::new("/repo with spaces");
-        let expected = "echo \"hello world\"; exec '/bin/my'\\''shell'";
-        for terminal in [
-            "cosmic-term",
-            "x-terminal-emulator",
-            "gnome-terminal",
-            "konsole",
-            "kitty",
-            "alacritty",
-            "xterm",
-        ] {
-            let argv = terminal_argv(terminal, "/bin/my'shell", "echo \"hello world\"", cwd);
-            assert!(
-                argv.iter().any(|argument| argument == expected),
+        let script = "echo \"hello world\"; exec '/bin/my'\\''shell'";
+        let shell = "/bin/my'shell";
+        let cases = [
+            ("cosmic-term", vec!["--", shell, "-lc", script]),
+            ("x-terminal-emulator", vec!["-e", shell, "-lc", script]),
+            (
+                "gnome-terminal",
+                vec![
+                    "--working-directory=/repo with spaces",
+                    "--",
+                    shell,
+                    "-lc",
+                    script,
+                ],
+            ),
+            (
+                "konsole",
+                vec!["--workdir", "/repo with spaces", "-e", shell, "-lc", script],
+            ),
+            (
+                "kitty",
+                vec!["--directory", "/repo with spaces", shell, "-lc", script],
+            ),
+            (
+                "alacritty",
+                vec![
+                    "--working-directory",
+                    "/repo with spaces",
+                    "-e",
+                    shell,
+                    "-lc",
+                    script,
+                ],
+            ),
+            ("xterm", vec!["-e", shell, "-lc", script]),
+        ];
+        for (terminal, expected) in cases {
+            assert_eq!(
+                terminal_argv(terminal, shell, "echo \"hello world\"", cwd),
+                expected.into_iter().map(OsString::from).collect::<Vec<_>>(),
                 "{terminal}"
             );
-            assert!(argv.iter().any(|argument| argument == "/bin/my'shell"));
         }
+    }
 
-        let gnome = terminal_argv("gnome-terminal", "/bin/bash", "pnpm tauri dev", cwd);
-        assert_eq!(gnome[0], "--working-directory=/repo with spaces");
-        assert_eq!(gnome[1], "--");
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn terminal_preference_and_fallback_order_are_respected() {
+        let directory = tempdir().unwrap();
+        for name in ["cosmic-term", "gnome-terminal", "xterm"] {
+            let executable = directory.path().join(name);
+            fs::write(&executable, "#!/bin/sh\n").unwrap();
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path = directory.path().as_os_str();
+        assert_eq!(
+            select_terminal(None, Some(path)).unwrap().name,
+            "cosmic-term"
+        );
+        fs::remove_file(directory.path().join("cosmic-term")).unwrap();
+        assert_eq!(
+            select_terminal(None, Some(path)).unwrap().name,
+            "gnome-terminal"
+        );
+        assert_eq!(
+            select_terminal(Some("xterm"), Some(path)).unwrap().name,
+            "xterm"
+        );
+        assert_eq!(
+            select_terminal(Some("not-installed"), Some(path))
+                .unwrap()
+                .name,
+            "gnome-terminal"
+        );
+        let empty = tempdir().unwrap();
+        assert_eq!(
+            select_terminal(None, Some(empty.path().as_os_str()))
+                .unwrap_err()
+                .message,
+            NO_TERMINAL
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detection_does_not_follow_root_metadata_symlinks() {
+        let directory = tempdir().unwrap();
+        let external = tempdir().unwrap();
+        fs::write(
+            external.path().join("package.json"),
+            r#"{"scripts":{"dev":"vite"}}"#,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            external.path().join("package.json"),
+            directory.path().join("package.json"),
+        )
+        .unwrap();
+        assert_eq!(detect_at(directory.path()).unwrap(), None);
     }
 
     #[cfg(target_os = "linux")]
@@ -461,7 +552,7 @@ mod tests {
         fs::set_permissions(&terminal, fs::Permissions::from_mode(0o755)).unwrap();
         let repo = directory.path().join("repo");
         fs::create_dir(&repo).unwrap();
-        let (name, pid) = start_terminal(
+        let (name, pid) = launch_repo(
             &repo,
             "echo 'hello world'",
             Some("xterm"),
@@ -471,7 +562,9 @@ mod tests {
         .unwrap();
         assert_eq!(name, "xterm");
         let deadline = Instant::now() + Duration::from_secs(3);
-        while !capture.exists() && Instant::now() < deadline {
+        while !fs::read_to_string(&capture).is_ok_and(|contents| contents.lines().count() >= 5)
+            && Instant::now() < deadline
+        {
             thread::sleep(Duration::from_millis(10));
         }
         let output = fs::read_to_string(&capture).unwrap();

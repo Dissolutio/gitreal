@@ -11,7 +11,7 @@ export interface AppConfig {
   active_tab: string | null;
   start_at_login: boolean;
   check_for_updates: boolean;
-  launch_commands: Record<string, string>;
+  launch_commands?: Record<string, string>;
   launch_terminal?: string | null;
   repos: KnownRepo[];
   tabs: PersistedTab[];

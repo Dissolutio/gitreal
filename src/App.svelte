@@ -630,7 +630,9 @@
         const commands = { ...launchCommands };
         delete commands[repo.path];
         launchCommands = commands;
-        launchPopover = { repoId: repo.repo_id, ...resetLaunch(suggestion) };
+        if (repository?.repo_id === repo.repo_id) {
+          launchPopover = { repoId: repo.repo_id, ...resetLaunch(suggestion) };
+        }
       } else if (action === "edit") {
         launchPopover = { repoId: repo.repo_id, ...editLaunch(savedCommand, suggestion) };
       } else {
@@ -656,6 +658,7 @@
     try {
       await api.setLaunchCommand(repo.repo_id, command);
       launchCommands = { ...launchCommands, [repo.path]: command };
+      if (!tabs.some(tab => tab.repository?.repo_id === repo.repo_id)) return;
       launchPopover = null;
       const terminal = await api.launchRepo(repo.repo_id);
       showLaunchSuccess(repo, command, terminal);
@@ -1222,7 +1225,7 @@
               </div>
             {/if}
             {#if launchPopover && repository?.repo_id === launchPopover.repoId}
-              <form class="launch-popover" role="dialog" aria-label="Set launch command" onsubmit={saveLaunchCommand}>
+              <form class="launch-popover" aria-label="Set launch command" onsubmit={saveLaunchCommand}>
                 <strong>{launchPopover.mode === "edit" ? "Edit launch command" : "Launch command"}</strong>
                 <p>{launchPopover.reason}</p>
                 <input aria-label="Launch command" bind:value={launchPopover.command} required />
